@@ -1,0 +1,14 @@
+[package]
+# maybe armature later if I beat dynarmic
+name = "rapid-arm-emu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+parking_lot = "0.12.5"
+bitflags = "2.11.1"
+cranelift = { version = "0.131.0", features = ["jit"] }
+crossbeam-utils = "0.8.21"
+
+[dev-dependencies]
+loom = "0.7"
