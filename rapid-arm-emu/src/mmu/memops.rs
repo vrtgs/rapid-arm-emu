@@ -7,7 +7,7 @@
 use std::hint::cold_path;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
-// FIXME: currently, all of this is UB, it just happens to work for rust 1.95.0,
+// FIXME: currently, the live implementation UB, it just happens to work for rust 1.95.0,
 //        but mixed sized atomic access is UB, and I am explictly doing UB
 //        if it ever stops being UB, thats GREAT, otherwise, this needs to be fixed
 //        which is quite easy with decentish performance as is commented out

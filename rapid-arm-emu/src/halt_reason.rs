@@ -61,7 +61,7 @@ impl AtomicHaltReason {
     }
     
     
-    pub fn take_halt_reason(&self) -> HaltReasonInner {
+    pub fn take(&self) -> HaltReasonInner {
         HaltReasonInner::from_bits_retain(self.0.swap(0, Ordering::SeqCst))
     }
 }
