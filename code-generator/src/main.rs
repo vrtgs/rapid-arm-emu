@@ -1,17 +1,18 @@
-use std::collections::HashSet;
+use std::time::Instant;
 use eyre::Result;
 
 mod instruction_parser;
 
+
 fn main() -> Result<()> {
+    let start = Instant::now();
     let insns = instruction_parser::load_instruction_pages()?;
 
-    let mut doc_var_combos = HashSet::new();
+    let elapsed = start.elapsed();
 
-    for insn in insns.iter() {
-        doc_var_combos.extend(insn.docvars.iter().filter(|(k, _)| ***k != *"mnemonic"))
-    }
+    println!("{:#?}", insns[1]);
 
-    println!("{:#?}", doc_var_combos);
+    println!("Took: {elapsed:?}");
+
     Ok(())
 }
