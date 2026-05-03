@@ -1,18 +1,21 @@
-use std::time::Instant;
-use eyre::Result;
+#![forbid(unsafe_code)]
 
+
+use eyre::Result;
+use crate::instruction_parser::InstructionSets;
+use crate::interner::Interner;
+
+mod interner;
 mod instruction_parser;
 
 
 fn main() -> Result<()> {
-    let start = Instant::now();
-    let insns = instruction_parser::load_instruction_pages()?;
-
-    let elapsed = start.elapsed();
-
-    println!("{:#?}", insns[1]);
-
-    println!("Took: {elapsed:?}");
+    let temp_dir = tempfile::tempdir()?;
+    let interner = Interner::new();
+    let InstructionSets { aarch64: _, .. } = instruction_parser::load_instruction_sets(
+        &temp_dir,
+        &interner
+    )?;
 
     Ok(())
 }

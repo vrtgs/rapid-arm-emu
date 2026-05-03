@@ -184,7 +184,7 @@ fn div_page_size_checked(vaddr: u64) -> Result<u64, MemoryFault> {
 
 impl MemoryProtections {
     // Self is a superset of PageFlags
-    pub(crate) fn into_page_flags(self) -> PageFlags {
+    fn into_page_flags(self) -> PageFlags {
         PageFlags::from_bits_retain((self & Self::all()).bits())
     }
 }
@@ -238,10 +238,77 @@ impl MemoryProtections {
 /// non-permission bookkeeping bits such as `INSN_DIRTY`, but it must not change
 /// the page's mapping state or guest memory protections.
 pub(crate) struct Page {
-    // Note: the page flags can for sure be stored in the lo bits of the page pointer
-    //       but this works for now, and is easier to ensure propper work
-    ptr: Option<NonNull<AtomicU8>>,
-    page_flags: AtomicU8,
+    /// Host backing pointer for this guest page.
+    ///
+    /// Mapping invariants:
+    /// - `None` means this page is unmapped.
+    /// - `Some(ptr)` means this page is mapped.
+    /// - If any guest memory-protection bit is set in `page_flags`
+    ///   (`READ`, `WRITE`, or `EXECUTE`), this field must be `Some`.
+    /// - Once mapped, the backing pointer is stable for the lifetime of that
+    ///   mapping.
+    /// - A mapped pointer must not be replaced directly. To change the backing
+    ///   pointer, the page must first transition through `None`:
+    ///
+    ///   ```text
+    ///   Some(old_ptr) -> None -> Some(new_ptr)
+    ///   ```
+    ///
+    /// - The invalid transition is:
+    ///
+    ///   ```text
+    ///   Some(old_ptr) -> Some(new_ptr)
+    ///   ```
+    ///
+    /// Access invariants:
+    /// - Direct access to the pointed-to memory must go through the operations in
+    ///   `memops`.
+    /// - The pointer is stored as `NonNull<AtomicU8>` because `memops` accepts
+    ///   pointers to `AtomicU8` and performs the actual byte, scalar,
+    ///   aligned, and unaligned memory operations.
+    pub(crate) ptr: Option<NonNull<AtomicU8>>,
+
+    // TODO seperate page_dirty from memory protection flags
+    /// Atomic per-page state.
+    ///
+    /// Stores the raw bits of `PageFlags`:
+    /// - `READ`
+    /// - `WRITE`
+    /// - `EXECUTE`
+    /// - `INSN_DIRTY`
+    ///
+    /// Permission invariants:
+    /// - `READ`, `WRITE`, and `EXECUTE` are guest-visible memory-protection bits.
+    /// - If any of those permission bits are set, `ptr` must be `Some`.
+    /// - Changing guest permissions requires exclusive access to the page.
+    /// - Shared access may read these flags for permission checks.
+    ///
+    /// `INSN_DIRTY` invariants:
+    /// - `INSN_DIRTY` is not a guest permission bit.
+    /// - `INSN_DIRTY` is bookkeeping for executable pages whose backing bytes may
+    ///   have changed since instruction cache / decoded instruction state was
+    ///   last synchronized.
+    /// - A successful store to a page that was executable at the time of the
+    ///   permission check must set `INSN_DIRTY`.
+    /// - If `EXECUTE` permission is removed from a page, `INSN_DIRTY` must be
+    ///   preserved or set, because previously executable contents may have cached
+    ///   instruction state that needs invalidation.
+    /// - Updating ordinary guest permissions must preserve an existing
+    ///   `INSN_DIRTY` bit.
+    /// - Clearing `INSN_DIRTY` is only done by the instruction-cache drain path,
+    ///   via `take_insn_dirty`.
+    /// - If an executable dirty page is unmapped, its backing pointer must be
+    ///   recorded in `pending_dirty_pages` before the page transitions to
+    ///   unmapped, so the invalidation range is not lost.
+    ///
+    /// Concurrency invariants:
+    /// - Permission changes and mapping-state changes require exclusive access.
+    /// - `INSN_DIRTY` may be updated through shared access after successful
+    ///   stores.
+    /// - Setting `INSN_DIRTY` uses release ordering so the guest writes that made
+    ///   the page dirty happen-before an acquire/acqrel dirty drain observes the
+    ///   bit.
+    pub(crate) page_flags: AtomicU8,
 }
 
 impl Page {
@@ -294,12 +361,12 @@ impl Page {
     }
 
     #[inline(always)]
-    pub(crate) fn load_flags(&self) -> PageFlags {
+    fn load_flags(&self) -> PageFlags {
         PageFlags::from_bits_retain(self.page_flags.load(Ordering::Relaxed))
     }
 
     #[inline(always)]
-    pub(crate) fn load_flags_mut(&mut self) -> PageFlags {
+    fn load_flags_mut(&mut self) -> PageFlags {
         PageFlags::from_bits_retain(*self.page_flags.get_mut())
     }
 
@@ -319,7 +386,7 @@ impl Page {
     }
 
     #[inline(always)]
-    pub(crate) fn get_data_ptr(&self, flags: PageFlags) -> Result<NonNull<AtomicU8>, MemoryFault> {
+    fn get_data_ptr(&self, flags: PageFlags) -> Result<NonNull<AtomicU8>, MemoryFault> {
         ensure!(self.has_access(flags));
         // Safety: if self.has_access returns true, its always ok to call get_data_ptr_unchecked
         Ok(unsafe { self.get_data_ptr_unchecked() })
@@ -336,7 +403,7 @@ impl Page {
     /// This function must be called after the write permission check succeeds and
     /// after the store operation succeeds.
     #[inline(always)]
-    pub(crate) fn set_insn_dirty(&self, initial_flags: PageFlags) {
+    fn set_insn_dirty(&self, initial_flags: PageFlags) {
         if initial_flags.contains(PageFlags::EXECUTE) {
             cold_path();
             if !initial_flags.contains(PageFlags::INSN_DIRTY) {

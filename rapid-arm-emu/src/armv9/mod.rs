@@ -11,15 +11,14 @@ pub struct Vector(pub u128);
 
 const _: () = assert!(align_of::<Vector>() == 16 && size_of::<Vector>() == 16);
 
-#[repr(C)]
 pub(crate) struct ProcessorState {
-    sp: u64,
-    pc: u64,
-    x_registers: [u64; 31],
-    pstate: u32,
-    fpsr: u32,
-    fpcr: u32,
-    vectors: [Vector; 32],
+    pub(crate) sp: u64,
+    pub(crate) pc: u64,
+    pub(crate) x_registers: [u64; 31],
+    pub(crate) pstate: u32,
+    pub(crate) fpsr: u32,
+    pub(crate) fpcr: u32,
+    pub(crate) vectors: [Vector; 32],
 }
 
 impl ProcessorState {
