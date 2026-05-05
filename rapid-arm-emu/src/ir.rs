@@ -1,9 +1,4 @@
-use std::mem::offset_of;
-use std::sync::atomic::AtomicU32;
-use crate::armv9::{ProcessorState, X_REGISTER_COUNT};
-use crate::io_mmu;
-use crate::io_mmu::IoMMU;
-use crate::ir::arena::{impl_storable, Arena};
+use crate::ir::arena::make_handle;
 
 mod arena;
 
@@ -226,8 +221,13 @@ impl ExecIrBuilder {
         }
     }
 
+    #[must_use]
+    fn make_lvalue(&mut self, ty: Type) -> LValue {
+        self.lvalues.store(LValueData { ty })
+    }
     unsafe fn emit_stmt(&mut self, rvalue: RValue) -> LValue {
 
+}
     }
 
     unsafe fn load_x_reg_unchecked(&mut self, x_reg: u8, width: IntWidth) -> LValue {
