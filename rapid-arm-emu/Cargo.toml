@@ -10,6 +10,19 @@ bitflags = "2.11.1"
 crossbeam-utils = "0.8.21"
 pastey = "0.2.2"
 thiserror = "2.0.18"
+anyhow = "1.0.102"
+
+[dependencies.gccjit]
+version = "3.3.0"
+
+[dependencies.inkwell]
+version = "0.9.0"
+features = ["llvm-sys-221"]
+
+[dependencies.cranelift]
+version = "0.131.1"
+features = ["jit", "frontend", "native", "module"]
+
 
 [dependencies.bytemuck]
 version = "1.25.0"

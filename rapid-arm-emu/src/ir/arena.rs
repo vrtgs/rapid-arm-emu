@@ -2,6 +2,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::hint;
 use std::hint::cold_path;
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::num::NonZero;
 use std::ops::{Index, IndexMut};
@@ -141,6 +142,10 @@ impl<S: Storable> Arena<S> {
         self.assert_invariants();
         self.0.get_mut(to_raw(handle).get())
     }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 pub struct Reservation<'a, S>(&'a mut Arena<S>);
@@ -200,6 +205,43 @@ impl<S: Storable> IndexMut<S::Handle> for Arena<S> {
     #[track_caller]
     fn index_mut(&mut self, index: S::Handle) -> &mut Self::Output {
         self.get_mut(index).unwrap_or_else(indexing_handle_failed)
+    }
+}
+
+pub struct ArenaMap<K, V>(Vec<Option<V>>, PhantomData<K>);
+
+impl<K: Handle, V> ArenaMap<K, V> {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity), PhantomData)
+    }
+
+    pub fn get(&self, key: K) -> Option<&V> {
+        self.0.get(to_raw(key).get()).map_or(None, Option::as_ref)
+    }
+
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let index = to_raw(key).get();
+        if self.0.len() <= index {
+            cold_path();
+            self.0.resize_with(index.strict_add(1), || None);
+        }
+        self.0[index].replace(value)
+    }
+}
+
+
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn indexing_map_handle_failed<T>() -> T {
+    panic!("key not found in map")
+}
+
+impl<K: Handle, V> Index<K> for ArenaMap<K, V> {
+    type Output = V;
+
+    fn index(&self, index: K) -> &Self::Output {
+        self.get(index).unwrap_or_else(indexing_map_handle_failed)
     }
 }
 

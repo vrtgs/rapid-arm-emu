@@ -3,10 +3,6 @@ name = "code-generator"
 version = "0.1.0"
 edition = "2024"
 
-[profile.dev]
-opt-level = 1
-
-
 [dependencies]
 tar = "0.4.45"
 flate2 = "1.1.9"

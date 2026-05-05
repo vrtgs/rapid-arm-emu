@@ -1124,8 +1124,15 @@ impl IoMMU {
 }
 
 impl IoMMU {
-    pub(crate) fn pages(&self) -> &[Page] {
-        &self.pages
+    pub(crate) fn pages_ffi(&self) -> (*const Page, u64) {
+        // mapped pages count must be less than or equal u64::MAX >> PAGE_SHIFT
+        let len = unsafe {
+            u64::try_from(self.pages.len()).unwrap_unchecked()
+        };
+        
+        let ptr = self.pages.as_ptr();
+
+        (ptr, len)
     }
 }
 

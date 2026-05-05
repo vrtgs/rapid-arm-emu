@@ -45,8 +45,8 @@ impl HaltReason {
 pub(crate) struct AtomicHaltReason(AtomicU32);
 
 impl AtomicHaltReason {
-    pub fn new(reason: HaltReasonInner) -> Self {
-        Self(AtomicU32::new(reason.bits()))
+    pub(crate) fn new() -> Self {
+        Self(AtomicU32::new(0))
     }
 
     pub fn load(&self) -> HaltReasonInner {
@@ -63,5 +63,9 @@ impl AtomicHaltReason {
     
     pub fn take(&self) -> HaltReasonInner {
         HaltReasonInner::from_bits_retain(self.0.swap(0, Ordering::SeqCst))
+    }
+    
+    pub(crate) fn as_ffi(&self) -> &AtomicU32 {
+        &self.0
     }
 }
