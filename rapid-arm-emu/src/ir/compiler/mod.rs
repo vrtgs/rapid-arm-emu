@@ -88,9 +88,9 @@ impl ExecIrCompiler {
         Self {
             next_function_id: AtomicUsize::new(0),
             cranelift_compiler: CraneliftCompiler::new(
-                cranelift_backend::OptLevel::SpeedAndSize
+                cranelift_backend::OptLevel::Speed
             ).unwrap(),
-            show_disasm: true
+            show_disasm: cfg!(test)
         }
     }
 

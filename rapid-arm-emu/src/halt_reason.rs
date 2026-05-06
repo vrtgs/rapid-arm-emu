@@ -1,5 +1,4 @@
 use std::fmt::{Debug, Formatter};
-use std::mem::MaybeUninit;
 use std::num::NonZero;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -65,18 +64,6 @@ impl Debug for HaltReason {
     }
 }
 
-impl HaltReason {
-    pub(crate) fn into_inner(self) -> HaltReasonInner {
-        todo!()
-    }
-
-    pub(crate) fn from_inner(_reason: HaltReasonInner) -> Option<HaltReason> {
-        todo!()
-    }
-}
-
-// TODO figure out the best memory ordering for this
-//      seqcst is fine for now
 pub(crate) struct AtomicHaltReason(AtomicU32);
 
 impl AtomicHaltReason {

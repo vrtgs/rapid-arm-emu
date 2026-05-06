@@ -1,4 +1,4 @@
-use std::mem::{offset_of, ManuallyDrop};
+use std::mem::ManuallyDrop;
 use anyhow::{anyhow, bail, ensure, Context};
 use arrayvec::ArrayVec;
 use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -10,7 +10,6 @@ use crate::ir::{Block as IrBlock, Type as IrType};
 use cranelift::codegen::ir as clif_ir;
 use cranelift::prelude::{AbiParam, Configurable, InstBuilder, IntCC, MemFlags};
 use cranelift::prelude::isa::OwnedTargetIsa;
-use crate::armv9::ProcessorState;
 use crate::ir::compiler::{CompileOptions, CompiledExecBlock, ExecBlockFFI};
 
 struct FunctionLowering<'a> {
@@ -232,6 +231,16 @@ impl<'a> FunctionLowering<'a> {
             }
 
 
+            StmtKind::AddImm {
+                value,
+                imm64
+            } => {
+                let value = self.use_value(value)?;
+                let new_value = self.builder.ins().iadd_imm(value, imm64.cast_signed());
+                array_helper::from_arr([new_value])
+            },
+
+
             StmtKind::IntCmp { cmp, lhs, rhs } => {
                 let op = Self::convert_to_intcc(cmp);
                 let (lhs, rhs) = (self.use_value(lhs)?, self.use_value(rhs)?);
@@ -267,6 +276,7 @@ impl<'a> FunctionLowering<'a> {
 
                 array_helper::from_arr([value])
             }
+
             StmtKind::BitwiseImm { op, lhs, rhs } => {
                 let lhs = self.use_value(lhs)?;
                 let rhs = rhs.cast_signed();
@@ -319,18 +329,7 @@ impl<'a> FunctionLowering<'a> {
                 array_helper::from_arr([value])
             }
 
-            StmtKind::InstructionDone => {
-                let base_ptr = LValue::ARG_PROCESSOR_STATE;
-                let offset = offset_of!(ProcessorState, pc);
-
-                let pc = self.lower_host_load(IntWidth::W64, base_ptr, offset)?;
-
-                let four = self.builder.ins().iconst(clif_ir::types::I64, 4);
-                let next_pc = self.builder.ins().iadd(pc, four);
-                self.lower_host_store(base_ptr, offset, next_pc)?;
-
-                array_helper::from_arr([])
-            }
+            StmtKind::Safepoint => array_helper::from_arr([])
         };
 
         Ok(value)

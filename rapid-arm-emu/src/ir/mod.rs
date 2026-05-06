@@ -7,6 +7,7 @@ use crate::ir::arena::{impl_storable, Arena, ArenaSet};
 
 mod arena;
 pub(crate) mod compiler;
+pub(crate) mod ffi_support;
 
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -53,6 +54,7 @@ impl Type {
     }
 }
 
+#[derive(Debug)]
 struct LValueData {
     pub ty: Type,
 }
@@ -249,6 +251,11 @@ enum StmtKind {
         rhs: LValue,
     },
 
+    AddImm {
+        value: LValue,
+        imm64: u64
+    },
+
     /// Produces:
     ///   0: arithmetic result
     ///   1: overflow flag
@@ -313,8 +320,7 @@ enum StmtKind {
     /// loads the halt reason found at Arg::HaltReasonPtr
     LoadHaltReason,
 
-    /// increments `pc` by 4
-    InstructionDone,
+    Safepoint
 }
 
 #[derive(Debug)]
@@ -372,6 +378,7 @@ pub(crate) struct ExecIr {
     block_compile_order: Vec<Block>,
 }
 
+
 pub(crate) struct ExecIrBuilder {
     lvalues: Arena<LValueData>,
     blocks: Arena<BlockData>,
@@ -379,11 +386,11 @@ pub(crate) struct ExecIrBuilder {
     halt_check_every: NonZero<u32>,
     halt_check_in: u32,
 }
+
 pub(crate) struct IrBuilderConfig {
     halt_check_every: NonZero<u32>,
 }
 
-// FIXME reduce this massive code duplication
 impl ExecIrBuilder {
     pub fn with_config(config: IrBuilderConfig) -> Self {
         Self {
@@ -396,7 +403,7 @@ impl ExecIrBuilder {
     }
 
     pub fn new() -> Self {
-        let halt_check_every = const { NonZero::new(512 + 256).unwrap() };
+        let halt_check_every = const { NonZero::new(64).unwrap() };
         Self::with_config(IrBuilderConfig { halt_check_every })
     }
 
@@ -414,11 +421,21 @@ impl ExecIrBuilder {
 
     pub fn terminate(&mut self, terminator: Terminator) {
         match terminator {
-            Terminator::BrNZ { cond: int, .. }
-            | Terminator::ReturnFail { halt_reason: int } => {
+            Terminator::Return => {},
+
+            Terminator::ReturnFail { halt_reason: int } => {
                 assert!(matches!(self.lvalues[int].ty, Type::Int(_)))
             }
-            Terminator::Br(_) | Terminator::Return => {}
+
+            Terminator::BrNZ { cond: int, zero, non_zero } => {
+                assert!(matches!(self.lvalues[int].ty, Type::Bool | Type::Int(_)));
+                assert_ne!(zero, Block::ENTRYPOINT, "can't branch to entrypoint");
+                assert_ne!(non_zero, Block::ENTRYPOINT, "can't branch to entrypoint");
+            }
+
+            Terminator::Br(block) => {
+                assert_ne!(block, Block::ENTRYPOINT, "can't branch to entrypoint");
+            },
         }
 
         let mark_cold = matches!(terminator, Terminator::ReturnFail { .. });
@@ -448,6 +465,7 @@ impl ExecIrBuilder {
 
 
             StmtKind::ArithBinOp { lhs, .. }
+            | StmtKind::AddImm { value: lhs, .. }
             | StmtKind::Bitwise { lhs, .. }
             | StmtKind::BitwiseImm { lhs, .. }
             | StmtKind::Select { cond: _, if_true: lhs, if_false: _ } => {
@@ -470,7 +488,7 @@ impl ExecIrBuilder {
 
             StmtKind::StoreHost { .. } => array_helper::empty(),
             StmtKind::LoadHaltReason => array_helper::iter_from_arr([Type::Int(IntWidth::W32)]),
-            StmtKind::InstructionDone => array_helper::empty(),
+            StmtKind::Safepoint => array_helper::empty(),
         }
     }
 
@@ -867,6 +885,21 @@ impl ExecIrBuilder {
         self.emit_arith_binop(ArithBinOp::Add, lhs, rhs)
     }
 
+    pub fn add_imm(&mut self, value: LValue, amount: IConst) -> LValue {
+        // FIXME clean up code duplication
+        self.emit_same_int_ty_imm(
+            "arithmetic",
+            value,
+            amount.width,
+            move |this| unsafe {
+                this.emit_1ret_stmt(StmtKind::AddImm {
+                    value,
+                    imm64: amount.bits,
+                })
+            }
+        )
+    }
+
     pub fn sub(&mut self, lhs: LValue, rhs: LValue) -> LValue {
         self.emit_arith_binop(ArithBinOp::Sub, lhs, rhs)
     }
@@ -908,6 +941,8 @@ impl ExecIrBuilder {
         )
     }
 
+    /// This is a normal value-producing bin-op.
+    ///
     /// It does not branch, does not panic, and does not terminate the block
     /// and does not update condition flags.
     /// The result is the signed quotient of `lhs / rhs`, rounded toward zero.
@@ -987,12 +1022,19 @@ impl ExecIrBuilder {
             let block_data = &mut self.blocks[block];
             let insert_at = insert_at(block_data);
 
-            if let Some(instruction_end) = insert_at.checked_sub(1) {
-                assert!(matches!(
-                    block_data.stmts[instruction_end].rvalue,
-                    StmtKind::InstructionDone
-                ));
-            }
+            let is_after_safepoint = insert_at
+                .checked_sub(1)
+                .is_some_and(|instruction_end| {
+                    matches!(
+                        block_data.stmts[instruction_end].rvalue,
+                        StmtKind::Safepoint
+                    )
+                });
+
+            assert!(
+                is_after_safepoint,
+                "internal error: halt check must be inserted immediately after a safepoint"
+            );
 
             let tail_stmts = block_data.stmts.split_off(insert_at);
             let old_terminator =
@@ -1034,19 +1076,24 @@ impl ExecIrBuilder {
         continuation
     }
 
-    pub fn instruction_done(&mut self) {
-        unsafe {
-            self.emit_void_stmt(StmtKind::InstructionDone);
-
-            self.halt_check_in = self.halt_check_in.strict_sub(1);
-            if self.halt_check_in == 0 {
-                self.halt_check_in = self.halt_check_every.get();
-                self.current_block = self.insert_halt_check_at(
-                    self.current_block,
-                    |block| block.stmts.len()
-                );
-            }
+    pub fn add_safepoint(&mut self) {
+        unsafe { self.emit_void_stmt(StmtKind::Safepoint) }
+        self.halt_check_in = self.halt_check_in.strict_sub(1);
+        if self.halt_check_in == 0 {
+            self.halt_check_in = self.halt_check_every.get();
+            self.current_block = self.insert_halt_check_at(
+                self.current_block,
+                |block| block.stmts.len()
+            );
         }
+    }
+
+    /// Shorthand to both increment `pc` and insert a safepoint
+    pub fn next_insn(&mut self) {
+        let pc = self.load_pc();
+        let new_pc = self.add_imm(pc, IConst::u64(4));
+        self.store_pc(new_pc);
+        self.add_safepoint()
     }
 }
 
@@ -1162,6 +1209,16 @@ fn compute_backedge_sources(exec_ir: &ExecIrBuilder) -> Vec<Block> {
 
 impl ExecIrBuilder {
     fn insert_halt_check_guard(&mut self, block: Block) {
+        // FIXME currently this is broken
+        //       an instruction can legally do
+        //       BrNZ BrNZ BrNZ BrNZ
+        //       to say for example it loads 4 64 bit numbers and that will lead to several blocks
+        //       that check for faulting; what we actually need to do is place the halt check
+        //       right after a safepoint, which is a point of the program that can be paused
+        //       also meaning that the instruction just finished; but we seperate incrementing
+        //       the PC/or for example jumping to a new PC, and having the instruction be done
+
+
         // place the halt poll after instruction completion.
         // That preserves the invariant that a translated instruction either fully retires
         // before observing an external halt request, or has not started the next instruction yet.
@@ -1169,7 +1226,7 @@ impl ExecIrBuilder {
             block_data
                 .stmts
                 .iter()
-                .rposition(|stmt| matches!(stmt.rvalue, StmtKind::InstructionDone))
+                .rposition(|stmt| matches!(stmt.rvalue, StmtKind::Safepoint))
                 .map_or(0, |idx| idx.strict_add(1))
         });
     }
@@ -1195,7 +1252,7 @@ impl ExecIrBuilder {
 mod exec_ir_tests {
     use std::sync::LazyLock;
     use crate::cpu_fabric::CpuFabric;
-    use crate::halt_reason::AtomicHaltReason;
+    use crate::halt_reason::{AtomicHaltReason, HaltReason, HaltReasonInner};
     use crate::io_mmu::IoMMU;
     use crate::ir::compiler::{CompiledExecBlock, ExecIrCompiler};
     use super::*;
@@ -1210,13 +1267,33 @@ mod exec_ir_tests {
         COMPILER.compile(builder.build())
     }
 
+
+    fn call_compiled_full(
+        compiled: &CompiledExecBlock,
+        processor_state: &mut ProcessorState,
+        setup: impl FnOnce(&mut ProcessorState, &IoMMU, &AtomicHaltReason),
+    ) -> u32 {
+        let halt_reason = AtomicHaltReason::new();
+        let io_mmu = empty_io_mmu();
+        setup(processor_state, &io_mmu, &halt_reason);
+        compiled.call(processor_state, &halt_reason, &io_mmu)
+    }
+
     fn call_compiled(
         compiled: &CompiledExecBlock,
         processor_state: &mut ProcessorState,
     ) -> u32 {
-        let halt_reason = AtomicHaltReason::new();
-        let io_mmu = empty_io_mmu();
-        compiled.call(processor_state, &halt_reason, &io_mmu)
+        call_compiled_full(compiled, processor_state, |_, _, _| {})
+    }
+
+
+    fn run_full(
+        builder: ExecIrBuilder,
+        processor_state: &mut ProcessorState,
+        setup: impl FnOnce(&mut ProcessorState, &IoMMU, &AtomicHaltReason),
+    ) -> u32 {
+        let compiled = compile(builder);
+        call_compiled_full(&compiled, processor_state, setup)
     }
 
     fn run(builder: ExecIrBuilder, processor_state: &mut ProcessorState) -> u32 {
@@ -1689,9 +1766,9 @@ mod exec_ir_tests {
     fn instruction_done_increments_pc_by_four_each_time() {
         let mut builder = ExecIrBuilder::new();
 
-        builder.instruction_done();
-        builder.instruction_done();
-        builder.instruction_done();
+        builder.next_insn();
+        builder.next_insn();
+        builder.next_insn();
 
         let mut state = ProcessorState::initial();
         state.pc = 0x1000;
@@ -1707,7 +1784,7 @@ mod exec_ir_tests {
 
         let pc = u64_const(&mut builder, 0x2000);
         builder.store_pc(pc);
-        builder.instruction_done();
+        builder.next_insn();
 
         let mut state = ProcessorState::initial();
         state.pc = 0x1000;
@@ -2291,10 +2368,10 @@ mod exec_ir_tests {
             halt_check_every: NonZero::new(1).unwrap()
         });
 
-        builder.instruction_done();
-        builder.instruction_done();
-        builder.instruction_done();
-        builder.instruction_done();
+        builder.next_insn();
+        builder.next_insn();
+        builder.next_insn();
+        builder.next_insn();
 
         let mut state = ProcessorState::initial();
         state.pc = 0x40;
@@ -2309,7 +2386,7 @@ mod exec_ir_tests {
         let mut builder = ExecIrBuilder::new();
 
         for _ in 0..520 {
-            builder.instruction_done();
+            builder.next_insn();
         }
 
         let mut state = ProcessorState::initial();
@@ -2334,7 +2411,7 @@ mod exec_ir_tests {
         let one = builder.iconst(IConst::u64(1));
         let next = builder.sub(current, one);
         builder.store_x_reg::<0>(next);
-        builder.instruction_done();
+        builder.next_insn();
         builder.terminate(Terminator::BrNZ {
             cond: next,
             non_zero: loop_block,
@@ -2420,8 +2497,7 @@ mod exec_ir_tests {
     }
 
     #[test]
-    #[should_panic]
-    fn terminator_rejects_bool_branch_condition() {
+    fn terminator_accept_bool_branch_condition() {
         let mut builder = ExecIrBuilder::new();
 
         let one = builder.iconst(IConst::u64(1));
@@ -2453,5 +2529,35 @@ mod exec_ir_tests {
 
         let wide = builder.iconst(IConst::u64(0));
         builder.store_pstate(wide);
+    }
+
+
+    #[test]
+    fn halts_inifnite_loop() {
+        let mut builder = ExecIrBuilder::new();
+
+        let new_block = builder.create_block();
+        // can't loop back to entry point; invalid IR
+        builder.terminate(Terminator::Br(new_block));
+        builder.switch_to(new_block);
+        builder.terminate(Terminator::Br(new_block));
+
+        let expected_code = HaltReason {
+            opcode: NonZero::new(121).unwrap(),
+            payload: 0xbeef,
+        };
+
+        let code = run_full(
+            builder,
+            &mut ProcessorState::initial(),
+            |_, _io_mmu, halt_reason| {
+                halt_reason.halt(expected_code);
+            }
+        );
+
+        assert_eq!(
+            Some(expected_code),
+            HaltReason::from_inner(HaltReasonInner::from_bits_retain(code))
+        )
     }
 }

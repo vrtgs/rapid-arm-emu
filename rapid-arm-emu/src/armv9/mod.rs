@@ -126,6 +126,6 @@ impl Armv9CpuCore {
     }
 
     pub fn halt(&self, reason: HaltReason) {
-        self.halt_reason.add_reasons(reason.into_inner())
+        self.halt_reason.add_reasons_full(reason.into_inner())
     }
 }
