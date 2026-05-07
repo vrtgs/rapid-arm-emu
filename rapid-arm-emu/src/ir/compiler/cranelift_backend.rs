@@ -342,7 +342,7 @@ impl<'a> FunctionLowering<'a> {
                 self.builder.ins().return_(&[zero]);
             }
 
-            Terminator::ReturnFail { halt_reason } => {
+            Terminator::ReturnCode { halt_reason } => {
                 let halt_reason = self.use_value(halt_reason)?;
                 self.assert_value_ty(
                     halt_reason,
@@ -527,6 +527,7 @@ impl CraneliftCompiler {
             let code = ctx.compiled_code()
                 .expect("Cranelift did not leave compiled code in the context");
 
+            eprintln!("{}:", options.function_name);
             eprintln!("{}", code.vcode.as_deref().unwrap_or("no disassembly was produced"));
         }
 

@@ -8,6 +8,7 @@ use crate::ir::arena::{impl_storable, Arena, ArenaSet};
 mod arena;
 pub(crate) mod compiler;
 pub(crate) mod ffi_support;
+mod halt_check_pass;
 
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -331,11 +332,11 @@ struct Stmt {
 
 
 #[derive(Debug)]
-enum Terminator {
+pub enum Terminator {
     /// Return "0" i.e. return success.
     Return,
     /// Return a `NonZero<u32>` block-exit reason.
-    ReturnFail {
+    ReturnCode {
         halt_reason: LValue
     },
     BrNZ {
@@ -346,9 +347,31 @@ enum Terminator {
     Br(Block),
 }
 
+impl Terminator {
+    pub const MAX_TARGETS: usize = 2;
+
+    pub fn targets(&self) -> arrayvec::IntoIter<Block, { Self::MAX_TARGETS }> {
+        match *self {
+            Terminator::Br(target) => array_helper::iter_from_arr([target]),
+
+
+            Terminator::Return | Terminator::ReturnCode { .. } => array_helper::empty(),
+
+            Terminator::BrNZ {
+                non_zero,
+                zero,
+                ..
+            } => array_helper::iter_from_arr([non_zero, zero]),
+        }
+    }
+}
+
+
 #[derive(Debug)]
 struct BlockData {
+    predecessors: Vec<Block>,
     stmts: Vec<Stmt>,
+    terminated: bool,
     terminator: Terminator,
     is_cold: bool,
 }
@@ -356,7 +379,9 @@ struct BlockData {
 impl BlockData {
     pub fn empty() -> Self {
         Self {
+            predecessors: vec![],
             stmts: vec![],
+            terminated: false,
             terminator: Terminator::Return,
             is_cold: false,
         }
@@ -376,6 +401,7 @@ pub(crate) struct ExecIr {
     lvalues: Arena<LValueData>,
     blocks: Arena<BlockData>,
     block_compile_order: Vec<Block>,
+    halt_check_every: NonZero<u32>,
 }
 
 
@@ -384,7 +410,6 @@ pub(crate) struct ExecIrBuilder {
     blocks: Arena<BlockData>,
     current_block: Block,
     halt_check_every: NonZero<u32>,
-    halt_check_in: u32,
 }
 
 pub(crate) struct IrBuilderConfig {
@@ -398,7 +423,6 @@ impl ExecIrBuilder {
             blocks: Arena::new(),
             current_block: Block::ENTRYPOINT,
             halt_check_every: config.halt_check_every,
-            halt_check_in: config.halt_check_every.get()
         }
     }
 
@@ -419,30 +443,64 @@ impl ExecIrBuilder {
         self.current_block = block;
     }
 
-    pub fn terminate(&mut self, terminator: Terminator) {
+
+    pub fn predecessors(&self, block: Block) -> &[Block] {
+        self.blocks[block].predecessors.as_slice()
+    }
+
+    pub fn successors(
+        &self,
+        block: Block
+    ) -> arrayvec::IntoIter<Block, { Terminator::MAX_TARGETS }> {
+        self.blocks[block].terminator.targets()
+    }
+
+    pub fn terminate_block(
+        &mut self,
+        block: Block,
+        mut terminator: Terminator
+    ) {
+
         match terminator {
             Terminator::Return => {},
 
-            Terminator::ReturnFail { halt_reason: int } => {
+            Terminator::ReturnCode { halt_reason: int } => {
                 assert!(matches!(self.lvalues[int].ty, Type::Int(_)))
             }
 
             Terminator::BrNZ { cond: int, zero, non_zero } => {
                 assert!(matches!(self.lvalues[int].ty, Type::Bool | Type::Int(_)));
-                assert_ne!(zero, Block::ENTRYPOINT, "can't branch to entrypoint");
-                assert_ne!(non_zero, Block::ENTRYPOINT, "can't branch to entrypoint");
+                if zero == non_zero {
+                    terminator = Terminator::Br(zero)
+                }
             }
 
-            Terminator::Br(block) => {
-                assert_ne!(block, Block::ENTRYPOINT, "can't branch to entrypoint");
-            },
+            Terminator::Br(_) => {},
         }
 
-        let mark_cold = matches!(terminator, Terminator::ReturnFail { .. });
-        self.blocks[self.current_block].terminator = terminator;
+        for target in terminator.targets() {
+            assert_ne!(target, Block::ENTRYPOINT, "can't branch to entrypoint");
+        }
+
+        let mark_cold = matches!(terminator, Terminator::ReturnCode { .. });
+
+        for target in terminator.targets() {
+            self.blocks[target].predecessors.push(block)
+        }
+
+        let block_data = &mut self.blocks[block];
+        assert!(!block_data.terminated);
+        block_data.terminator = terminator;
+        block_data.terminated = true;
+
         if mark_cold {
             self.mark_block_bold()
         }
+    }
+
+    pub fn terminate(&mut self, terminator: Terminator) {
+        let current_block = self.current_block;
+        self.terminate_block(current_block, terminator)
     }
 
     pub fn mark_block_bold(&mut self) {
@@ -1016,11 +1074,10 @@ impl ExecIrBuilder {
     fn insert_halt_check_at(
         &mut self,
         block: Block,
-        insert_at: impl FnOnce(&mut BlockData) -> usize
+        insert_at: usize
     ) -> Block {
-        let (tail_stmts, old_terminator, old_is_cold) = {
+        let (tail_stmts, old_terminated, old_terminator, old_is_cold) = {
             let block_data = &mut self.blocks[block];
-            let insert_at = insert_at(block_data);
 
             let is_after_safepoint = insert_at
                 .checked_sub(1)
@@ -1040,52 +1097,55 @@ impl ExecIrBuilder {
             let old_terminator =
                 std::mem::replace(&mut block_data.terminator, Terminator::Return);
             let old_is_cold = block_data.is_cold;
-            (tail_stmts, old_terminator, old_is_cold)
+            let old_terminated = block_data.terminated;
+            (tail_stmts, old_terminated, old_terminator, old_is_cold)
         };
 
-        let (halt_reason, reservation) = self.lvalues.reserve();
-        reservation.store(LValueData {
+
+        let halt_reason = self.lvalues.store(LValueData {
             ty: Type::Int(IntWidth::W32),
         });
 
         let continuation = self.blocks.store(BlockData {
+            predecessors: vec![],
             stmts: tail_stmts,
+            terminated: old_terminated,
             terminator: old_terminator,
             is_cold: old_is_cold,
         });
 
         let fail = self.blocks.store(BlockData {
+            predecessors: vec![],
             stmts: Vec::new(),
-            terminator: Terminator::ReturnFail { halt_reason },
+            terminated: true,
+            terminator: Terminator::ReturnCode { halt_reason },
             is_cold: true,
         });
 
-        let block_data = &mut self.blocks[block];
 
+        let block_data = &mut self.blocks[block];
         block_data.stmts.push(Stmt {
             outputs: array_helper::from_arr([halt_reason]),
             rvalue: StmtKind::LoadHaltReason,
         });
 
-        block_data.terminator = Terminator::BrNZ {
+        // only time we need to "unterminate" a block
+        block_data.terminated = false;
+        self.terminate_block(block, Terminator::BrNZ {
             cond: halt_reason,
             non_zero: fail,
             zero: continuation,
-        };
+        });
+
+        debug_assert_eq!(self.blocks[fail].predecessors, [block]);
+        debug_assert_eq!(self.blocks[continuation].predecessors, [block]);
+
 
         continuation
     }
 
     pub fn add_safepoint(&mut self) {
         unsafe { self.emit_void_stmt(StmtKind::Safepoint) }
-        self.halt_check_in = self.halt_check_in.strict_sub(1);
-        if self.halt_check_in == 0 {
-            self.halt_check_in = self.halt_check_every.get();
-            self.current_block = self.insert_halt_check_at(
-                self.current_block,
-                |block| block.stmts.len()
-            );
-        }
     }
 
     /// Shorthand to both increment `pc` and insert a safepoint
@@ -1098,150 +1158,60 @@ impl ExecIrBuilder {
 }
 
 
-fn terminator_targets(terminator: &Terminator) -> arrayvec::IntoIter<Block, 2> {
-    match *terminator {
-        Terminator::Br(target) => array_helper::iter_from_arr([target]),
-
-
-        Terminator::Return | Terminator::ReturnFail { .. } => array_helper::empty(),
-
-        Terminator::BrNZ {
-            non_zero,
-            zero,
-            ..
-        } => array_helper::iter_from_arr([non_zero, zero]),
-    }
-}
-
-
-fn compute_reverse_post_order(exec_ir: &ExecIrBuilder) -> Vec<Block> {
-    #[derive(Debug, Copy, Clone)]
-    enum DfsFrame {
-        Enter(Block),
-        Exit(Block),
-    }
-
-    let mut seen = ArenaSet::with_capacity(exec_ir.blocks.len());
-
-    let mut postorder = Vec::with_capacity(exec_ir.blocks.len());
-
-    let mut dfs_stack = vec![DfsFrame::Enter(Block::ENTRYPOINT)];
-
-    while let Some(frame) = dfs_stack.pop() {
-        match frame {
-            DfsFrame::Enter(block) => {
-                if !seen.insert(block) {
-                    continue;
-                }
-
-                dfs_stack.push(DfsFrame::Exit(block));
-
-                let block_terminator = &exec_ir.blocks[block].terminator;
-
-                for target in terminator_targets(block_terminator).rev() {
-                    if !seen.contains(target) {
-                        dfs_stack.push(DfsFrame::Enter(target));
-                    }
-                }
-            }
-
-            DfsFrame::Exit(block) => {
-                assert!(postorder.len() < exec_ir.blocks.len());
-                postorder.push(block);
-            }
-        }
-    }
-
-    assert!(postorder.len() <= exec_ir.blocks.len());
-
-    postorder.reverse();
-    postorder
-}
-
-
-fn compute_backedge_sources(exec_ir: &ExecIrBuilder) -> Vec<Block> {
-    #[derive(Debug, Copy, Clone)]
-    enum DfsFrame {
-        Enter(Block),
-        Exit(Block),
-    }
-
-    let mut seen = ArenaSet::with_capacity(exec_ir.blocks.len());
-    let mut active = ArenaSet::with_capacity(exec_ir.blocks.len());
-
-    let mut backedge_source_set = ArenaSet::with_capacity(exec_ir.blocks.len());
-    let mut backedge_sources = Vec::new();
-
-    let mut dfs_stack = vec![DfsFrame::Enter(Block::ENTRYPOINT)];
-
-    while let Some(frame) = dfs_stack.pop() {
-        match frame {
-            DfsFrame::Enter(block) => {
-                if !seen.insert(block) {
-                    continue;
-                }
-
-                active.insert(block);
-                dfs_stack.push(DfsFrame::Exit(block));
-
-                let block_terminator = &exec_ir.blocks[block].terminator;
-
-                for target in terminator_targets(block_terminator) {
-                    if active.contains(target) {
-                        if backedge_source_set.insert(block) {
-                            backedge_sources.push(block);
-                        }
-                    } else if !seen.contains(target) {
-                        dfs_stack.push(DfsFrame::Enter(target));
-                    }
-                }
-            }
-
-            DfsFrame::Exit(block) => {
-                active.remove(block);
-            }
-        }
-    }
-
-    backedge_sources
-}
-
 
 impl ExecIrBuilder {
-    fn insert_halt_check_guard(&mut self, block: Block) {
-        // FIXME currently this is broken
-        //       an instruction can legally do
-        //       BrNZ BrNZ BrNZ BrNZ
-        //       to say for example it loads 4 64 bit numbers and that will lead to several blocks
-        //       that check for faulting; what we actually need to do is place the halt check
-        //       right after a safepoint, which is a point of the program that can be paused
-        //       also meaning that the instruction just finished; but we seperate incrementing
-        //       the PC/or for example jumping to a new PC, and having the instruction be done
+    fn topo_sort(&self) -> Vec<Block> {
+        #[derive(Debug, Copy, Clone)]
+        enum DfsFrame {
+            Enter(Block),
+            Exit(Block),
+        }
 
+        let mut seen = ArenaSet::with_capacity(self.blocks.len());
 
-        // place the halt poll after instruction completion.
-        // That preserves the invariant that a translated instruction either fully retires
-        // before observing an external halt request, or has not started the next instruction yet.
-        self.insert_halt_check_at(block, |block_data| {
-            block_data
-                .stmts
-                .iter()
-                .rposition(|stmt| matches!(stmt.rvalue, StmtKind::Safepoint))
-                .map_or(0, |idx| idx.strict_add(1))
-        });
-    }
+        let mut postorder = Vec::with_capacity(self.blocks.len());
 
-    pub fn build(mut self) -> ExecIr {
-        if self.halt_check_every != const { NonZero::new(1).unwrap() } {
-            for block in compute_backedge_sources(&self) {
-                self.insert_halt_check_guard(block);
+        let mut dfs_stack = vec![DfsFrame::Enter(Block::ENTRYPOINT)];
+
+        while let Some(frame) = dfs_stack.pop() {
+            match frame {
+                DfsFrame::Enter(block) => {
+                    if !seen.insert(block) {
+                        continue;
+                    }
+
+                    dfs_stack.push(DfsFrame::Exit(block));
+
+                    let terminator = &self.blocks[block].terminator;
+
+                    for target in terminator.targets().rev() {
+                        if !seen.contains(target) {
+                            dfs_stack.push(DfsFrame::Enter(target));
+                        }
+                    }
+                }
+
+                DfsFrame::Exit(block) => {
+                    assert!(postorder.len() < self.blocks.len());
+                    postorder.push(block);
+                }
             }
         }
 
-        let reverse_post_order = compute_reverse_post_order(&self);
+        assert!(postorder.len() <= self.blocks.len());
+
+        postorder.reverse();
+        postorder
+    }
+
+    #[must_use]
+    pub fn build(mut self) -> ExecIr {
+        halt_check_pass::insert_halt_checks(&mut self);
+        let reverse_post_order  = self.topo_sort();
         ExecIr {
             lvalues: self.lvalues,
             blocks: self.blocks,
+            halt_check_every: self.halt_check_every,
             block_compile_order: reverse_post_order
         }
     }
@@ -1802,8 +1772,11 @@ mod exec_ir_tests {
         let exit_block = builder.create_block();
 
         builder.terminate(Terminator::Br(loop_block));
-
         builder.switch_to(loop_block);
+
+
+        builder.add_safepoint();
+
         let current = builder.load_x_reg::<0>(IntWidth::W64);
         let one = u64_const(&mut builder, 1);
         let next = builder.sub(current, one);
@@ -2303,7 +2276,7 @@ mod exec_ir_tests {
         store_x_const::<0>(&mut builder, 0x1234);
 
         let halt_reason = builder.iconst(IConst::u32(0x4d2));
-        builder.terminate(Terminator::ReturnFail { halt_reason });
+        builder.terminate(Terminator::ReturnCode { halt_reason });
 
         let mut state = ProcessorState::initial();
         assert_eq!(run(builder, &mut state), 0x4d2);
@@ -2326,7 +2299,7 @@ mod exec_ir_tests {
 
         builder.switch_to(fail);
         let halt_reason = builder.iconst(IConst::u32(0xbeef));
-        builder.terminate(Terminator::ReturnFail { halt_reason });
+        builder.terminate(Terminator::ReturnCode { halt_reason });
 
         builder.switch_to(ok);
         store_x_const::<1>(&mut builder, 0x600d);
@@ -2519,7 +2492,7 @@ mod exec_ir_tests {
         let one = builder.iconst(IConst::u64(1));
         let halt_reason = builder.icmp_imm(IntCmp::Equal, one, IConst::u64(1));
 
-        builder.terminate(Terminator::ReturnFail { halt_reason });
+        builder.terminate(Terminator::ReturnCode { halt_reason });
     }
 
     #[test]
@@ -2540,6 +2513,7 @@ mod exec_ir_tests {
         // can't loop back to entry point; invalid IR
         builder.terminate(Terminator::Br(new_block));
         builder.switch_to(new_block);
+        builder.add_safepoint();
         builder.terminate(Terminator::Br(new_block));
 
         let expected_code = HaltReason {
@@ -2559,5 +2533,20 @@ mod exec_ir_tests {
             Some(expected_code),
             HaltReason::from_inner(HaltReasonInner::from_bits_retain(code))
         )
+    }
+
+
+    #[test]
+    #[should_panic]
+    fn inifnite_loop_with_no_safepoint() {
+        let mut builder = ExecIrBuilder::new();
+
+        let new_block = builder.create_block();
+        // can't loop back to entry point; invalid IR
+        builder.terminate(Terminator::Br(new_block));
+        builder.switch_to(new_block);
+        builder.terminate(Terminator::Br(new_block));
+        
+        let _ = builder.build();
     }
 }

@@ -12,6 +12,8 @@ pastey = "0.2.2"
 thiserror = "2.0.18"
 anyhow = "1.0.102"
 arrayvec = "0.7.6"
+stacker = "0.1.24"
+rpds = "1.2.0"
 
 [dependencies.gccjit]
 version = "3.3.0"

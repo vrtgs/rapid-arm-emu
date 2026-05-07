@@ -35,6 +35,12 @@ impl HaltReasonInner {
 }
 
 
+pub const INVALID_INSN: NonZero<u8> = NonZero::new(1).unwrap();
+pub const UNALIGNED_PC: NonZero<u8> = NonZero::new(2).unwrap();
+pub const MEMORY_TRAP: NonZero<u8> = NonZero::new(3).unwrap();
+
+
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HaltReason {
     pub opcode: NonZero<u8>,
@@ -44,7 +50,7 @@ pub struct HaltReason {
 impl HaltReason {
     pub(crate) fn from_inner(reason: HaltReasonInner) -> Option<Self> {
         let bits = reason.bits();
-        let opcode = NonZero::new((bits >> 8) as u8)?;
+        let opcode = NonZero::new(((bits >> 8) & 0xFF) as u8)?;
         let payload = (bits >> 16) as u16;
         Some(Self {
             opcode,
@@ -69,10 +75,6 @@ pub(crate) struct AtomicHaltReason(AtomicU32);
 impl AtomicHaltReason {
     pub(crate) fn new() -> Self {
         Self(AtomicU32::new(0))
-    }
-
-    pub fn load(&self) -> HaltReasonInner {
-        HaltReasonInner::from_bits_retain(self.0.load(Ordering::Acquire))
     }
 
     #[inline]

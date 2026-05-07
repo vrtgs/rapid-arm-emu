@@ -1292,10 +1292,6 @@ mod mmu_tests {
             self.mmu.load(vaddr, &mut out).unwrap().to_vec()
         }
 
-        fn flags(&self, page: usize) -> MemProt {
-            self.mmu.pages[page].mem_prot
-        }
-
         fn is_dirty(&self, page: usize) -> bool {
             self.mmu.pages[page].insn_dirty.load(Ordering::Relaxed)
         }

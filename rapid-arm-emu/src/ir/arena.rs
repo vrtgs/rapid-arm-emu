@@ -65,13 +65,6 @@ impl RawHandle {
         }
     }
 
-    pub const fn inc(self) -> Option<Self> {
-        match self.0.checked_add(1) {
-            Some(nz) => Some(Self(nz)),
-            None => None
-        }
-    }
-
     pub const fn get(self) -> usize {
         int_to_usize(unsafe { self.0.get().unchecked_sub(1) })
     }
@@ -157,6 +150,16 @@ impl<S: Storable> Arena<S> {
     pub fn len(&self) -> usize {
         self.0.len()
     }
+
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item=(S::Handle, &S)> {
+        self.assert_invariants();
+        self.0.iter().enumerate().map(|(i, item)| (from_raw(RawHandle::new(i)), item))
+    }
+    
+    pub fn keys(&self) -> impl DoubleEndedIterator<Item=S::Handle> {
+        self.assert_invariants();
+        (0..self.len()).map(RawHandle::new).map(from_raw::<S::Handle>)
+    }
 }
 
 pub struct Reservation<'a, S>(&'a mut Arena<S>);
@@ -233,8 +236,12 @@ impl<K: Handle, V> ArenaMap<K, V> {
         Self(Vec::from_iter(std::iter::repeat_with(|| None).take(capacity)), PhantomData)
     }
 
+    pub fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
     pub fn get(&self, key: K) -> Option<&V> {
-        self.0.get(to_raw(key).get()).map_or(None, Option::as_ref)
+        self.0.get(to_raw(key).get()).and_then(Option::as_ref)
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
@@ -244,6 +251,16 @@ impl<K: Handle, V> ArenaMap<K, V> {
             self.0.resize_with(index.strict_add(1), || None);
         }
         self.0[index].replace(value)
+    }
+    
+    pub fn iter(&self) -> impl Iterator<Item=(K, &V)> {
+        self
+            .0
+            .iter()
+            .enumerate()
+            .filter_map(|(i, val)| {
+                val.as_ref().map(|val| (from_raw::<K>(RawHandle::new(i)), val)) 
+            })
     }
 }
 
@@ -267,12 +284,20 @@ impl<K: Handle, V> Index<K> for ArenaMap<K, V> {
 
 pub struct ArenaSet<K>(Vec<usize>, PhantomData<K>);
 
+impl<K: Handle> Clone for ArenaSet<K> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone(), self.1)
+    }
+    
+    fn clone_from(&mut self, source: &Self) {
+        self.0.clone_from(&source.0)
+    }
+}
+
 impl<K: Handle> ArenaSet<K> {
     const BITS: NonZero<usize> = {
         let bits: u32 = usize::BITS;
         assert!(bits <= 256);
-        assert!(usize::MAX >= 256);
-
         NonZero::new(bits as usize).unwrap()
     };
 
@@ -287,6 +312,10 @@ impl<K: Handle> ArenaSet<K> {
         let mut this = Self(vec![], PhantomData);
         this.reserve(capacity);
         this
+    }
+
+    pub fn new() -> Self {
+        Self::with_capacity(0)
     }
 
     fn index_and_mask(key: K) -> (usize, usize) {
@@ -322,11 +351,9 @@ impl<K: Handle> ArenaSet<K> {
         *row = old_row & !mask;
         (old_row & mask) != 0
     }
-}
 
-impl<K: Handle + Debug> Debug for ArenaSet<K> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let iter = self
+    pub fn iter(&self) -> impl Iterator<Item=K> {
+        self
             .0
             .iter()
             .flat_map(|&bits| {
@@ -337,12 +364,25 @@ impl<K: Handle + Debug> Debug for ArenaSet<K> {
             .enumerate()
             .filter_map(|(i, mask)| (mask != 0).then_some(i))
             .map(RawHandle::new)
-            .map(from_raw::<K>);
+            .map(from_raw::<K>)
+    }
+}
 
-        f
-            .debug_set()
-            .entries(iter)
-            .finish()
+impl<K: Handle> FromIterator<K> for ArenaSet<K> {
+    fn from_iter<T: IntoIterator<Item=K>>(iter: T) -> Self {
+        let iter = iter.into_iter();
+        let (lower, _upper) = iter.size_hint();
+        let mut this = ArenaSet::with_capacity(lower);
+        for key in iter {
+            this.insert(key);
+        }
+        this
+    }
+}
+
+impl<K: Handle + Debug> Debug for ArenaSet<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
     }
 }
 
@@ -360,6 +400,21 @@ macro_rules! make_handle {
 }
 
 macro_rules! handle_impl_helper {
+    (
+        impl usize like for $name: path;
+    ) => {
+        impl $name {
+            pub const fn new(index: usize) -> Self {
+                let raw = $crate::ir::arena::RawHandle::new(index);
+                $crate::ir::arena::from_raw(raw)
+            }
+            
+            pub const fn get(self) -> usize {
+                $crate::ir::arena::to_raw(self).get()
+            }
+        }
+    };
+    
     (
         impl const for $name: path {
             $(const $const_name: ident;)*
