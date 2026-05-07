@@ -325,9 +325,14 @@ enum StmtKind {
 }
 
 #[derive(Debug)]
-struct Stmt {
+struct StmtData {
     outputs: ArrayVec<LValue, MAX_STMT_OUTPUTS>,
     rvalue: StmtKind,
+}
+
+impl_storable! {
+    StmtData as impl Stmt;
+    init: { }
 }
 
 
@@ -389,17 +394,18 @@ impl BlockData {
 }
 
 
-impl_storable!(
+impl_storable! {
     BlockData as impl pub Block;
     init: {
         const ENTRYPOINT = BlockData::empty();
     }
-);
+}
 
 
 pub(crate) struct ExecIr {
     lvalues: Arena<LValueData>,
     blocks: Arena<BlockData>,
+    stmts: Arena<StmtData>,
     block_compile_order: Vec<Block>,
     halt_check_every: NonZero<u32>,
 }
@@ -408,6 +414,7 @@ pub(crate) struct ExecIr {
 pub(crate) struct ExecIrBuilder {
     lvalues: Arena<LValueData>,
     blocks: Arena<BlockData>,
+    stmts: Arena<StmtData>,
     current_block: Block,
     halt_check_every: NonZero<u32>,
 }
@@ -421,6 +428,7 @@ impl ExecIrBuilder {
         Self {
             lvalues: Arena::new(),
             blocks: Arena::new(),
+            stmts: Arena::new(),
             current_block: Block::ENTRYPOINT,
             halt_check_every: config.halt_check_every,
         }
@@ -460,7 +468,6 @@ impl ExecIrBuilder {
         block: Block,
         mut terminator: Terminator
     ) {
-
         match terminator {
             Terminator::Return => {},
 
@@ -562,7 +569,8 @@ impl ExecIrBuilder {
         let emit_out: [LValue; N] = *emit_out.as_array()
             .expect("invalid stmt output amount");
 
-        self.blocks[self.current_block].stmts.push(Stmt { outputs, rvalue });
+        let stmt = self.stmts.store(StmtData { outputs, rvalue });
+        self.blocks[self.current_block].stmts.push(stmt);
 
         emit_out
     }
@@ -1083,7 +1091,7 @@ impl ExecIrBuilder {
                 .checked_sub(1)
                 .is_some_and(|instruction_end| {
                     matches!(
-                        block_data.stmts[instruction_end].rvalue,
+                        self.stmts[block_data.stmts[instruction_end]].rvalue,
                         StmtKind::Safepoint
                     )
                 });
@@ -1100,7 +1108,6 @@ impl ExecIrBuilder {
             let old_terminated = block_data.terminated;
             (tail_stmts, old_terminated, old_terminator, old_is_cold)
         };
-
 
         let halt_reason = self.lvalues.store(LValueData {
             ty: Type::Int(IntWidth::W32),
@@ -1124,10 +1131,11 @@ impl ExecIrBuilder {
 
 
         let block_data = &mut self.blocks[block];
-        block_data.stmts.push(Stmt {
+        let stmt = self.stmts.store(StmtData {
             outputs: array_helper::from_arr([halt_reason]),
             rvalue: StmtKind::LoadHaltReason,
         });
+        block_data.stmts.push(stmt);
 
         // only time we need to "unterminate" a block
         block_data.terminated = false;
@@ -1211,6 +1219,7 @@ impl ExecIrBuilder {
         ExecIr {
             lvalues: self.lvalues,
             blocks: self.blocks,
+            stmts: self.stmts,
             halt_check_every: self.halt_check_every,
             block_compile_order: reverse_post_order
         }
@@ -2546,7 +2555,7 @@ mod exec_ir_tests {
         builder.terminate(Terminator::Br(new_block));
         builder.switch_to(new_block);
         builder.terminate(Terminator::Br(new_block));
-        
+
         let _ = builder.build();
     }
 }

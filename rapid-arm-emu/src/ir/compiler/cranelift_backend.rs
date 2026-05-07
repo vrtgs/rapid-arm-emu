@@ -5,7 +5,7 @@ use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{Linkage, Module};
 use crate::ir::arena::ArenaMap;
-use crate::ir::{ArithBinOp, ExecIr, OverflowingBinOp, IConst, IntWidth, LValue, StmtKind, Stmt, Terminator, IntCmp, BitwiseOp, MAX_STMT_OUTPUTS};
+use crate::ir::{ArithBinOp, ExecIr, OverflowingBinOp, IConst, IntWidth, LValue, StmtKind, Terminator, IntCmp, BitwiseOp, MAX_STMT_OUTPUTS, StmtData};
 use crate::ir::{Block as IrBlock, Type as IrType};
 use cranelift::codegen::ir as clif_ir;
 use cranelift::prelude::{AbiParam, Configurable, InstBuilder, IntCC, MemFlags};
@@ -131,7 +131,7 @@ impl<'a> FunctionLowering<'a> {
     }
 
 
-    fn lower_stmt(&mut self, _exec_ir: &ExecIr, stmt: &Stmt) -> anyhow::Result<()> {
+    fn lower_stmt(&mut self, _exec_ir: &ExecIr, stmt: &StmtData) -> anyhow::Result<()> {
         let values = self.lower_rvalue(&stmt.rvalue)?;
         let outputs = stmt.outputs.as_slice();
 
@@ -388,7 +388,8 @@ impl<'a> FunctionLowering<'a> {
 
             let block_data = &exec_ir.blocks[ir_block];
 
-            for stmt in &block_data.stmts {
+            for &stmt in &block_data.stmts {
+                let stmt = &exec_ir.stmts[stmt];
                 self.lower_stmt(exec_ir, stmt)?;
             }
 

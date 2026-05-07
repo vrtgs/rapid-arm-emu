@@ -394,15 +394,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZero;
-use crate::ir::{Block, ExecIrBuilder, StmtKind};
+use crate::ir::{Block, ExecIrBuilder, Stmt, StmtKind};
 use crate::ir::arena::{handle_impl_helper, make_handle, Arena, ArenaMap, ArenaSet, Storable};
-
-#[derive(Copy, Clone)]
-struct SafepointLoc {
-    stmt_index: usize,
-    block: Block,
-}
-
 
 #[derive(Copy, Clone)]
 struct ShouldHalt(bool);
@@ -410,8 +403,57 @@ struct ShouldHalt(bool);
 #[derive(Clone)]
 struct HaltState {
     remaining: NonZero<usize>,
-    suffix_safepoints: rpds::Queue<SafepointLoc>
+    suffix_safepoints: rpds::Queue<Stmt>
 }
+
+struct HaltCheckInserter<'a> {
+    ir: &'a mut ExecIrBuilder,
+    // note: this is deliberately a hashmap
+    //       because there aren't that many
+    //       safepoints compared to other types of stmts
+    safepoint_stmt_to_block_and_index: HashMap<Stmt, (Block, usize)>
+}
+
+impl<'a> HaltCheckInserter<'a> {
+    pub fn new(ir: &'a mut ExecIrBuilder) -> Self {
+        let mut safepoints =
+            HashMap::with_capacity(ir.stmts.len().div_ceil(128));
+
+        for (block, data) in ir.blocks.iter() {
+            for (i, stmt) in data.stmts.iter().copied().enumerate() {
+                if let StmtKind::Safepoint = ir.stmts[stmt].rvalue {
+                    let old_pos = safepoints.insert(stmt, (block, i));
+                    debug_assert!(old_pos.is_none());
+                }
+            }
+        }
+
+        Self {
+            ir,
+            safepoint_stmt_to_block_and_index: safepoints
+        }
+    }
+
+    pub fn ir(&mut self) -> &mut ExecIrBuilder {
+        self.ir
+    }
+
+    pub fn insert_halt_check_at(&mut self, at: Stmt) {
+        let safepoints = &mut self.safepoint_stmt_to_block_and_index;
+        let (block, stmt_index) = safepoints[&at];
+        let continuation = self.ir.insert_halt_check_at(block, stmt_index);
+
+        for (i, &stmt) in self.ir.blocks[continuation].stmts.iter().enumerate() {
+            if let StmtKind::Safepoint = self.ir.stmts[stmt].rvalue {
+                let old = safepoints.insert(stmt, (continuation, i));
+                debug_assert!(old.is_some_and(|(old_block, old_idx)| {
+                    old_block == block && old_idx > stmt_index
+                }))
+            }
+        }
+    }
+}
+
 
 impl HaltState {
     fn from_remaining(remaining: NonZero<usize>) -> Self {
@@ -455,7 +497,7 @@ impl HaltState {
 
     pub fn normalize_to(
         &mut self,
-        ir: &mut ExecIrBuilder,
+        inserter: &mut HaltCheckInserter,
         halt_check_every: NonZero<usize>,
         target: NonZero<usize>,
     ) {
@@ -484,12 +526,8 @@ impl HaltState {
         }
 
         // `can_normalize_to` ensured this safepoint exists.
-        let insertion_safepoint = suffixes.peek().unwrap();
-
-        ir.insert_halt_check_at(
-            insertion_safepoint.block,
-            insertion_safepoint.stmt_index.strict_add(1),
-        );
+        let insertion_safepoint = suffixes.peek().copied().unwrap();
+        inserter.insert_halt_check_at(insertion_safepoint);
 
         self.remaining = target;
         // `self.suffix_safepoints` was taken above and intentionally remains empty.
@@ -499,7 +537,7 @@ impl HaltState {
     pub fn push_safepoint(
         &mut self,
         halt_check_every: NonZero<usize>,
-        safepoint: SafepointLoc,
+        safepoint: Stmt,
     ) -> ShouldHalt {
         let new_remaining = NonZero::new(self.remaining.get().strict_sub(1));
         self.remaining = new_remaining.unwrap_or(halt_check_every);
@@ -524,22 +562,21 @@ impl HaltState {
     #[inline]
     fn break_down_block_inner(
         mut this: Option<&mut Self>,
-        ir: &mut ExecIrBuilder,
+        inserter: &mut HaltCheckInserter,
         halt_check_every: NonZero<usize>,
         mut block: Block
     ) -> Block {
         'break_down_loop: loop {
+            let ir = inserter.ir();
+
             let mut split = None;
-            for (i, stmt) in ir.blocks[block].stmts.iter().enumerate() {
-                if let StmtKind::Safepoint = stmt.rvalue {
+            for (i, &stmt) in ir.blocks[block].stmts.iter().enumerate() {
+                if let StmtKind::Safepoint = ir.stmts[stmt].rvalue {
                     let should_halt = this.as_mut().map_or(
                         ShouldHalt(true),
                         |this| this.push_safepoint(
                             halt_check_every,
-                            SafepointLoc {
-                                stmt_index: i,
-                                block
-                            }
+                            stmt
                         )
                     );
 
@@ -563,7 +600,7 @@ impl HaltState {
 
     pub fn break_down_block(
         mut self,
-        ir: &mut ExecIrBuilder,
+        ir: &mut HaltCheckInserter,
         halt_check_every: NonZero<usize>,
         block: Block
     ) -> (Block, Self) {
@@ -582,7 +619,7 @@ impl HaltState {
     /// safepoint, inserting a halt check after every safepoint in the cyclic SCC
     /// guarantees every cycle contains at least one halt check.
     pub fn force_halt_checks_after_safepoints(
-        ir: &mut ExecIrBuilder,
+        ir: &mut HaltCheckInserter,
         block: Block,
     ) -> Block {
         Self::break_down_block_inner(
@@ -594,26 +631,26 @@ impl HaltState {
     }
 
     fn merge_halt_states(
-        ir: &mut ExecIrBuilder,
+        inserter: &mut HaltCheckInserter,
         halt_check_every: NonZero<usize>,
-        incoming: &mut [(Block, HaltState)],
+        incoming: &mut [HaltState],
     ) -> HaltState {
         match incoming {
             [] => HaltState::from_remaining(halt_check_every),
 
             // Single predecessor: preserve precise path-local suffix history.
-            [(_, state)] => state.clone(),
+            [state] => state.clone(),
 
             _ => {
                 let r_lo = incoming
                     .iter()
-                    .map(|(_, state)| state.remaining)
+                    .map(|state| state.remaining)
                     .min()
                     .unwrap();
 
                 let r_hi = incoming
                     .iter()
-                    .map(|(_, state)| state.remaining)
+                    .map(|state| state.remaining)
                     .max()
                     .unwrap();
 
@@ -624,11 +661,11 @@ impl HaltState {
                 if diff > threshold.get() {
                     let can_normalize = incoming
                         .iter()
-                        .all(|(_, s)| s.can_normalize_to(halt_check_every, r_hi));
+                        .all(|s| s.can_normalize_to(halt_check_every, r_hi));
 
                     if can_normalize {
-                        for (_, state) in incoming.iter_mut() {
-                            state.normalize_to(ir, halt_check_every, r_hi);
+                        for state in incoming {
+                            state.normalize_to(inserter, halt_check_every, r_hi);
                         }
 
                         return HaltState::from_remaining(r_hi);
@@ -769,7 +806,7 @@ fn block_has_safepoint(ir: &ExecIrBuilder, block: Block) -> bool {
     ir.blocks[block]
         .stmts
         .iter()
-        .any(|stmt| matches!(&stmt.rvalue, StmtKind::Safepoint))
+        .any(|&stmt| matches!(&ir.stmts[stmt].rvalue, StmtKind::Safepoint))
 }
 
 fn component_is_cyclic(ir: &ExecIrBuilder, component: &[Block]) -> bool {
@@ -899,18 +936,28 @@ pub fn insert_halt_checks(ir: &mut ExecIrBuilder) {
 
     let mut edge_state = HashMap::<(Block, Block), HaltState>::new();
 
+    let mut inserter = HaltCheckInserter::new(ir);
+
+
     for component_id in scc_graph.topo_order.iter().copied() {
         let component = &scc_graph.components[component_id];
 
-        let mut incoming = Vec::<(Block, HaltState)>::new();
+        let mut incoming = Vec::<HaltState>::with_capacity(
+            component.0.len()
+        );
 
         for &block in &component.0 {
+            let ir = inserter.ir();
+
             if block == Block::ENTRYPOINT {
-                incoming.push((
-                    Block::ENTRYPOINT,
-                    HaltState::from_remaining(halt_check_every)
-                ));
+                incoming.push(HaltState::from_remaining(halt_check_every));
                 debug_assert!(ir.predecessors(block).is_empty());
+                debug_assert_eq!(
+                    component.0.len(),
+                    1,
+                    "the entrypoint block can't participate in a cycle"
+                );
+
                 continue
             }
 
@@ -919,14 +966,13 @@ pub fn insert_halt_checks(ir: &mut ExecIrBuilder) {
                     continue;
                 }
 
-                if let Some(state) = edge_state.remove(&(pred, block)) {
-                    incoming.push((pred, state));
-                }
+                let state = edge_state.remove(&(pred, block)).unwrap();
+                incoming.push(state);
             }
         }
 
         let halt_state_in =
-            HaltState::merge_halt_states(ir, halt_check_every, &mut incoming);
+            HaltState::merge_halt_states(&mut inserter, halt_check_every, &mut incoming);
 
         if scc_graph.component_is_cyclic(component_id) {
             // TODO more complex analysis to be able to have fewer halt checks
@@ -951,9 +997,9 @@ pub fn insert_halt_checks(ir: &mut ExecIrBuilder) {
 
             for &block in &component.0 {
                 let tail_block =
-                    HaltState::force_halt_checks_after_safepoints(ir, block);
+                    HaltState::force_halt_checks_after_safepoints(&mut inserter, block);
 
-                for succ in ir.successors(tail_block) {
+                for succ in inserter.ir().successors(tail_block) {
                     if scc_graph.component_of.get(succ).copied() == Some(component_id) {
                         continue;
                     }
@@ -963,13 +1009,16 @@ pub fn insert_halt_checks(ir: &mut ExecIrBuilder) {
             }
         } else {
             let &[block] = component.0.as_slice() else {
-                panic!("empty SCC component")
+                match component.0.is_empty() {
+                    true => panic!("empty SCC component"),
+                    false => unreachable!("SCCs with more than one component must be cyclical")
+                }
             };
 
             let (tail_block, halt_state_out) =
-                halt_state_in.break_down_block(ir, halt_check_every, block);
+                halt_state_in.break_down_block(&mut inserter, halt_check_every, block);
 
-            for succ in ir.successors(tail_block) {
+            for succ in inserter.ir.successors(tail_block) {
                 edge_state.insert((tail_block, succ), halt_state_out.clone());
             }
         }

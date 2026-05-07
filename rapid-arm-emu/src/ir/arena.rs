@@ -155,7 +155,7 @@ impl<S: Storable> Arena<S> {
         self.assert_invariants();
         self.0.iter().enumerate().map(|(i, item)| (from_raw(RawHandle::new(i)), item))
     }
-    
+
     pub fn keys(&self) -> impl DoubleEndedIterator<Item=S::Handle> {
         self.assert_invariants();
         (0..self.len()).map(RawHandle::new).map(from_raw::<S::Handle>)
@@ -252,14 +252,14 @@ impl<K: Handle, V> ArenaMap<K, V> {
         }
         self.0[index].replace(value)
     }
-    
+
     pub fn iter(&self) -> impl Iterator<Item=(K, &V)> {
         self
             .0
             .iter()
             .enumerate()
             .filter_map(|(i, val)| {
-                val.as_ref().map(|val| (from_raw::<K>(RawHandle::new(i)), val)) 
+                val.as_ref().map(|val| (from_raw::<K>(RawHandle::new(i)), val))
             })
     }
 }
@@ -288,7 +288,7 @@ impl<K: Handle> Clone for ArenaSet<K> {
     fn clone(&self) -> Self {
         Self(self.0.clone(), self.1)
     }
-    
+
     fn clone_from(&mut self, source: &Self) {
         self.0.clone_from(&source.0)
     }
@@ -408,13 +408,13 @@ macro_rules! handle_impl_helper {
                 let raw = $crate::ir::arena::RawHandle::new(index);
                 $crate::ir::arena::from_raw(raw)
             }
-            
+
             pub const fn get(self) -> usize {
                 $crate::ir::arena::to_raw(self).get()
             }
         }
     };
-    
+
     (
         impl const for $name: path {
             $(const $const_name: ident;)*
@@ -459,11 +459,11 @@ macro_rules! handle_impl_helper {
 }
 
 macro_rules! impl_storable {
-    (
+    {
         $ty: ty as $(impl $vis: vis $impl_name: ident)? $(($existing_handle: path))?$(;$(init: {
             $(const $const_name: ident = $init: expr;)*
         })?)?
-    ) => {
+    } => {
 
         $($crate::ir::arena::make_handle!($vis $impl_name);)?
 
