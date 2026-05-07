@@ -10,7 +10,7 @@ use crate::ir::{Block as IrBlock, Type as IrType};
 use cranelift::codegen::ir as clif_ir;
 use cranelift::prelude::{AbiParam, Configurable, InstBuilder, IntCC, MemFlags};
 use cranelift::prelude::isa::OwnedTargetIsa;
-use crate::ir::compiler::{CompileOptions, CompiledExecBlock, ExecBlockFFI};
+use crate::ir::compiler::{CompileOptions, CompiledExecChunk, ExecBlockFFI};
 
 struct FunctionLowering<'a> {
     builder: FunctionBuilder<'a>,
@@ -488,7 +488,7 @@ impl CraneliftCompiler {
         Ok(Self { isa })
     }
 
-    pub fn try_compile(&self, options: CompileOptions, exec_ir: ExecIr) -> anyhow::Result<CompiledExecBlock> {
+    pub fn try_compile(&self, options: CompileOptions, exec_ir: ExecIr) -> anyhow::Result<CompiledExecChunk> {
         let builder = JITBuilder::with_isa(
             self.isa.clone(),
             cranelift::module::default_libcall_names()
@@ -556,7 +556,7 @@ impl CraneliftCompiler {
             }
         }
 
-        Ok(CompiledExecBlock::new_with_recources(ffi, DropModule(ManuallyDrop::new(module))))
+        Ok(CompiledExecChunk::new_with_recources(ffi, DropModule(ManuallyDrop::new(module))))
     }
 }
 

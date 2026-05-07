@@ -18,7 +18,7 @@ pub(crate) struct CodeBlock {
     /// note that the start isn't guarenteed to be the entrypoint of the function
     addr: Range<HostPointer>,
 
-    machine_code_handle: crate::ir::compiler::CompiledExecBlock,
+    machine_code_handle: crate::ir::compiler::CompiledExecChunk,
 }
 
 impl CodeBlock {

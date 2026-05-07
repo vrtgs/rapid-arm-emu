@@ -374,7 +374,6 @@ impl Terminator {
 
 #[derive(Debug)]
 struct BlockData {
-    predecessors: Vec<Block>,
     stmts: Vec<Stmt>,
     terminated: bool,
     terminator: Terminator,
@@ -384,7 +383,6 @@ struct BlockData {
 impl BlockData {
     pub fn empty() -> Self {
         Self {
-            predecessors: vec![],
             stmts: vec![],
             terminated: false,
             terminator: Terminator::Return,
@@ -451,11 +449,6 @@ impl ExecIrBuilder {
         self.current_block = block;
     }
 
-
-    pub fn predecessors(&self, block: Block) -> &[Block] {
-        self.blocks[block].predecessors.as_slice()
-    }
-
     pub fn successors(
         &self,
         block: Block
@@ -490,10 +483,6 @@ impl ExecIrBuilder {
         }
 
         let mark_cold = matches!(terminator, Terminator::ReturnCode { .. });
-
-        for target in terminator.targets() {
-            self.blocks[target].predecessors.push(block)
-        }
 
         let block_data = &mut self.blocks[block];
         assert!(!block_data.terminated);
@@ -1130,7 +1119,6 @@ impl ExecIrBuilder {
         });
 
         let continuation = self.blocks.store(BlockData {
-            predecessors: vec![],
             stmts: tail_stmts,
             terminated: old_terminated,
             terminator: old_terminator,
@@ -1138,7 +1126,6 @@ impl ExecIrBuilder {
         });
 
         let fail = self.blocks.store(BlockData {
-            predecessors: vec![],
             stmts: Vec::new(),
             terminated: true,
             terminator: Terminator::ReturnCode { halt_reason },
@@ -1154,15 +1141,16 @@ impl ExecIrBuilder {
         block_data.stmts.push(stmt);
 
         // only time we need to "unterminate" a block
+        // if we ever add a `predecessors` field to BlockData
+        // this would be a perfect place to actually remove the
+        // this block from all the blocks found in `old_terminator`s
+        // predecessors and assign those to `continuation`
         block_data.terminated = false;
         self.terminate_block(block, Terminator::BrNZ {
             cond: halt_reason,
             non_zero: fail,
             zero: continuation,
         });
-
-        debug_assert_eq!(self.blocks[fail].predecessors, [block]);
-        debug_assert_eq!(self.blocks[continuation].predecessors, [block]);
 
 
         continuation
@@ -1249,7 +1237,7 @@ mod exec_ir_tests {
     use crate::cpu_fabric::CpuFabric;
     use crate::halt_reason::{AtomicHaltReason, HaltReason, HaltReasonInner};
     use crate::io_mmu::IoMMU;
-    use crate::ir::compiler::{CompiledExecBlock, ExecIrCompiler};
+    use crate::ir::compiler::{CompiledExecChunk, ExecIrCompiler};
     use super::*;
 
     fn empty_io_mmu() -> IoMMU {
@@ -1258,13 +1246,13 @@ mod exec_ir_tests {
 
     static COMPILER: LazyLock<ExecIrCompiler> = LazyLock::new(ExecIrCompiler::new);
 
-    fn compile(builder: ExecIrBuilder) -> CompiledExecBlock {
+    fn compile(builder: ExecIrBuilder) -> CompiledExecChunk {
         COMPILER.compile(builder.build())
     }
 
 
     fn call_compiled_full(
-        compiled: &CompiledExecBlock,
+        compiled: &CompiledExecChunk,
         processor_state: &mut ProcessorState,
         setup: impl FnOnce(&mut ProcessorState, &IoMMU, &AtomicHaltReason),
     ) -> u32 {
@@ -1275,7 +1263,7 @@ mod exec_ir_tests {
     }
 
     fn call_compiled(
-        compiled: &CompiledExecBlock,
+        compiled: &CompiledExecChunk,
         processor_state: &mut ProcessorState,
     ) -> u32 {
         call_compiled_full(compiled, processor_state, |_, _, _| {})

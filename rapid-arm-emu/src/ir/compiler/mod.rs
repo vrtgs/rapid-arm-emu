@@ -23,16 +23,15 @@ type ExecBlockFFI = unsafe extern "C" fn(
 ) -> u32;
 
 #[derive(Clone)]
-pub(crate) struct CompiledExecBlock {
+pub(crate) struct CompiledExecChunk {
     ffi: ExecBlockFFI,
 
-    // Keeps the JIT module alive for at least as long as the fn pointer.
-    //
+    // Keeps the JIT resources alive for at least as long as the fn pointer.
     // If this is dropped while `ffi` may still be called, we get very very bad UB
     _resources: Arc<SyncCell<dyn Any + Send>>,
 }
 
-impl CompiledExecBlock {
+impl CompiledExecChunk {
     fn new_with_recources(
         ffi: ExecBlockFFI,
         resources: impl Any + Send
@@ -94,12 +93,12 @@ impl ExecIrCompiler {
         }
     }
 
-    pub fn compile(&self, exec_ir: ExecIr) -> CompiledExecBlock {
+    pub fn compile(&self, exec_ir: ExecIr) -> CompiledExecChunk {
         self.try_compile(exec_ir)
-            .unwrap_or_else(|err| panic!("failed to compile ExecIr with Cranelift: {err}"))
+            .unwrap_or_else(|err| panic!("failed to compile ExecIr: {err}"))
     }
 
-    pub fn try_compile(&self, exec_ir: ExecIr) -> anyhow::Result<CompiledExecBlock> {
+    pub fn try_compile(&self, exec_ir: ExecIr) -> anyhow::Result<CompiledExecChunk> {
         let function_name = {
             let id = self.next_function_id.fetch_add(1, Ordering::Relaxed);
             format!("exec_block_{id}")

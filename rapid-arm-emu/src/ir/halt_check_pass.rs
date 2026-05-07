@@ -394,13 +394,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZero;
+use std::ops::DerefMut;
 use smallvec::SmallVec;
 use crate::ir::{Block, ExecIrBuilder, Stmt, StmtKind};
 use crate::ir::arena::{handle_impl_helper, make_handle, Arena, ArenaMap, ArenaSet, Storable};
-
-#[derive(Copy, Clone)]
-struct ShouldHalt(bool);
-
 
 /// represents the state at the end of one path into the merge.
 /// After seeing `r` more safepoints, the next safepoint forces a halt check.
@@ -421,7 +418,7 @@ struct HaltState {
 
 struct HaltStateMap {
     outgoing_edges: ArenaMap<Block, HashMap<Block, HaltState>>,
-    incoming_edges: ArenaMap<Block, HashSet<Block>>
+    incoming_edges: ArenaMap<Block, HashSet<Block>>,
 }
 
 impl HaltStateMap {
@@ -432,7 +429,7 @@ impl HaltStateMap {
 
         Self {
             outgoing_edges: forward_edges,
-            incoming_edges: backward_edges
+            incoming_edges: backward_edges,
         }
     }
 
@@ -453,50 +450,55 @@ impl HaltStateMap {
         &mut self,
         towards: Block
     ) -> impl Iterator<Item=(Block, HaltState)> + use<'_> {
-        struct Drain<'a> {
-            towards: Block,
-            outgoing_edges: &'a mut ArenaMap<Block, HashMap<Block, HaltState>>,
-            drain: std::collections::hash_set::Drain<'a, Block>,
-        }
-
-        impl Iterator for Drain<'_> {
-            type Item = (Block, HaltState);
-
-            fn next(&mut self) -> Option<Self::Item> {
-                self.drain.next().map(|from| {
-                    let to = self.towards;
-                    let edge_must_exist = "edge must exist in forward map if it exists in backward map";
-                    let state = self.outgoing_edges
-                        .get_mut(from)
-                        .and_then(|map| map.remove(&to))
-                        .expect(edge_must_exist);
-
-                    (to, state)
-                })
-            }
-        }
-
-        impl Drop for Drain<'_> {
-            fn drop(&mut self) {
-                for _ in self {
-                    // run next to completion
-                }
-            }
-        }
-
-
+        // its .map() -> .flatten()
+        // because flat_map() complains about the borrow checker
         self
             .incoming_edges
             .get_mut(towards)
             .map(|incoming_edges| {
-                Drain {
-                    towards,
+                DrainHaltState {
+                    to: towards,
                     outgoing_edges: &mut self.outgoing_edges,
                     drain: incoming_edges.drain(),
                 }
             })
             .into_iter()
             .flatten()
+    }
+}
+
+struct DrainHaltState<'a> {
+    to: Block,
+    outgoing_edges: &'a mut ArenaMap<Block, HashMap<Block, HaltState>>,
+    drain: std::collections::hash_set::Drain<'a, Block>,
+}
+
+impl Iterator for DrainHaltState<'_> {
+    type Item = (Block, HaltState);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.drain.next().map(|from| {
+            let to = self.to;
+            let edge_must_exist = "edge must exist in forward map if it exists in backward map";
+            let state = self.outgoing_edges
+                .get_mut(from)
+                .and_then(|map| map.remove(&to))
+                .expect(edge_must_exist);
+
+            (from, state)
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.drain.size_hint()
+    }
+}
+
+impl Drop for DrainHaltState<'_> {
+    fn drop(&mut self) {
+        for _ in self {
+            // run next to completion
+        }
     }
 }
 
@@ -508,12 +510,19 @@ struct HaltCheckInserter<'a> {
     //       safepoints compared to other types of stmts
     safepoint_stmt_to_block_and_index: HashMap<Stmt, (Block, usize)>,
     map: HaltStateMap,
+
+    // Safepoints after which this pass inserted a compensating halt check.
+    // note this is delibaretly a hashset because a small portion of statements are safepoints
+    // and an even smaller portion affects resets
+    // this makes safepoint edits lazy,
+    // and that means we can skip repeated expensive global scans to the HaltState
+    semantic_reset_after: HashSet<Stmt>,
 }
 
 impl<'a> HaltCheckInserter<'a> {
-    pub fn new(ir: &'a mut ExecIrBuilder) -> Self {
-        let mut safepoints =
-            HashMap::with_capacity(ir.stmts.len().div_ceil(128));
+    pub fn new(halt_check_every: NonZero<usize>, ir: &'a mut ExecIrBuilder) -> Self {
+        let safepoint_stmt_est = ir.stmts.len().div_ceil(128);
+        let mut safepoints = HashMap::with_capacity(safepoint_stmt_est);
 
         for (block, data) in ir.blocks.iter() {
             for (i, stmt) in data.stmts.iter().copied().enumerate() {
@@ -529,7 +538,10 @@ impl<'a> HaltCheckInserter<'a> {
         Self {
             ir,
             safepoint_stmt_to_block_and_index: safepoints,
-            map
+            map,
+            semantic_reset_after: HashSet::with_capacity(
+                (safepoint_stmt_est / halt_check_every).div_ceil(2)
+            )
         }
     }
 
@@ -560,15 +572,26 @@ impl<'a> HaltCheckInserter<'a> {
         // the end of `from` jumps towards `to`
         // and so we need to remap anything `from` maps to and place it in `continuation`
         if let Some(edges) = self.map.outgoing_edges.remove(block) {
+            let insert_continuation_err =
+                "continuation is a fresh block, and can't have any existing edges";
+
+            // remap incoming
             for &to in edges.keys() {
-                let removed = self.map.incoming_edges.get_mut(to).unwrap().remove(&block);
-                assert!(removed)
+                let set = self.map.incoming_edges.get_mut(to).unwrap();
+                let removed = set.remove(&block);
+                assert!(
+                    removed,
+                    "if there is a forward edge from block -> to; then to -> block must exist"
+                );
+                let inserted = set.insert(continuation);
+                assert!(inserted, "{insert_continuation_err}");
             }
 
+            // remap outgoing
             let old_edges = self.map.outgoing_edges.insert(continuation, edges);
             assert!(
                 old_edges.is_none(),
-                "continuation is a fresh block, and can't have any existing edges"
+                "{insert_continuation_err}"
             );
         }
 
@@ -576,72 +599,43 @@ impl<'a> HaltCheckInserter<'a> {
         continuation
     }
 
-    // TODO better merger
-    //
-    // pub fn insert_halt_check_after_safepoint(&mut self, at: Stmt) -> (Block, Block) {
-    //     let safepoints = &mut self.safepoint_stmt_to_block_and_index;
-    //     let (block, stmt_index) = safepoints[&at];
-    //     let continuation = self.insert_halt_check_after_safepoint_indexed(block, stmt_index);
-    //     (block, continuation)
-    // }
+    pub fn insert_compensating_halt_check_after_safepoint(
+        &mut self,
+        at: Stmt,
+    ) -> Block {
+        let inserted = self.semantic_reset_after.insert(at);
+
+        assert!(
+            inserted,
+            "attempted to insert two compensating halt checks after the same safepoint"
+        );
+
+        let (block, stmt_index) = self.safepoint_stmt_to_block_and_index[&at];
+
+        self.insert_halt_check_after_safepoint_indexed(block, stmt_index)
+    }
 }
 
 
-impl HaltState {
-    fn from_remaining(remaining: NonZero<usize>) -> Self {
-        Self {
-            remaining,
-            suffix_safepoints: rpds::Queue::new(),
-        }
-    }
+trait BlockHalter {
+    fn process_safepoint(&mut self, halt_check_every: NonZero<usize>, safepoint: Stmt) -> bool;
 
-    pub fn push_safepoint(
+    fn take_current_state(&mut self) -> HaltState;
+
+    fn process_block(
         &mut self,
-        halt_check_every: NonZero<usize>,
-        safepoint: Stmt,
-    ) -> ShouldHalt {
-        let new_remaining = NonZero::new(self.remaining.get().strict_sub(1));
-        self.remaining = new_remaining.unwrap_or(halt_check_every);
-
-        let halt = ShouldHalt(new_remaining.is_none());
-
-        match halt {
-            // There is never a need to keep suffix history before this point,
-            // because after inserting a halt check the countdown resets to N.
-            ShouldHalt(true) => self.suffix_safepoints = rpds::Queue::new(),
-            ShouldHalt(false) => {
-                self.suffix_safepoints.enqueue_mut(safepoint);
-                if self.suffix_safepoints.len() > halt_check_every.get() {
-                    self.suffix_safepoints.dequeue_mut();
-                }
-            }
-        }
-
-        halt
-    }
-
-    #[inline]
-    fn break_down_block_inner(
-        mut this: Option<&mut Self>,
         inserter: &mut HaltCheckInserter,
         halt_check_every: NonZero<usize>,
         mut block: Block
-    ) -> Block {
+    ) -> (Block, HaltState) {
         'break_down_loop: loop {
             let ir = inserter.ir();
 
             let mut split = None;
             for (i, &stmt) in ir.blocks[block].stmts.iter().enumerate() {
                 if let StmtKind::Safepoint = ir.stmts[stmt].rvalue {
-                    let should_halt = this.as_mut().map_or(
-                        ShouldHalt(true),
-                        |this| this.push_safepoint(
-                            halt_check_every,
-                            stmt
-                        )
-                    );
-
-                    if should_halt.0 {
+                    let should_halt = self.process_safepoint(halt_check_every, stmt);
+                    if should_halt {
                         split = Some(i);
                         break
                     }
@@ -655,52 +649,237 @@ impl HaltState {
             block = inserter.insert_halt_check_after_safepoint_indexed(block, pos);
         }
 
-        block
+        let state_after_block = self.take_current_state();
+
+        (block, state_after_block)
+    }
+}
+
+struct CyclicBlockHalter {
+    halt_check_every: Option<NonZero<usize>>,
+    state_in_remaining: NonZero<usize>,
+}
+
+impl CyclicBlockHalter {
+    pub fn new(state_in: HaltState) -> Self {
+        Self {
+            halt_check_every: None,
+            state_in_remaining: state_in.remaining
+        }
+    }
+}
+
+impl BlockHalter for CyclicBlockHalter {
+    #[inline]
+    fn process_safepoint(&mut self, halt_check_every: NonZero<usize>, _: Stmt) -> bool {
+        self.halt_check_every = Some(halt_check_every);
+        true
     }
 
-    pub fn break_down_block(
-        mut self,
-        ir: &mut HaltCheckInserter,
+    fn take_current_state(&mut self) -> HaltState {
+        let remaining = self
+            .halt_check_every
+            .take()
+            .unwrap_or(self.state_in_remaining);
+
+        HaltState::from_remaining(remaining)
+    }
+}
+
+struct ACyclicBlockHalter(HaltState);
+
+impl ACyclicBlockHalter {
+    fn new(state_in: HaltState) -> Self {
+        Self(state_in)
+    }
+}
+
+impl BlockHalter for ACyclicBlockHalter {
+    fn process_safepoint(
+        &mut self,
         halt_check_every: NonZero<usize>,
-        block: Block
-    ) -> (Block, Self) {
-        let last_block = Self::break_down_block_inner(
-            Some(&mut self),
-            ir,
-            halt_check_every,
-            block
+        safepoint: Stmt
+    ) -> bool {
+        let state = &mut self.0;
+
+        let new_remaining = NonZero::new(state.remaining.get().strict_sub(1));
+        state.remaining = new_remaining.unwrap_or(halt_check_every);
+
+        let should_insert_halt_check = new_remaining.is_none();
+
+        match should_insert_halt_check {
+            // There is never a need to keep suffix history before this point,
+            // because after inserting a halt check the countdown resets to N.
+            true => state.suffix_safepoints = rpds::Queue::new(),
+            false => {
+                state.suffix_safepoints.enqueue_mut(safepoint);
+                if state.suffix_safepoints.len() > halt_check_every.get() {
+                    assert!(state.suffix_safepoints.dequeue_mut());
+                }
+            }
+        }
+
+        should_insert_halt_check
+    }
+
+    fn take_current_state(&mut self) -> HaltState {
+        self.0.clone()
+    }
+}
+
+impl HaltState {
+    fn from_remaining(remaining: NonZero<usize>) -> Self {
+        Self {
+            remaining,
+            suffix_safepoints: rpds::Queue::new(),
+        }
+    }
+
+    fn has_complete_suffix(&self, halt_check_every: NonZero<usize>) -> bool {
+        self.suffix_safepoints.len()
+            == halt_check_every.get().strict_sub(self.remaining.get())
+    }
+
+    // canonicalization can only increase remaining, never decrease it.
+    fn canonicalize_against_resets(
+        &mut self,
+        halt_check_every: NonZero<usize>,
+        reset_after: &HashSet<Stmt>,
+    ) {
+        if self.suffix_safepoints.is_empty() || reset_after.is_empty() {
+            return;
+        }
+
+        let mut found_reset = false;
+        let mut new_suffix = rpds::Queue::new();
+
+        for stmt in self.suffix_safepoints.iter().copied() {
+            if reset_after.contains(&stmt) {
+                found_reset = true;
+
+                // This reset becomes the latest known reset so far.
+                // Anything before it, including the old tentative suffix after an
+                // earlier reset, is no longer relevant.
+                new_suffix = rpds::Queue::new();
+            } else if found_reset {
+                new_suffix.enqueue_mut(stmt);
+            }
+        }
+
+        if !found_reset {
+            return;
+        }
+
+        let after_count = new_suffix.len();
+
+        debug_assert!(
+            after_count < halt_check_every.get(),
+            "unchecked suffix after canonicalization should be shorter than halt_check_every"
         );
 
-        (last_block, self)
+        debug_assert!(after_count < self.suffix_safepoints.len());
+
+        let remaining = halt_check_every.get().strict_sub(after_count);
+        let new_remaining = NonZero::new(remaining)
+            .expect("after_count must be strictly less than halt_check_every");
+
+        self.remaining = new_remaining;
+        self.suffix_safepoints = new_suffix;
     }
 
-    /// For cyclic SCCs, countdown analysis inside the SCC is not necessary for
-    /// termination safety. Once we have proven every cycle contains at least one
-    /// safepoint, inserting a halt check after every safepoint in the cyclic SCC
-    /// guarantees every cycle contains at least one halt check.
-    pub fn force_halt_checks_after_safepoints(
-        ir: &mut HaltCheckInserter,
-        block: Block,
-    ) -> Block {
-        Self::break_down_block_inner(
-            None,
-            ir,
-            const { NonZero::new(1).unwrap() },
-            block
-        )
+    fn has_insertion_point(
+        &self,
+        halt_check_every: NonZero<usize>,
+        target: NonZero<usize>,
+    ) -> bool {
+        if self.remaining >= target {
+            return false;
+        }
+
+        if !self.has_complete_suffix(halt_check_every) {
+            return false;
+        }
+
+        let safepoints_after_insert = halt_check_every.get().strict_sub(target.get());
+
+        if self.suffix_safepoints.len() <= safepoints_after_insert {
+            return false;
+        }
+
+        true
     }
 
-    fn merge_halt_states(
-        _inserter: &mut HaltCheckInserter,
+    fn compensating_insertion_safepoint(
+        &self,
+        halt_check_every: NonZero<usize>,
+        target: NonZero<usize>,
+    ) -> Stmt {
+        assert!(self.has_insertion_point(halt_check_every, target));
+
+        let safepoints_after_insert =
+            halt_check_every.get().strict_sub(target.get());
+
+        let skip_from_front = self
+            .suffix_safepoints
+            .len()
+            .strict_sub(safepoints_after_insert)
+            .strict_sub(1);
+
+        self.suffix_safepoints
+            .iter()
+            .copied()
+            .nth(skip_from_front)
+            .unwrap()
+    }
+
+    // Precondition: self has already been canonicalized against
+    // inserter.semantic_reset_after.
+    fn insert_compensating_check(
+        &mut self,
+        inserter: &mut HaltCheckInserter,
+        halt_check_every: NonZero<usize>,
+        target: NonZero<usize>,
+    ) {
+        if self.remaining >= target {
+            return;
+        }
+
+        let insertion_safepoint =
+            self.compensating_insertion_safepoint(halt_check_every, target);
+
+        inserter.insert_compensating_halt_check_after_safepoint(
+            insertion_safepoint,
+        );
+
+        self.canonicalize_against_resets(
+            halt_check_every,
+            &inserter.semantic_reset_after,
+        );
+
+        debug_assert!(
+            self.remaining >= target,
+            "compensating insertion failed to normalize state"
+        );
+    }
+
+    fn merge_halt_states_inner(
+        inserter: &mut HaltCheckInserter,
         halt_check_every: NonZero<usize>,
         incoming: &mut [HaltState],
     ) -> HaltState {
-        match incoming {
+        for state in incoming.iter_mut() {
+            state.canonicalize_against_resets(
+                halt_check_every,
+                &inserter.semantic_reset_after
+            )
+        }
+
+        match *incoming {
             // No incoming edges; start fresh
             [] => HaltState::from_remaining(halt_check_every),
 
             // Single predecessor: preserve precise path-local suffix history.
-            [state] => state.clone(),
+            [ref state] => state.clone(),
 
             _ => {
                 let r_lo = incoming
@@ -709,28 +888,63 @@ impl HaltState {
                     .min()
                     .unwrap();
 
-                // TODO better merger
-                // let r_hi = incoming
-                //     .iter()
-                //     .map(|state| state.remaining)
-                //     .max()
-                //     .unwrap();
-                //
-                // let diff = r_hi.get().strict_sub(r_lo.get());
-                // let threshold = halt_check_every
-                //     .div_ceil(const { NonZero::new(2).unwrap() });
-                //
-                // if diff > threshold.get() {
-                //     let can_normalize = ...;
-                //     if can_normalize {
-                //         /*normalize*/
-                //         return HaltState::from_remaining(r_hi);
-                //     }
-                // }
+                let r_hi = incoming
+                    .iter()
+                    .map(|state| state.remaining)
+                    .max()
+                    .unwrap();
+
+                let diff = r_hi.get().strict_sub(r_lo.get());
+                let threshold = halt_check_every
+                    .div_ceil(const { NonZero::new(2).unwrap() });
+
+                if diff > threshold.get() {
+                    let target = r_hi;
+
+                    let can_normalize = incoming.iter().all(|state| {
+                        state.remaining >= target
+                            || state.has_insertion_point(halt_check_every, target)
+                    });
+
+                    if can_normalize {
+                        for (i, state) in incoming.iter_mut().enumerate() {
+                            if i != 0 {
+                                state.canonicalize_against_resets(
+                                    halt_check_every,
+                                    &inserter.semantic_reset_after,
+                                );
+                            }
+
+                            state.insert_compensating_check(
+                                inserter,
+                                halt_check_every,
+                                target
+                            )
+                        }
+
+                        debug_assert!(
+                            incoming.iter().all(|state| state.remaining >= target),
+                            "merge normalization failed to bring every incoming state up to target"
+                        );
+                        return HaltState::from_remaining(r_hi);
+                    }
+                }
 
                 HaltState::from_remaining(r_lo)
             }
         }
+    }
+
+    fn merge_halt_states(
+        inserter: &mut HaltCheckInserter,
+        halt_check_every: NonZero<usize>,
+        mut incoming: impl DerefMut<Target=[HaltState]>,
+    ) -> HaltState {
+        Self::merge_halt_states_inner(
+            inserter,
+            halt_check_every,
+            &mut incoming
+        )
     }
 }
 
@@ -857,14 +1071,6 @@ fn strongly_connected_components(
     tarjan.run()
 }
 
-
-fn block_has_safepoint(ir: &ExecIrBuilder, block: Block) -> bool {
-    ir.blocks[block]
-        .stmts
-        .iter()
-        .any(|&stmt| matches!(&ir.stmts[stmt].rvalue, StmtKind::Safepoint))
-}
-
 fn component_is_cyclic(ir: &ExecIrBuilder, component: &[Block]) -> bool {
     match *component {
         // No blocks: never cyclic.
@@ -882,14 +1088,23 @@ fn component_is_cyclic(ir: &ExecIrBuilder, component: &[Block]) -> bool {
     }
 }
 
-
-struct SccGraph {
-    components: Arena<OwnedComponent>,
-    component_of: ArenaMap<Block, SccComponent>,
-    topo_order: Vec<SccComponent>,
-    is_cyclic: ArenaSet<SccComponent>,
+fn block_has_safepoint(ir: &ExecIrBuilder, block: Block) -> bool {
+    ir.blocks[block]
+        .stmts
+        .iter()
+        .any(|&stmt| matches!(&ir.stmts[stmt].rvalue, StmtKind::Safepoint))
 }
 
+// prevents the bad case where a cyclic SCC merely contains a safepoint somewhere
+// but also contains a separate safepoint-free cycle.
+//
+// example of why checking simply for if an SCC contains a safepoint is wrong
+// block A:
+//    _v1 = true;
+//    br_nz _v1 A B
+// block B:
+//    safepoint
+//    br A
 fn assert_cycles_have_safepoints(ir: &ExecIrBuilder) {
     let allowed = ir
         .blocks
@@ -906,6 +1121,13 @@ fn assert_cycles_have_safepoints(ir: &ExecIrBuilder) {
             );
         }
     }
+}
+
+struct SccGraph {
+    components: Arena<OwnedComponent>,
+    component_of: ArenaMap<Block, SccComponent>,
+    topo_order: Vec<SccComponent>,
+    is_cyclic: ArenaSet<SccComponent>,
 }
 
 impl SccGraph {
@@ -987,96 +1209,70 @@ impl SccGraph {
 
 #[allow(dead_code)]
 pub fn insert_halt_checks(ir: &mut ExecIrBuilder) {
-    let halt_check_every = NonZero::<usize>::try_from(ir.halt_check_every)
+    let halt_check_every: NonZero<u32> = ir.halt_check_every;
+    let halt_check_every: NonZero<usize> = halt_check_every
+        .try_into()
         .unwrap_or(NonZero::<usize>::MAX);
 
     let scc_graph = SccGraph::new(ir);
 
-    let mut inserter = HaltCheckInserter::new(ir);
+    let mut inserter = HaltCheckInserter::new(halt_check_every, ir);
+
+    const INCOMING_STACK_BUFFER: usize = 64;
+
 
     for component_id in scc_graph.topo_order.iter().copied() {
         let component = scc_graph.components[component_id].0.as_slice();
 
 
-        // TODO more complex analysis to be able to have fewer halt checks
-        //      this currently works though, and this is low priority for now
-        //      note if this changes, please update the docs for this module
-        if scc_graph.component_is_cyclic(component_id) {
-            // We intentionally do not use precise incoming countdown state inside
-            // a cyclic SCC. Every safepoint in the SCC gets a halt check, which
-            // makes every cycle terminating-safe because cycles without safepoints
-            // were rejected by SccGraph::new.
-            for &comp in component {
-                inserter
-                    .map
-                    .drain_incoming(comp)
-                    .fold((), |(), item| drop(item))
-            }
+        let mut incoming = SmallVec::<[HaltState; 64]>::new();
 
-            for &block in component {
-                let last_block = HaltState::force_halt_checks_after_safepoints(
-                    &mut inserter,
-                    block,
-                );
+        for &block in component {
+            let iter = inserter
+                .map
+                .drain_incoming(block)
+                .map(|(_precessor, state)| state);
 
-
-                for succ in inserter.ir().successors(last_block) {
-                    let succ_component = scc_graph.component_of[succ];
-
-                    if succ_component == component_id {
-                        continue;
-                    }
-
-                    // Conservative SCC boundary:
-                    //
-                    // There may be an entry -> exit path through this cyclic SCC
-                    // that sees no safepoint. Therefore we cannot safely reset to
-                    // `halt_check_every` on outgoing edges.
-                    //
-                    // Using remaining = 1 means the next safepoint after the SCC
-                    // will get a halt check. This may over-insert, but it is safe.
-                    let old = inserter.map.add_edge(
-                        last_block,
-                        succ,
-                        HaltState::from_remaining(const { NonZero::new(1).unwrap() })
-                    );
-
-                    debug_assert!(old.is_none());
-                }
-            }
-
-            continue;
+            incoming.extend(iter);
         }
 
-        // Non-cyclic SCCs are exactly singleton blocks with no self-loop.
-        let &[block] = component else {
-            unreachable!("non-cyclic SCC should be a singleton block");
+
+        let state_in = HaltState::merge_halt_states(
+            &mut inserter,
+            halt_check_every,
+            incoming,
+        );
+
+        let is_cyclic = scc_graph.component_is_cyclic(component_id);
+
+        let halter: &mut dyn BlockHalter = match is_cyclic {
+            true => &mut CyclicBlockHalter::new(state_in),
+            false => &mut ACyclicBlockHalter::new(state_in),
         };
 
-        let mut incoming = inserter.map.drain_incoming(block)
-            .map(|(_predecessor, state)| state)
-            .collect::<SmallVec<[_; 32]>>();
+        if cfg!(debug_assertions) && !is_cyclic {
+            assert_eq!(component.len(), 1);
+        }
 
-        let state = HaltState::merge_halt_states(
-            &mut inserter,
-            halt_check_every,
-            &mut incoming,
-        );
-
-        let (last_block, state) = state.break_down_block(
-            &mut inserter,
-            halt_check_every,
-            block,
-        );
-
-        for succ in inserter.ir().successors(last_block) {
-            let old = inserter.map.add_edge(
-                last_block,
-                succ,
-                state.clone(),
+        for &block in component {
+            let (last_block, state_out) = halter.process_block(
+                &mut inserter,
+                halt_check_every,
+                block,
             );
 
-            debug_assert!(old.is_none());
+            for successor in inserter.ir().successors(last_block) {
+                if is_cyclic && scc_graph.component_of[successor] == component_id {
+                    continue;
+                }
+
+                let old = inserter.map.add_edge(
+                    last_block,
+                    successor,
+                    state_out.clone()
+                );
+                assert!(old.is_none());
+            }
         }
     }
 }
