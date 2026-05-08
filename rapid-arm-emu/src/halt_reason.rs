@@ -24,22 +24,15 @@ impl HaltReasonInner {
         let trap_mask = HaltReasonInner::TrapBits.bits();
         let a_trap = a.bits() & trap_mask;
         let b_trap = b.bits() & trap_mask;
-        let trap = std::hint::select_unpredictable(
-            a_trap != 0,
-            a_trap,
-            b_trap
-        );
+        let trap = std::hint::select_unpredictable(a_trap != 0, a_trap, b_trap);
 
         Self::from_bits_retain(trap | internal_reasons)
     }
 }
 
-
-pub const INVALID_INSN: NonZero<u8> = NonZero::new(1).unwrap();
-pub const UNALIGNED_PC: NonZero<u8> = NonZero::new(2).unwrap();
-pub const MEMORY_TRAP: NonZero<u8> = NonZero::new(3).unwrap();
-
-
+const INVALID_INSN: NonZero<u8> = NonZero::new(1).unwrap();
+const UNALIGNED_PC: NonZero<u8> = NonZero::new(2).unwrap();
+const MEMORY_TRAP: NonZero<u8> = NonZero::new(3).unwrap();
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HaltReason {
@@ -48,17 +41,27 @@ pub struct HaltReason {
 }
 
 impl HaltReason {
-    pub(crate) fn from_inner(reason: HaltReasonInner) -> Option<Self> {
-        let bits = reason.bits();
-        let opcode = NonZero::new(((bits >> 8) & 0xFF) as u8)?;
-        let payload = (bits >> 16) as u16;
-        Some(Self {
-            opcode,
-            payload
-        })
+    pub const fn new(opcode: NonZero<u8>, payload: u16) -> Self {
+        Self { opcode, payload }
     }
 
-    pub(crate) fn into_inner(self) -> HaltReasonInner {
+    pub const MEMORY_TRAP: Self = Self {
+        opcode: MEMORY_TRAP,
+        payload: 0,
+    };
+}
+
+impl HaltReason {
+    pub(crate) const fn from_inner(reason: HaltReasonInner) -> Option<Self> {
+        let bits = reason.bits();
+        let Some(opcode) = NonZero::new(((bits >> 8) & 0xFF) as u8) else {
+            return None;
+        };
+        let payload = (bits >> 16) as u16;
+        Some(Self { opcode, payload })
+    }
+
+    pub(crate) const fn into_inner(self) -> HaltReasonInner {
         let bits = ((self.payload as u32) << 16) | ((self.opcode.get() as u32) << 8);
         HaltReasonInner::from_bits_retain(bits)
     }
@@ -78,28 +81,27 @@ impl AtomicHaltReason {
     }
 
     #[inline]
-    pub(crate) fn add_reasons_full(&self, reason: HaltReasonInner) {
+    pub(crate) fn add_reasons_full(&self, reason: HaltReasonInner) -> HaltReasonInner {
         // CAS loop
         // the lsb gets `or`ed and the top 24 bits get replaced
-        self.0.update(Ordering::Release, Ordering::Relaxed, |bits| {
-            let new_reason = HaltReasonInner::merge_halt_reason(
-                reason,
-                HaltReasonInner::from_bits_retain(bits)
-            );
+        let bits = self.0.update(Ordering::Release, Ordering::Relaxed, |bits| {
+            let new_reason =
+                HaltReasonInner::merge_halt_reason(reason, HaltReasonInner::from_bits_retain(bits));
 
             new_reason.bits()
         });
+
+        HaltReasonInner::from_bits_retain(bits)
     }
 
     pub fn halt(&self, reason: HaltReason) {
-        self.add_reasons_full(reason.into_inner())
+        self.add_reasons_full(reason.into_inner());
     }
-    
-    
+
     pub fn take(&self) -> HaltReasonInner {
         HaltReasonInner::from_bits_retain(self.0.swap(0, Ordering::AcqRel))
     }
-    
+
     pub(crate) fn as_ffi(&self) -> &AtomicU32 {
         &self.0
     }

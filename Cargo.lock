@@ -229,7 +229,7 @@ dependencies = [
  "regalloc2",
  "rustc-hash",
  "serde",
- "smallvec",
+ "smallvec 1.15.1",
  "target-lexicon",
  "wasmtime-internal-core",
 ]
@@ -279,7 +279,7 @@ checksum = "dfa2ad00399dd47e7e7e33cb1dc23b0e39ed9dcd01e8f026fc37af91655031b8"
 dependencies = [
  "cranelift-codegen",
  "log",
- "smallvec",
+ "smallvec 1.15.1",
  "target-lexicon",
 ]
 
@@ -818,7 +818,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "redox_syscall 0.5.18",
- "smallvec",
+ "smallvec 1.15.1",
  "windows-link",
 ]
 
@@ -906,7 +906,7 @@ dependencies = [
  "parking_lot",
  "pastey",
  "rpds",
- "smallvec",
+ "smallvec 2.0.0-alpha.12",
  "stacker",
  "thiserror",
 ]
@@ -960,7 +960,7 @@ dependencies = [
  "hashbrown 0.17.0",
  "log",
  "rustc-hash",
- "smallvec",
+ "smallvec 1.15.1",
 ]
 
 [[package]]
@@ -1141,6 +1141,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "smallvec"
+version = "2.0.0-alpha.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef784004ca8777809dcdad6ac37629f0a97caee4c685fcea805278d81dd8b857"
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1296,7 +1302,7 @@ dependencies = [
  "once_cell",
  "regex-automata",
  "sharded-slab",
- "smallvec",
+ "smallvec 1.15.1",
  "thread_local",
  "tracing",
  "tracing-core",

@@ -1,96 +1,161 @@
-use std::mem::ManuallyDrop;
-use anyhow::{anyhow, bail, ensure, Context};
+use crate::array_helper;
+use crate::ir::arena::ArenaMap;
+use crate::ir::compiler::{CompileOptions, CompiledExecChunk, ExecBlockFFI};
+use crate::ir::{
+    Arg, ArithBinOp, BitwiseOp, CallbackSignature, ExecIr, HOST_CB_SMALL_ARGS, IConst, IntCmp,
+    IntWidth, LoadType, MAX_STMT_OUTPUTS, OverflowingBinOp, SSAValue, ShiftOp, StackSlot, StmtData,
+    StmtKind, Terminator, TerminatorKind,
+};
+use crate::ir::{Block as IrBlock, Jump as IrJump, Type as IrType};
+use anyhow::{Context, anyhow, ensure};
 use arrayvec::ArrayVec;
+use cranelift::codegen::ir as clif_ir;
+pub use cranelift::codegen::settings::OptLevel;
 use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{Linkage, Module};
-use crate::ir::arena::ArenaMap;
-use crate::ir::{ArithBinOp, ExecIr, OverflowingBinOp, IConst, IntWidth, LValue, StmtKind, Terminator, IntCmp, BitwiseOp, MAX_STMT_OUTPUTS, StmtData};
-use crate::ir::{Block as IrBlock, Type as IrType};
-use cranelift::codegen::ir as clif_ir;
-use cranelift::prelude::{AbiParam, Configurable, InstBuilder, IntCC, MemFlags};
 use cranelift::prelude::isa::OwnedTargetIsa;
-use crate::ir::compiler::{CompileOptions, CompiledExecChunk, ExecBlockFFI};
+use cranelift::prelude::{AbiParam, Configurable, InstBuilder, IntCC, MemFlags};
+use smallvec::SmallVec;
+use std::cmp::Ordering;
+use std::mem::ManuallyDrop;
+use std::num::NonZero;
+
+fn clif_int_ty(width: IntWidth) -> clif_ir::Type {
+    match width {
+        IntWidth::W8 => clif_ir::types::I8,
+        IntWidth::W16 => clif_ir::types::I16,
+        IntWidth::W32 => clif_ir::types::I32,
+        IntWidth::W64 => clif_ir::types::I64,
+    }
+}
+
+fn ir_ty_to_clif_ty(ptr_ty: clif_ir::Type, ty: IrType) -> clif_ir::Type {
+    match ty {
+        IrType::Bool => clif_ir::types::I8,
+        IrType::Int(width) => clif_int_ty(width),
+        IrType::HostPtr => ptr_ty,
+    }
+}
 
 struct FunctionLowering<'a> {
     builder: FunctionBuilder<'a>,
+    module: &'a JITModule,
+    exec_ir: &'a ExecIr,
     ptr_ty: clif_ir::Type,
 
     live_ordered_blocks: &'a [IrBlock],
-    values: ArenaMap<LValue, clif_ir::Value>,
+    stack_slots: ArenaMap<StackSlot, clif_ir::StackSlot>,
+    values: ArenaMap<SSAValue, clif_ir::Value>,
     blocks: ArenaMap<IrBlock, clif_ir::Block>,
+    signatures: ArenaMap<CallbackSignature, clif_ir::SigRef>,
 }
 
 impl<'a> FunctionLowering<'a> {
-    fn bind_entry_args(&mut self, entry_block: clif_ir::Block) -> anyhow::Result<()> {
+    fn assert_entry_args(&mut self, entry_block: clif_ir::Block) -> anyhow::Result<()> {
         let params = self.builder.block_params(entry_block);
-        let &[
-        processor_state,
-        pages,
-        pages_count,
-        halt_reason,
-        io_mmu
-        ] = params else {
-            bail!(
-                "internal compiler error: expected 5 entry params, got {}",
-                params.len(),
-            )
-        };
 
-        self.values.insert(LValue::ARG_PROCESSOR_STATE, processor_state);
-        self.values.insert(LValue::ARG_PAGES, pages);
-        self.values.insert(LValue::ARG_PAGE_COUNT, pages_count);
-        self.values.insert(LValue::ARG_HALT_REASON_PTR, halt_reason);
-        self.values.insert(LValue::ARG_IO_MMU, io_mmu);
+        let args = Arg::args();
+
+        ensure!(
+            args.len() == params.len(),
+            "internal compiler error: expected {} entry params, got {}",
+            args.len(),
+            params.len(),
+        );
+
+        for (arg, &param) in args.zip(params) {
+            assert_eq!(self.values[arg.as_ssa_value()], param);
+        }
 
         Ok(())
     }
 
+    fn ir_ty_to_clif_ty(&self, ty: IrType) -> clif_ir::Type {
+        ir_ty_to_clif_ty(self.ptr_ty, ty)
+    }
+
     fn new(
         mut builder: FunctionBuilder<'a>,
+        module: &'a JITModule,
         exec_ir: &'a ExecIr,
         ptr_ty: clif_ir::Type,
     ) -> anyhow::Result<Self> {
         let mut blocks = ArenaMap::with_capacity(exec_ir.blocks.len());
+        let mut values = ArenaMap::with_capacity(exec_ir.ssa_values.len());
+        let mut stack_slots = ArenaMap::with_capacity(exec_ir.stack_slots.len());
+        let signatures = ArenaMap::with_capacity(exec_ir.signatures.len());
+
+        for (ir_stack_slot, data) in exec_ir.stack_slots.iter() {
+            debug_assert!(data.align.is_power_of_two());
+            let align_shift = u8::try_from(data.align.ilog2())?;
+            let clif_stack_slot = builder.create_sized_stack_slot(clif_ir::StackSlotData {
+                kind: clif_ir::StackSlotKind::ExplicitSlot,
+                size: 0,
+                align_shift,
+                key: None,
+            });
+
+            stack_slots.insert_unique(ir_stack_slot, clif_stack_slot);
+        }
 
         for &ir_block in &exec_ir.block_compile_order {
             let clif_block = builder.create_block();
 
-            if exec_ir.blocks[ir_block].is_cold {
+            let block_ref = &exec_ir.blocks[ir_block];
+            for &param in &block_ref.parameters {
+                let ty = ir_ty_to_clif_ty(ptr_ty, exec_ir.ssa_values[param].ty);
+
+                let clif_param = builder.append_block_param(clif_block, ty);
+                values.insert(param, clif_param);
+            }
+
+            if block_ref.is_cold {
                 builder.set_cold_block(clif_block);
             }
 
-            blocks.insert(ir_block, clif_block);
+            blocks.insert_unique(ir_block, clif_block);
         }
 
         let entry_block = *blocks
             .get(IrBlock::ENTRYPOINT)
             .context("internal compiler error: missing entry block")?;
 
-        builder.append_block_params_for_function_params(entry_block);
-
         let mut this = Self {
             builder,
+            module,
+            exec_ir,
             ptr_ty,
+
             live_ordered_blocks: &exec_ir.block_compile_order,
-            values: ArenaMap::with_capacity(exec_ir.lvalues.len()),
+            values,
             blocks,
+            stack_slots,
+            signatures,
         };
 
-        this.bind_entry_args(entry_block)?;
+        this.assert_entry_args(entry_block)?;
 
         Ok(this)
     }
 
-    fn use_value(&self, lvalue: LValue) -> anyhow::Result<clif_ir::Value> {
-        self.values
-            .get(lvalue)
+    fn use_stack_slot(&self, stack_slot: StackSlot) -> anyhow::Result<clif_ir::StackSlot> {
+        self.stack_slots
+            .get(stack_slot)
             .copied()
-            .context("internal compiler error: lvalue used before being lowered")
+            .context("internal compiler error: missing stack slot")
+    }
+
+    fn use_value(&self, ssa_value: SSAValue) -> anyhow::Result<clif_ir::Value> {
+        self.values
+            .get(ssa_value)
+            .copied()
+            .context("internal compiler error: ssa_value used before being lowered")
     }
 
     fn clif_block(&self, block: IrBlock) -> anyhow::Result<clif_ir::Block> {
-        let res = self.blocks
+        let res = self
+            .blocks
             .get(block)
             .copied()
             .expect("internal compiler error: missing cranelift block");
@@ -98,22 +163,22 @@ impl<'a> FunctionLowering<'a> {
         Ok(res)
     }
 
+    fn clif_jump(&self, jump: &IrJump) -> anyhow::Result<(clif_ir::Block, Vec<clif_ir::BlockArg>)> {
+        let block = self.clif_block(jump.target)?;
+        let values = jump
+            .parameters
+            .iter()
+            .map(|&ssa_value| self.use_value(ssa_value).map(clif_ir::BlockArg::Value))
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
-    fn int_ty(width: IntWidth) -> clif_ir::Type {
-        match width {
-            IntWidth::W8 => clif_ir::types::I8,
-            IntWidth::W16 => clif_ir::types::I16,
-            IntWidth::W32 => clif_ir::types::I32,
-            IntWidth::W64 => clif_ir::types::I64,
-        }
+        Ok((block, values))
     }
 
     fn iconst(&mut self, iconst: IConst) -> clif_ir::Value {
         let bits = iconst.bits.cast_signed();
-        let ty = Self::int_ty(iconst.width);
+        let ty = clif_int_ty(iconst.width);
         self.builder.ins().iconst(ty, bits)
     }
-
 
     fn assert_value_ty(
         &self,
@@ -130,7 +195,6 @@ impl<'a> FunctionLowering<'a> {
         Ok(())
     }
 
-
     fn lower_stmt(&mut self, _exec_ir: &ExecIr, stmt: &StmtData) -> anyhow::Result<()> {
         let values = self.lower_rvalue(&stmt.rvalue)?;
         let outputs = stmt.outputs.as_slice();
@@ -140,51 +204,67 @@ impl<'a> FunctionLowering<'a> {
             "statement lowering produced mismatched values"
         );
 
-        for (value, &lvalue) in values.into_iter().zip(outputs) {
-            self.values.insert(lvalue, value);
+        for (value, &ssa_value) in values.into_iter().zip(outputs) {
+            self.values.insert_unique(ssa_value, value)
         }
 
         Ok(())
     }
 
-    fn host_memory_flags() -> MemFlags {
-        MemFlags::trusted().with_aligned().with_can_move()
+    fn host_memory_flags(can_move: bool) -> MemFlags {
+        let mut flags = MemFlags::trusted();
+        if can_move {
+            flags.set_can_move();
+        }
+
+        flags
+    }
+
+    fn guest_memory_flags() -> MemFlags {
+        MemFlags::trusted().with_endianness(clif_ir::Endianness::Little)
     }
 
     fn lower_host_load(
         &mut self,
-        width: IntWidth,
-        base_ptr: LValue,
-        offset: usize
+        ty: LoadType,
+        base_ptr: SSAValue,
+        offset: usize,
+        can_move: bool,
     ) -> anyhow::Result<clif_ir::Value> {
         let base_ptr = self.use_value(base_ptr)?;
-        let offset = i32::try_from(offset)
-            .context("internal compiler error host load offset too large")?;
+        let offset =
+            i32::try_from(offset).context("internal compiler error host load offset too large")?;
+
+        let ty = match ty {
+            LoadType::Int(width) => clif_int_ty(width),
+            LoadType::HostPtr => self.ptr_ty,
+        };
 
         Ok(self.builder.ins().load(
-            Self::int_ty(width),
-            Self::host_memory_flags(),
+            ty,
+            Self::host_memory_flags(can_move),
             base_ptr,
-            clif_ir::immediates::Offset32::new(offset)
+            clif_ir::immediates::Offset32::new(offset),
         ))
     }
 
     fn lower_host_store(
         &mut self,
-        base_ptr: LValue,
+        base_ptr: SSAValue,
         offset: usize,
-        value: clif_ir::Value
+        value: clif_ir::Value,
+        can_move: bool,
     ) -> anyhow::Result<()> {
         let base_ptr = self.use_value(base_ptr)?;
 
-        let offset = i32::try_from(offset)
-            .context("internal compiler error host load offset too large")?;
+        let offset =
+            i32::try_from(offset).context("internal compiler error host load offset too large")?;
 
         self.builder.ins().store(
-            Self::host_memory_flags(),
+            Self::host_memory_flags(can_move),
             value,
             base_ptr,
-            clif_ir::immediates::Offset32::new(offset)
+            clif_ir::immediates::Offset32::new(offset),
         );
 
         Ok(())
@@ -205,6 +285,65 @@ impl<'a> FunctionLowering<'a> {
         }
     }
 
+    fn fn_signature(&mut self, signature: CallbackSignature) -> anyhow::Result<clif_ir::SigRef> {
+        Ok(*self.signatures.get_or_insert_with(signature, || {
+            let mut clif_signature = self.module.make_signature();
+
+            let sig = &self.exec_ir.signatures[signature];
+            for &arg in &sig.args {
+                clif_signature
+                    .params
+                    .push(AbiParam::new(ir_ty_to_clif_ty(self.ptr_ty, arg)));
+            }
+
+            if let Some(ty) = sig.ret {
+                clif_signature
+                    .returns
+                    .push(AbiParam::new(ir_ty_to_clif_ty(self.ptr_ty, ty)))
+            }
+
+            self.builder.import_signature(clif_signature)
+        }))
+    }
+
+    fn ptr_add(
+        &mut self,
+        base_ptr: SSAValue,
+        offset: SSAValue,
+        elem_size: NonZero<usize>,
+    ) -> anyhow::Result<clif_ir::Value> {
+        let base_ptr = self.use_value(base_ptr)?;
+        let offset = self.use_value(offset)?;
+
+        self.assert_value_ty(base_ptr, self.ptr_ty, "PtrAdd base_ptr")?;
+
+        let offset_ty = self.builder.func.dfg.value_type(offset);
+        let base_ptr_ty = self.ptr_ty;
+
+        let offset = match offset_ty.bits().cmp(&base_ptr_ty.bits()) {
+            Ordering::Less => self.builder.ins().uextend(base_ptr_ty, offset),
+            Ordering::Equal => offset,
+            Ordering::Greater => self.builder.ins().ireduce(base_ptr_ty, offset),
+        };
+
+        let offset = match elem_size.get() {
+            1 => offset,
+            imm => self.builder.ins().imul_imm(offset, i64::try_from(imm)?),
+        };
+
+        let offset_ptr = self.builder.ins().iadd(base_ptr, offset);
+
+        Ok(offset_ptr)
+    }
+
+    fn ptr_byte_add(
+        &mut self,
+        base_ptr: SSAValue,
+        offset: SSAValue,
+    ) -> anyhow::Result<clif_ir::Value> {
+        self.ptr_add(base_ptr, offset, const { NonZero::new(1).unwrap() })
+    }
+
     fn lower_rvalue(
         &mut self,
         rvalue: &StmtKind,
@@ -212,11 +351,7 @@ impl<'a> FunctionLowering<'a> {
         let value = match *rvalue {
             StmtKind::IConst(iconst) => array_helper::from_arr([self.iconst(iconst)]),
 
-            StmtKind::ArithBinOp {
-                op,
-                lhs,
-                rhs,
-            } => {
+            StmtKind::ArithBinOp { op, lhs, rhs } => {
                 let (lhs, rhs) = (self.use_value(lhs)?, self.use_value(rhs)?);
                 let ins = self.builder.ins();
                 let value = match op {
@@ -230,16 +365,11 @@ impl<'a> FunctionLowering<'a> {
                 array_helper::from_arr([value])
             }
 
-
-            StmtKind::AddImm {
-                value,
-                imm64
-            } => {
+            StmtKind::AddImm { value, imm64 } => {
                 let value = self.use_value(value)?;
                 let new_value = self.builder.ins().iadd_imm(value, imm64.cast_signed());
                 array_helper::from_arr([new_value])
-            },
-
+            }
 
             StmtKind::IntCmp { cmp, lhs, rhs } => {
                 let op = Self::convert_to_intcc(cmp);
@@ -254,7 +384,11 @@ impl<'a> FunctionLowering<'a> {
                 array_helper::from_arr([self.builder.ins().icmp_imm(op, lhs, rhs)])
             }
 
-            StmtKind::Select { cond, if_true, if_false } => {
+            StmtKind::Select {
+                cond,
+                if_true,
+                if_false,
+            } => {
                 let (cond, if_true, if_false) = (
                     self.use_value(cond)?,
                     self.use_value(if_true)?,
@@ -290,11 +424,23 @@ impl<'a> FunctionLowering<'a> {
                 array_helper::from_arr([value])
             }
 
-            StmtKind::OverflowingBinOp {
+            StmtKind::ShiftImm {
                 op,
-                lhs,
-                rhs,
+                value,
+                shift_ammount,
             } => {
+                let value = self.use_value(value)?;
+                let ins = self.builder.ins();
+                let shift_ammount = i64::from(shift_ammount);
+                let output = match op {
+                    ShiftOp::SignExtendShr => ins.sshr_imm(value, shift_ammount),
+                    ShiftOp::ZeroExtendShr => ins.ushr_imm(value, shift_ammount),
+                    ShiftOp::Shl => ins.ishl_imm(value, shift_ammount),
+                };
+                array_helper::from_arr([output])
+            }
+
+            StmtKind::OverflowingBinOp { op, lhs, rhs } => {
                 let (lhs, rhs) = (self.use_value(lhs)?, self.use_value(rhs)?);
                 let ins = self.builder.ins();
                 let (value, overflow) = match op {
@@ -305,82 +451,164 @@ impl<'a> FunctionLowering<'a> {
                 array_helper::from_arr([value, overflow])
             }
 
-            StmtKind::LoadHost { width, base_ptr, offset } => {
-                array_helper::from_arr([self.lower_host_load(width, base_ptr, offset)?])
+            StmtKind::LoadHost {
+                ty,
+                base_ptr,
+                offset,
+                can_move,
+            } => {
+                let loaded_val = self.lower_host_load(ty, base_ptr, offset, can_move)?;
+                array_helper::from_arr([loaded_val])
             }
 
             StmtKind::StoreHost {
                 base_ptr,
                 offset,
                 value,
+                can_move,
             } => {
                 let value = self.use_value(value)?;
-                self.lower_host_store(base_ptr, offset, value)?;
+                self.lower_host_store(base_ptr, offset, value, can_move)?;
+                array_helper::from_arr([])
+            }
+
+            StmtKind::LoadStackPtr { slot } => {
+                let slot = self.use_stack_slot(slot)?;
+                let addr = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
+                array_helper::from_arr([addr])
+            }
+
+            StmtKind::PtrAdd {
+                base_ptr,
+                offset,
+                elem_size,
+            } => {
+                let out_ptr = self.ptr_add(base_ptr, offset, elem_size)?;
+                array_helper::from_arr([out_ptr])
+            }
+
+            StmtKind::HostCallback {
+                func,
+                signature,
+                ref args,
+            } => {
+                let signature = self.fn_signature(signature)?;
+                let args: &SmallVec<SSAValue, HOST_CB_SMALL_ARGS> = args;
+                let args = args
+                    .iter()
+                    .map(|&val| self.use_value(val))
+                    .collect::<anyhow::Result<SmallVec<_, HOST_CB_SMALL_ARGS>>>()?;
+
+                let ptr_value = (func as *const ()).expose_provenance();
+                let value = u64::try_from(ptr_value)?.cast_signed();
+                let fn_ptr_val = self.builder.ins().iconst(self.ptr_ty, value);
+
+                let ins = self
+                    .builder
+                    .ins()
+                    .call_indirect(signature, fn_ptr_val, &args);
+                self.builder.inst_results(ins).iter().copied().collect()
+            }
+
+            StmtKind::VMLoadRaw {
+                aligned_page_ptr,
+                page_offset,
+                width,
+            } => {
+                let int_ty = clif_int_ty(width);
+                let ptr = self.ptr_byte_add(aligned_page_ptr, page_offset)?;
+                let flags = Self::guest_memory_flags();
+                let loaded_val = self.builder.ins().atomic_load(int_ty, flags, ptr);
+                array_helper::from_arr([loaded_val])
+            }
+            StmtKind::VMStoreRaw {
+                aligned_page_ptr,
+                page_offset,
+                value,
+            } => {
+                let value = self.use_value(value)?;
+                let ptr = self.ptr_byte_add(aligned_page_ptr, page_offset)?;
+                let flags = Self::guest_memory_flags();
+                self.builder.ins().atomic_store(flags, value, ptr);
                 array_helper::from_arr([])
             }
 
             StmtKind::LoadHaltReason => {
-                let ptr = self.use_value(LValue::ARG_HALT_REASON_PTR)?;
+                // although accessing the halt reason is **always** safe to do
+                // having the load halt reason operation move is quite unexpected
+                // and can lead to just well never halting
+                // because the halt check moved to the end of the start of the function
+                // and was just reasding stale halt reasons
+                let can_move = false;
+                let ptr = self.use_value(SSAValue::ARG_HALT_REASON_PTR)?;
                 let value = self.builder.ins().atomic_load(
                     clif_ir::types::I32,
-                    Self::host_memory_flags(),
-                    ptr
+                    Self::host_memory_flags(can_move),
+                    ptr,
                 );
                 array_helper::from_arr([value])
             }
 
-            StmtKind::Safepoint => array_helper::from_arr([])
+            StmtKind::TakeHaltReason => {
+                // same reasons as `StmtKind::LoadHaltReason` stated above
+                let can_move = false;
+                let zero = self.iconst(IConst::zero(IntWidth::W32));
+                let ptr = self.use_value(SSAValue::ARG_HALT_REASON_PTR)?;
+                let value = self.builder.ins().atomic_rmw(
+                    clif_ir::types::I32,
+                    Self::host_memory_flags(can_move),
+                    clif_ir::AtomicRmwOp::Xchg,
+                    ptr,
+                    zero,
+                );
+
+                array_helper::from_arr([value])
+            }
+
+            StmtKind::Safepoint => array_helper::from_arr([]),
         };
 
         Ok(value)
     }
 
     fn lower_terminator(&mut self, terminator: &Terminator) -> anyhow::Result<()> {
-        match *terminator {
-            Terminator::Return => {
+        match terminator.kind {
+            TerminatorKind::Return => {
                 let zero = self.builder.ins().iconst(clif_ir::types::I32, 0);
                 self.builder.ins().return_(&[zero]);
             }
 
-            Terminator::ReturnCode { halt_reason } => {
+            TerminatorKind::ReturnCode { halt_reason } => {
                 let halt_reason = self.use_value(halt_reason)?;
-                self.assert_value_ty(
-                    halt_reason,
-                    clif_ir::types::I32,
-                    "ReturnFail halt_reason"
-                )?;
+                self.assert_value_ty(halt_reason, clif_ir::types::I32, "ReturnFail halt_reason")?;
                 self.builder.ins().return_(&[halt_reason]);
             }
 
-            Terminator::Br(target) => {
-                let target = self.clif_block(target)?;
-                self.builder.ins().jump(target, &[]);
+            TerminatorKind::Br => {
+                let target = &terminator.targets[0];
+                let (target, args) = self.clif_jump(target)?;
+                self.builder.ins().jump(target, &args);
             }
 
-            Terminator::BrNZ {
-                cond,
-                non_zero,
-                zero,
-            } => {
+            TerminatorKind::BrZ { cond } => {
+                let [zero, non_zero] = terminator.targets.as_array().unwrap();
+
                 let cond = self.use_value(cond)?;
                 let cond_is_nonzero = self.int_nonzero(cond)?;
 
-                let non_zero = self.clif_block(non_zero)?;
-                let zero = self.clif_block(zero)?;
+                let (non_zero, nz_args) = self.clif_jump(non_zero)?;
+                let (zero, z_args) = self.clif_jump(zero)?;
 
                 self.builder
                     .ins()
-                    .brif(cond_is_nonzero, non_zero, &[], zero, &[]);
+                    .brif(cond_is_nonzero, non_zero, &nz_args, zero, &z_args);
             }
         }
 
         Ok(())
     }
 
-    fn lower_blocks(
-        &mut self,
-        exec_ir: &ExecIr,
-    ) -> anyhow::Result<()> {
+    fn lower_blocks(&mut self, exec_ir: &ExecIr) -> anyhow::Result<()> {
         for &ir_block in self.live_ordered_blocks {
             let clif_block = self.clif_block(ir_block)?;
 
@@ -399,20 +627,10 @@ impl<'a> FunctionLowering<'a> {
         Ok(())
     }
 
-
     fn int_nonzero(&mut self, value: clif_ir::Value) -> anyhow::Result<clif_ir::Value> {
         let ty = self.builder.func.dfg.value_type(value);
         ensure!(ty.is_int(), "BrNZ condition must be an integer value");
         Ok(self.builder.ins().icmp_imm(IntCC::NotEqual, value, 0))
-    }
-
-    #[allow(dead_code)]
-    fn ir_ty_to_clif_ty(&self, ty: IrType) -> anyhow::Result<clif_ir::Type> {
-        match ty {
-            IrType::Bool => Ok(clif_ir::types::I8),
-            IrType::Int(width) => Ok(Self::int_ty(width)),
-            IrType::HostPtr => Ok(self.ptr_ty),
-        }
     }
 
     fn finish(mut self) {
@@ -421,7 +639,6 @@ impl<'a> FunctionLowering<'a> {
     }
 }
 
-
 fn exec_block_signature(module: &JITModule) -> clif_ir::Signature {
     let ptr_ty = module.target_config().pointer_type();
 
@@ -429,22 +646,18 @@ fn exec_block_signature(module: &JITModule) -> clif_ir::Signature {
     // which is basically the C calling convention
     let mut sig = module.make_signature();
 
-    sig.params.push(AbiParam::new(ptr_ty));     // processor_state
-    sig.params.push(AbiParam::new(ptr_ty));     // pages
-    sig.params.push(AbiParam::new(clif_ir::types::I64)); // page_count
-    sig.params.push(AbiParam::new(ptr_ty));     // halt_reason_ptr
-    sig.params.push(AbiParam::new(ptr_ty));     // io_mmu
+    for arg in Arg::args() {
+        sig.params
+            .push(AbiParam::new(ir_ty_to_clif_ty(ptr_ty, arg.ty())));
+    }
 
     sig.returns.push(AbiParam::new(clif_ir::types::I32));
 
     sig
 }
 
-pub use cranelift::codegen::settings::OptLevel;
-use crate::array_helper;
-
 pub struct CraneliftCompiler {
-    isa: OwnedTargetIsa
+    isa: OwnedTargetIsa,
 }
 
 impl CraneliftCompiler {
@@ -461,7 +674,6 @@ impl CraneliftCompiler {
             .set("use_colocated_libcalls", "false")
             .map_err(|err| anyhow!("Cranelift flag use_colocated_libcalls failed: {err}"))?;
 
-
         // JIT code is in-process and not being linked as a PIC object.
         flag_builder.set("is_pic", "false")?;
 
@@ -472,11 +684,14 @@ impl CraneliftCompiler {
 
         flag_builder.set("preserve_frame_pointers", "false")?;
 
-        flag_builder.set("opt_level", match opt_level {
-            OptLevel::None => "none",
-            OptLevel::Speed => "speed",
-            OptLevel::SpeedAndSize => "speed_and_size",
-        })?;
+        flag_builder.set(
+            "opt_level",
+            match opt_level {
+                OptLevel::None => "none",
+                OptLevel::Speed => "speed",
+                OptLevel::SpeedAndSize => "speed_and_size",
+            },
+        )?;
 
         let isa_builder = cranelift::native::builder()
             .map_err(|msg| anyhow!("host machine is not supported by Cranelift: {msg}"))?;
@@ -488,11 +703,13 @@ impl CraneliftCompiler {
         Ok(Self { isa })
     }
 
-    pub fn try_compile(&self, options: CompileOptions, exec_ir: ExecIr) -> anyhow::Result<CompiledExecChunk> {
-        let builder = JITBuilder::with_isa(
-            self.isa.clone(),
-            cranelift::module::default_libcall_names()
-        );
+    pub fn try_compile(
+        &self,
+        options: CompileOptions,
+        exec_ir: ExecIr,
+    ) -> anyhow::Result<CompiledExecChunk> {
+        let builder =
+            JITBuilder::with_isa(self.isa.clone(), cranelift::module::default_libcall_names());
 
         let mut module = JITModule::new(builder);
         let mut ctx = module.make_context();
@@ -508,8 +725,7 @@ impl CraneliftCompiler {
             let ptr_ty = module.target_config().pointer_type();
             let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
 
-            let mut lowering =
-                FunctionLowering::new(builder, &exec_ir, ptr_ty)?;
+            let mut lowering = FunctionLowering::new(builder, &module, &exec_ir, ptr_ty)?;
 
             lowering.lower_blocks(&exec_ir)?;
             lowering.finish();
@@ -523,15 +739,21 @@ impl CraneliftCompiler {
             .define_function(func_id, &mut ctx)
             .map_err(|err| anyhow!("define_function failed: {err}"))?;
 
-
         if options.show_disasm {
-            let code = ctx.compiled_code()
+            let code = ctx
+                .compiled_code()
                 .expect("Cranelift did not leave compiled code in the context");
 
-            eprintln!("{}:", options.function_name);
-            eprintln!("{}", code.vcode.as_deref().unwrap_or("no disassembly was produced"));
+            eprintln!("{} clif:\n{}", options.function_name, ctx.func.display());
+            eprintln!(
+                "{name}:\ndis-assembly:\n{disasm}",
+                name = options.function_name,
+                disasm = code
+                    .vcode
+                    .as_deref()
+                    .unwrap_or("no disassembly was produced")
+            );
         }
-
 
         module.clear_context(&mut ctx);
 
@@ -556,8 +778,9 @@ impl CraneliftCompiler {
             }
         }
 
-        Ok(CompiledExecChunk::new_with_recources(ffi, DropModule(ManuallyDrop::new(module))))
+        Ok(CompiledExecChunk::new_with_recources(
+            ffi,
+            DropModule(ManuallyDrop::new(module)),
+        ))
     }
 }
-
-

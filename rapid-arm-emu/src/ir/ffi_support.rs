@@ -66,7 +66,6 @@ macro_rules! impl_io_mmu_store_ints {
     };
 }
 
-
 impl_io_mmu_store_ints!(
     {
         func: io_mmu_store64_le,

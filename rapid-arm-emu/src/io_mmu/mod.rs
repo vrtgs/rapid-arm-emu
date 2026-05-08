@@ -41,6 +41,8 @@
 //! 4. Access scalars through `load_byte/load16/load32/load64` and
 //!    `store_byte/store16/store32/store64`.
 
+use crate::cpu_fabric::CpuFabric;
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::hint::cold_path;
 use std::mem::MaybeUninit;
@@ -48,9 +50,6 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use parking_lot::Mutex;
-use crate::cpu_fabric::CpuFabric;
-
 
 mod memops;
 
@@ -78,7 +77,6 @@ macro_rules! make_checked_usize_cast {
                 }
             }
         }
-
     };
 }
 
@@ -89,7 +87,7 @@ make_checked_usize_cast! { usize => u64 }
 const fn u64_add_usize(x: u64, y: usize) -> Option<u64> {
     let Some(y) = usize_to_u64(y) else {
         cold_path();
-        return None
+        return None;
     };
     x.checked_add(y)
 }
@@ -108,6 +106,7 @@ pub const PAGE_SHIFT: u8 = {
     bits as u8
 };
 
+pub const PAGE_OFFSET_MASK: u64 = PAGE_SIZE_U64.strict_sub(1);
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -117,7 +116,6 @@ bitflags::bitflags! {
         const EXECUTE    = 0b0100;
     }
 }
-
 
 /// Fault returned when a memory access is invalid.
 ///
@@ -149,18 +147,14 @@ macro_rules! ensure {
     };
 }
 
-
 #[inline]
 fn div_rem_page_size(vaddr: u64) -> (u64, usize) {
-    (
-        vaddr >> PAGE_SHIFT,
-        {
-            let remainder = vaddr & const { PAGE_SIZE_U64.strict_sub(1) };
-            // Safety: PAGE_SIZE fits in usize, and we are taking the remainder by PAGE_SIZE
-            //         therefore the remainder **MUST** fit in a usize
-            unsafe { u64_to_usize(remainder).unwrap_unchecked() }
-        }
-    )
+    (vaddr >> PAGE_SHIFT, {
+        let remainder = vaddr & PAGE_OFFSET_MASK;
+        // Safety: PAGE_SIZE fits in usize, and we are taking the remainder by PAGE_SIZE
+        //         therefore the remainder **MUST** fit in a usize
+        unsafe { u64_to_usize(remainder).unwrap_unchecked() }
+    })
 }
 
 #[inline]
@@ -169,8 +163,6 @@ fn div_page_size_checked(vaddr: u64) -> Result<u64, MemoryFault> {
     ensure!(offset == 0);
     Ok(page)
 }
-
-
 
 /// Per-page invariants:
 ///
@@ -233,10 +225,7 @@ impl Page {
         insn_dirty: AtomicBool::new(false),
     };
 
-    pub(crate) fn mapped(
-        ptr: NonNull<AtomicU8>,
-        memory_protections: MemProt,
-    ) -> Self {
+    pub(crate) fn mapped(ptr: NonNull<AtomicU8>, memory_protections: MemProt) -> Self {
         Self {
             ptr: Some(ptr),
             mem_prot: memory_protections,
@@ -256,7 +245,6 @@ impl Page {
     /// `self` must be mapped
     pub(crate) unsafe fn mem_protect(&mut self, memory_protections: MemProt) {
         debug_assert!(self.is_mapped());
-
 
         let old_prot = self.mem_prot;
         let new_prot = memory_protections;
@@ -297,7 +285,6 @@ impl Page {
         Ok(unsafe { self.get_data_ptr_unchecked() })
     }
 
-
     /// Marks this page as requiring instruction-cache invalidation.
     ///
     /// This is called after every successful store. It only changes the page state
@@ -318,8 +305,11 @@ impl Page {
         }
     }
 
+    fn is_insn_dirty(&self) -> bool {
+        self.insn_dirty.load(Ordering::Acquire)
+    }
 
-    pub(crate) fn take_insn_dirty(&self) -> bool {
+    fn take_insn_dirty(&self) -> bool {
         // Use AcqRel because this operation both observes and clears insn_dirty.
         //
         // Acquire pairs with the Release in set_insn_dirty, ensuring that if we observe
@@ -332,12 +322,15 @@ impl Page {
         self.insn_dirty.swap(false, Ordering::AcqRel)
     }
 
-
     /// # Safety
     ///
     /// the whole store operation must fit in the page
     #[inline(always)]
-    pub(crate) unsafe fn load(&self, offset: usize, mem: &mut [MaybeUninit<u8>]) -> Result<(), MemoryFault> {
+    pub(crate) unsafe fn load(
+        &self,
+        offset: usize,
+        mem: &mut [MaybeUninit<u8>],
+    ) -> Result<(), MemoryFault> {
         unsafe {
             let page_ptr = self.get_data_ptr(MemProt::READ)?;
 
@@ -440,7 +433,6 @@ impl_load_ops! {
     store: store_byte
 }
 
-
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub(crate) struct HostPointer(pub(crate) NonNull<AtomicU8>);
@@ -454,7 +446,6 @@ impl HostPointer {
 unsafe impl Send for HostPointer {}
 unsafe impl Sync for HostPointer {}
 
-
 /// Page-mapped virtual memory view over host-backed storage.
 ///
 /// `IoMMU` maps Armv9 virtual addresses onto page-aligned host memory.
@@ -465,10 +456,6 @@ unsafe impl Sync for HostPointer {}
 pub struct IoMMU {
     pages: Vec<Page>,
     pending_dirty_pages: Mutex<HashSet<HostPointer>>,
-    // FIXME whenever a write is in
-    //       range of an active monitor,
-    //       invalidate it and lock it,
-    //       until the store is complete
     fabric: CpuFabric,
 }
 
@@ -485,7 +472,7 @@ impl IoMMU {
         Self {
             pages: vec![],
             pending_dirty_pages: Mutex::new(HashSet::new()),
-            fabric
+            fabric,
         }
     }
 
@@ -500,7 +487,6 @@ impl IoMMU {
         }
         page.unmap()
     }
-
 
     /// Maps a host memory region into the MMU page table.
     ///
@@ -558,7 +544,6 @@ impl IoMMU {
                 self.pages.resize_with(end_page, || Page::UNMAPPED)
             }
 
-
             let base_ptr = NonNull::new_unchecked(ptr.cast::<AtomicU8>());
             for page_idx in start_page..end_page {
                 let page = self.pages.get_unchecked_mut(page_idx);
@@ -575,7 +560,7 @@ impl IoMMU {
     fn get_pages_mut(
         &mut self,
         start: u64,
-        size: u64
+        size: u64,
     ) -> Result<(&mut [Page], &mut HashSet<HostPointer>), MemoryFault> {
         let end = start.checked_add(size).ok_or_else(MemoryFault::fault)?;
         let end_page = div_page_size_checked(end)?;
@@ -586,7 +571,6 @@ impl IoMMU {
             .ok()
             .ok_or_else(MemoryFault::fault)?;
 
-
         let pages = self
             .pages
             .get_mut(start_page..end_page)
@@ -594,7 +578,6 @@ impl IoMMU {
 
         Ok((pages, self.pending_dirty_pages.get_mut()))
     }
-
 
     pub fn unmap_memory(&mut self, start: u64, size: u64) -> Result<(), MemoryFault> {
         let (pages, pending_dirty_pages) = self.get_pages_mut(start, size)?;
@@ -608,7 +591,7 @@ impl IoMMU {
         &mut self,
         start: u64,
         size: u64,
-        protections: MemProt
+        protections: MemProt,
     ) -> Result<(), MemoryFault> {
         // changing memory protections doesn't change the mapping of the host pointer
         // therefore there is no need to touch the pending dirty pages
@@ -656,7 +639,11 @@ impl IoMMU {
         for (i, page) in pages.iter().enumerate() {
             let page_idx = unsafe { start_page.unchecked_add(i) };
 
-            let page_off = if page_idx == start_page { start_offset } else { 0 };
+            let page_off = if page_idx == start_page {
+                start_offset
+            } else {
+                0
+            };
             let page_end = if page_idx == end_page {
                 // end_offset is < A::PAGE_SIZE
                 // which is some usize, that means there is some usize bigger than us
@@ -683,22 +670,14 @@ impl IoMMU {
         f: impl FnMut(&Page, usize, usize, usize),
     ) -> Result<(), MemoryFault> {
         if len == 0 {
-            return Ok(())
+            return Ok(());
         }
 
         let extra = unsafe { len.unchecked_sub(1) };
         let end = u64_add_usize(vaddr, extra).ok_or_else(MemoryFault::fault)?;
         // Safety: end is vaddr + len, with no overflow, and so this it must be bigger
-        unsafe {
-            self.for_each_page_chunk(
-                vaddr,
-                end,
-                required,
-                f
-            )
-        }
+        unsafe { self.for_each_page_chunk(vaddr, end, required, f) }
     }
-
 
     /// Loads a byte slice from virtual memory into `mem`.
     ///
@@ -718,7 +697,7 @@ impl IoMMU {
     pub fn load<'a>(
         &self,
         vaddr: u64,
-        mem: &'a mut [MaybeUninit<u8>]
+        mem: &'a mut [MaybeUninit<u8>],
     ) -> Result<&'a mut [u8], MemoryFault> {
         let result = self.for_each_page_chunk_len(
             vaddr,
@@ -771,7 +750,7 @@ struct SecondPage<'a> {
 struct SmallAccess<'a> {
     base_page: &'a Page,
     base_page_offset: usize,
-    second_page: Option<SecondPage<'a>>
+    second_page: Option<SecondPage<'a>>,
 }
 
 impl IoMMU {
@@ -798,15 +777,12 @@ impl IoMMU {
             false => None,
             true => {
                 cold_path();
-                let overflow_amount = unsafe {
-                    u8::try_from(end_offset.unchecked_sub(PAGE_SIZE)).unwrap_unchecked()
-                };
+                let overflow_amount =
+                    unsafe { u8::try_from(end_offset.unchecked_sub(PAGE_SIZE)).unwrap_unchecked() };
 
                 unsafe { core::hint::assert_unchecked(overflow_amount < BYTES) }
 
-                let overflow_amount = unsafe {
-                    NonZero::new_unchecked(overflow_amount)
-                };
+                let overflow_amount = unsafe { NonZero::new_unchecked(overflow_amount) };
 
                 let second_page = base_page_idx
                     .checked_add(1)
@@ -815,7 +791,7 @@ impl IoMMU {
 
                 Some(SecondPage {
                     page: second_page,
-                    overflow_amount
+                    overflow_amount,
                 })
             }
         };
@@ -823,11 +799,10 @@ impl IoMMU {
         Ok(SmallAccess {
             base_page,
             base_page_offset,
-            second_page
+            second_page,
         })
     }
 }
-
 
 macro_rules! emit_multi_word_load_store {
     ($($bits: tt),+ $(,)?) => {
@@ -1052,7 +1027,7 @@ emit_multi_word_load_store! { 64, 32, 16 }
 impl IoMMU {
     pub(crate) fn single_page_aligned_access<const ALIGN: u8>(
         &self,
-        vaddr: u64
+        vaddr: u64,
     ) -> Result<(&Page, usize), MemoryFault> {
         const {
             assert!(ALIGN.is_power_of_two());
@@ -1085,7 +1060,6 @@ impl IoMMU {
     }
 }
 
-
 impl IoMMU {
     pub(crate) fn fetch_aarch64_full(&self, vaddr: u64) -> Result<(HostPointer, u32), MemoryFault> {
         const ALIGN: u8 = 4;
@@ -1102,14 +1076,16 @@ impl IoMMU {
         self.fetch_aarch64_full(vaddr).map(|(_ptr, word)| word)
     }
 
-    pub(crate) fn drain_dirty_icache(&self) -> impl Iterator<Item=Range<HostPointer>> {
+    pub(crate) fn drain_dirty_icache(&self) -> impl Iterator<Item = Range<HostPointer>> {
         let mut dirty_pages = {
             let mut lock = self.pending_dirty_pages.lock();
             core::mem::take(&mut *lock)
         };
 
         for page in &self.pages {
-            if page.take_insn_dirty() {
+            // the `is_insn_dirty` avoids an expensive
+            // xchg if the page is not dirty
+            if page.is_insn_dirty() && page.take_insn_dirty() {
                 let page_ptr = unsafe { page.get_data_ptr_unchecked() };
                 dirty_pages.insert(HostPointer::new(page_ptr));
             }
@@ -1126,22 +1102,19 @@ impl IoMMU {
 impl IoMMU {
     pub(crate) fn pages_ffi(&self) -> (*const Page, u64) {
         // mapped pages count must be less than or equal u64::MAX >> PAGE_SHIFT
-        let len = unsafe {
-            u64::try_from(self.pages.len()).unwrap_unchecked()
-        };
-        
+        let len = unsafe { u64::try_from(self.pages.len()).unwrap_unchecked() };
+
         let ptr = self.pages.as_ptr();
 
         (ptr, len)
     }
 }
 
-
 #[cfg(test)]
 mod mmu_tests {
     use super::*;
 
-    use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
+    use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
     use std::mem::MaybeUninit;
     use std::ptr::NonNull;
 
@@ -1174,9 +1147,9 @@ mod mmu_tests {
             let len = pages.checked_mul(page_size()).unwrap();
             let layout = Layout::from_size_align(len, page_size()).unwrap();
 
-            let raw = match len{
+            let raw = match len {
                 0 => core::ptr::dangling_mut(),
-                _ => unsafe { alloc_zeroed(layout) }
+                _ => unsafe { alloc_zeroed(layout) },
             };
             let ptr = NonNull::new(raw).unwrap_or_else(|| handle_alloc_error(layout));
 
@@ -1204,7 +1177,7 @@ mod mmu_tests {
                 unsafe {
                     dealloc(
                         self.ptr.as_ptr(),
-                        Layout::from_size_align_unchecked(self.len, PAGE_SIZE)
+                        Layout::from_size_align_unchecked(self.len, PAGE_SIZE),
                     );
                 }
             }
@@ -1242,7 +1215,7 @@ mod mmu_tests {
                     pages.strict_mul(page_size()) as u64,
                     protections,
                 )
-                    .unwrap();
+                .unwrap();
             }
 
             Self {
@@ -1277,7 +1250,8 @@ mod mmu_tests {
                         backing.get_page(page).as_mut_ptr(),
                         page_size() as u64,
                         protections,
-                    ).unwrap();
+                    )
+                    .unwrap();
                 }
             }
 
@@ -1335,43 +1309,42 @@ mod mmu_tests {
         let mut mmu = IoMMU::new(CpuFabric::new());
 
         unsafe {
-            assert!(mmu
-                .map_memory(
-                    1,
-                    backing.as_mut_ptr(),
-                    page_size() as u64,
-                    MemProt::READ,
-                )
-                .is_err());
+            assert!(
+                mmu.map_memory(1, backing.as_mut_ptr(), page_size() as u64, MemProt::READ,)
+                    .is_err()
+            );
 
-            assert!(mmu
-                .map_memory(
+            assert!(
+                mmu.map_memory(
                     BASE,
                     backing.get_page(0).as_mut_ptr().add(1),
                     page_size() as u64,
                     MemProt::READ,
                 )
-                .is_err());
+                .is_err()
+            );
 
-            assert!(mmu
-                .map_memory(
+            assert!(
+                mmu.map_memory(
                     BASE,
                     backing.as_mut_ptr(),
                     (page_size() - 1) as u64,
                     MemProt::READ,
                 )
-                .is_err());
+                .is_err()
+            );
 
             let overflow_base = u64::MAX - ((page_size() as u64) - 1);
 
-            assert!(mmu
-                .map_memory(
+            assert!(
+                mmu.map_memory(
                     overflow_base,
                     backing.as_mut_ptr(),
                     page_size() as u64,
                     MemProt::READ,
                 )
-                .is_err());
+                .is_err()
+            );
         }
     }
 
@@ -1392,7 +1365,7 @@ mod mmu_tests {
                 page_size() as u64,
                 MemProt::READ,
             )
-                .unwrap();
+            .unwrap();
         }
 
         assert!(mmu.load_byte(0).is_err());
@@ -1465,7 +1438,10 @@ mod mmu_tests {
         let fixture = Fixture::new(1, MemProt::READ | MemProt::WRITE);
 
         for i in 0..64_u8 {
-            fixture.mmu.store_byte(i.into(), pattern_byte(i.into())).unwrap();
+            fixture
+                .mmu
+                .store_byte(i.into(), pattern_byte(i.into()))
+                .unwrap();
         }
 
         for i in 0..64_u8 {
@@ -1490,10 +1466,7 @@ mod mmu_tests {
 
     #[test]
     fn slice_store_load_roundtrip_across_two_pages() {
-        let fixture = Fixture::new(
-            2,
-            MemProt::READ | MemProt::WRITE
-        );
+        let fixture = Fixture::new(2, MemProt::READ | MemProt::WRITE);
 
         let start = u64::try_from(page_size().strict_sub(5)).unwrap();
         let data = pattern_array::<13>(0);
@@ -1505,10 +1478,8 @@ mod mmu_tests {
 
     #[test]
     fn slice_store_across_boundary_requires_write_on_both_pages() {
-        let fixture = Fixture::with_page_protections(&[
-            MemProt::READ | MemProt::WRITE,
-            MemProt::READ,
-        ]);
+        let fixture =
+            Fixture::with_page_protections(&[MemProt::READ | MemProt::WRITE, MemProt::READ]);
 
         let start = (page_size() - 1) as u64;
 
@@ -1517,10 +1488,8 @@ mod mmu_tests {
 
     #[test]
     fn slice_load_across_boundary_requires_read_on_both_pages() {
-        let fixture = Fixture::with_page_protections(&[
-            MemProt::READ | MemProt::WRITE,
-            MemProt::WRITE,
-        ]);
+        let fixture =
+            Fixture::with_page_protections(&[MemProt::READ | MemProt::WRITE, MemProt::WRITE]);
 
         let start = (page_size() - 1) as u64;
         let mut out = [MaybeUninit::<u8>::uninit(); 2];
@@ -1542,11 +1511,7 @@ mod mmu_tests {
 
     #[test]
     fn scalar_loads_inside_one_page_are_little_endian() {
-        let fixture = Fixture::with_bytes(
-            1,
-            MemProt::READ | MemProt::WRITE,
-            pattern_byte,
-        );
+        let fixture = Fixture::with_bytes(1, MemProt::READ | MemProt::WRITE, pattern_byte);
 
         let off16 = 11usize;
         let off32 = 19usize;
@@ -1590,11 +1555,7 @@ mod mmu_tests {
 
     #[test]
     fn scalar_loads_at_last_non_crossing_offsets_succeed() {
-        let fixture = Fixture::with_bytes(
-            1,
-            MemProt::READ | MemProt::WRITE,
-            pattern_byte,
-        );
+        let fixture = Fixture::with_bytes(1, MemProt::READ | MemProt::WRITE, pattern_byte);
 
         let p = page_size();
 
@@ -1616,11 +1577,7 @@ mod mmu_tests {
 
     #[test]
     fn scalar_loads_crossing_page_boundary_read_expected_bytes() {
-        let fixture = Fixture::with_bytes(
-            2,
-            MemProt::READ | MemProt::WRITE,
-            pattern_byte,
-        );
+        let fixture = Fixture::with_bytes(2, MemProt::READ | MemProt::WRITE, pattern_byte);
 
         let p = page_size();
 
@@ -1689,25 +1646,21 @@ mod mmu_tests {
 
     #[test]
     fn crossing_scalar_load_requires_read_on_both_pages() {
-        let fixture = Fixture::with_page_protections(&[
-            MemProt::READ,
-            MemProt::WRITE,
-        ]);
+        let fixture = Fixture::with_page_protections(&[MemProt::READ, MemProt::WRITE]);
 
         assert!(fixture.mmu.load16_le((page_size() - 1) as u64).is_err());
     }
 
     #[test]
     fn crossing_scalar_store_requires_write_on_both_pages() {
-        let fixture = Fixture::with_page_protections(&[
-            MemProt::WRITE,
-            MemProt::READ,
-        ]);
+        let fixture = Fixture::with_page_protections(&[MemProt::WRITE, MemProt::READ]);
 
-        assert!(fixture
-            .mmu
-            .store16_le((page_size() - 1) as u64, 0xbeef)
-            .is_err());
+        assert!(
+            fixture
+                .mmu
+                .store16_le((page_size() - 1) as u64, 0xbeef)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1726,10 +1679,7 @@ mod mmu_tests {
 
     #[test]
     fn store_byte_marks_executable_page_dirty() {
-        let fixture = Fixture::new(
-            1,
-            MemProt::READ | MemProt::WRITE | MemProt::EXECUTE,
-        );
+        let fixture = Fixture::new(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
 
         assert!(!fixture.is_dirty(0));
 
@@ -1740,10 +1690,7 @@ mod mmu_tests {
 
     #[test]
     fn store_slice_marks_executable_page_dirty() {
-        let fixture = Fixture::new(
-            1,
-            MemProt::READ | MemProt::WRITE | MemProt::EXECUTE,
-        );
+        let fixture = Fixture::new(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
 
         assert!(!fixture.is_dirty(0));
 
@@ -1754,10 +1701,7 @@ mod mmu_tests {
 
     #[test]
     fn store_slice_crossing_pages_marks_both_executable_pages_dirty() {
-        let fixture = Fixture::new(
-            2,
-            MemProt::READ | MemProt::WRITE | MemProt::EXECUTE,
-        );
+        let fixture = Fixture::new(2, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
 
         assert!(!fixture.is_dirty(0));
         assert!(!fixture.is_dirty(1));
@@ -1773,10 +1717,7 @@ mod mmu_tests {
 
     #[test]
     fn single_page_scalar_store_marks_executable_page_dirty() {
-        let fixture = Fixture::new(
-            1,
-            MemProt::READ | MemProt::WRITE | MemProt::EXECUTE,
-        );
+        let fixture = Fixture::new(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
 
         assert!(!fixture.is_dirty(0));
 
@@ -1825,10 +1766,7 @@ mod mmu_tests {
     #[test]
     fn bug_load_ending_at_boundary_should_not_require_read_on_next_page() {
         let fixture = Fixture::with_page_protections_and_bytes(
-            &[
-                MemProt::READ,
-                MemProt::WRITE,
-            ],
+            &[MemProt::READ, MemProt::WRITE],
             pattern_byte,
         );
 
@@ -1842,22 +1780,14 @@ mod mmu_tests {
     // on either touched page.
     #[test]
     fn bug_cross_page_scalar_store_should_mark_touched_executable_pages_dirty() {
-        let fixture = Fixture::new(
-            2,
-            MemProt::READ
-                | MemProt::WRITE
-                | MemProt::EXECUTE,
-        );
+        let fixture = Fixture::new(2, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
 
         assert!(!fixture.is_dirty(0));
         assert!(!fixture.is_dirty(1));
 
         let addr = (page_size() - 1) as u64;
 
-        fixture
-            .mmu
-            .store16_le(addr, 0xbeef)
-            .unwrap();
+        fixture.mmu.store16_le(addr, 0xbeef).unwrap();
 
         assert!(fixture.is_dirty(0));
         assert!(fixture.is_dirty(1));
@@ -1882,7 +1812,7 @@ mod mmu_tests {
                 page,
                 MemProt::READ | MemProt::WRITE,
             )
-                .unwrap();
+            .unwrap();
 
             // Intentionally skip page 1.
 
@@ -1892,7 +1822,7 @@ mod mmu_tests {
                 page,
                 MemProt::READ | MemProt::WRITE,
             )
-                .unwrap();
+            .unwrap();
         }
 
         Fixture {
@@ -2053,10 +1983,7 @@ mod mmu_tests {
 
         fixture.mmu.store_byte(BASE, 0xaa).unwrap();
 
-        fixture
-            .mmu
-            .mem_protect(BASE, page, MemProt::READ)
-            .unwrap();
+        fixture.mmu.mem_protect(BASE, page, MemProt::READ).unwrap();
 
         assert_eq!(fixture.mmu.load_byte(BASE).unwrap(), 0xaa);
         assert!(fixture.mmu.store_byte(BASE, 0xbb).is_err());
@@ -2072,10 +1999,7 @@ mod mmu_tests {
         fixture.mmu.store_byte(BASE, 0xaa).unwrap();
         assert_eq!(fixture.mmu.load_byte(BASE).unwrap(), 0xaa);
 
-        fixture
-            .mmu
-            .mem_protect(BASE, page, MemProt::WRITE)
-            .unwrap();
+        fixture.mmu.mem_protect(BASE, page, MemProt::WRITE).unwrap();
 
         assert!(fixture.mmu.load_byte(BASE).is_err());
         assert!(fixture.mmu.load16_le(BASE).is_err());
@@ -2108,10 +2032,7 @@ mod mmu_tests {
         let mut fixture = Fixture::new(1, MemProt::READ | MemProt::WRITE);
         let page = page_size() as u64;
 
-        fixture
-            .mmu
-            .mem_protect(BASE, page, MemProt::READ)
-            .unwrap();
+        fixture.mmu.mem_protect(BASE, page, MemProt::READ).unwrap();
 
         assert!(fixture.mmu.store_byte(BASE, 0xaa).is_err());
 
@@ -2167,10 +2088,7 @@ mod mmu_tests {
 
         fixture.mmu.unmap_memory(BASE, page).unwrap();
 
-        assert!(fixture
-            .mmu
-            .mem_protect(BASE, page, MemProt::READ)
-            .is_err());
+        assert!(fixture.mmu.mem_protect(BASE, page, MemProt::READ).is_err());
 
         assert!(fixture.mmu.load_byte(BASE).is_err());
         assert!(fixture.mmu.store_byte(BASE, 0xaa).is_err());
@@ -2181,10 +2099,12 @@ mod mmu_tests {
         let mut fixture = sparse_fixture_with_hole();
         let page = page_size() as u64;
 
-        assert!(fixture
-            .mmu
-            .mem_protect(page_addr(0), page * 3, MemProt::READ)
-            .is_err());
+        assert!(
+            fixture
+                .mmu
+                .mem_protect(page_addr(0), page * 3, MemProt::READ)
+                .is_err()
+        );
 
         // Page 0 and page 2 must still be writable. This catches accidental
         // partial updates if the implementation protects pages as it checks them.
@@ -2200,10 +2120,7 @@ mod mmu_tests {
         let mut fixture = Fixture::new(1, MemProt::READ | MemProt::WRITE);
         let page = page_size() as u64;
 
-        assert!(fixture
-            .mmu
-            .mem_protect(1, page, MemProt::READ)
-            .is_err());
+        assert!(fixture.mmu.mem_protect(1, page, MemProt::READ).is_err());
 
         assert!(fixture.mmu.store_byte(BASE, 0xaa).is_ok());
         assert_eq!(fixture.mmu.load_byte(BASE).unwrap(), 0xaa);
@@ -2214,10 +2131,12 @@ mod mmu_tests {
         let mut fixture = Fixture::new(1, MemProt::READ | MemProt::WRITE);
         let page = page_size() as u64;
 
-        assert!(fixture
-            .mmu
-            .mem_protect(BASE, page - 1, MemProt::READ)
-            .is_err());
+        assert!(
+            fixture
+                .mmu
+                .mem_protect(BASE, page - 1, MemProt::READ)
+                .is_err()
+        );
 
         assert!(fixture.mmu.store_byte(BASE, 0xaa).is_ok());
         assert_eq!(fixture.mmu.load_byte(BASE).unwrap(), 0xaa);
@@ -2228,10 +2147,12 @@ mod mmu_tests {
         let mut fixture = Fixture::new(1, MemProt::READ | MemProt::WRITE);
         let page = page_size() as u64;
 
-        assert!(fixture
-            .mmu
-            .mem_protect(page_addr(1), page, MemProt::READ)
-            .is_err());
+        assert!(
+            fixture
+                .mmu
+                .mem_protect(page_addr(1), page, MemProt::READ)
+                .is_err()
+        );
 
         assert!(fixture.mmu.store_byte(BASE, 0xaa).is_ok());
         assert_eq!(fixture.mmu.load_byte(BASE).unwrap(), 0xaa);
@@ -2241,10 +2162,7 @@ mod mmu_tests {
     fn mem_protect_rejects_address_overflow() {
         let mut fixture = Fixture::new(1, MemProt::READ | MemProt::WRITE);
 
-        assert!(fixture
-            .mmu
-            .mem_protect(u64::MAX, 1, MemProt::READ)
-            .is_err());
+        assert!(fixture.mmu.mem_protect(u64::MAX, 1, MemProt::READ).is_err());
 
         assert!(fixture.mmu.store_byte(BASE, 0xaa).is_ok());
     }
@@ -2257,11 +2175,7 @@ mod mmu_tests {
 
     #[test]
     fn unaligned_scalar_loads_inside_page_succeed() {
-        let fixture = Fixture::with_bytes(
-            1,
-            MemProt::READ | MemProt::WRITE,
-            pattern_byte,
-        );
+        let fixture = Fixture::with_bytes(1, MemProt::READ | MemProt::WRITE, pattern_byte);
 
         assert_eq!(
             fixture.mmu.load16_le(1).unwrap(),
@@ -2287,7 +2201,10 @@ mod mmu_tests {
         assert_eq!(fixture.read_vec(1, 2), 0xbeefu16.to_le_bytes().to_vec());
 
         fixture.mmu.store32_le(3, 0xaabb_ccdd).unwrap();
-        assert_eq!(fixture.read_vec(3, 4), 0xaabb_ccddu32.to_le_bytes().to_vec());
+        assert_eq!(
+            fixture.read_vec(3, 4),
+            0xaabb_ccddu32.to_le_bytes().to_vec()
+        );
 
         fixture.mmu.store64_le(5, 0x0123_4567_89ab_cdef).unwrap();
         assert_eq!(
@@ -2299,10 +2216,7 @@ mod mmu_tests {
     #[test]
     fn failed_crossing_scalar_store_does_not_write_first_page_when_second_page_lacks_write() {
         let fixture = Fixture::with_page_protections_and_bytes(
-            &[
-                MemProt::READ | MemProt::WRITE,
-                MemProt::READ,
-            ],
+            &[MemProt::READ | MemProt::WRITE, MemProt::READ],
             pattern_byte,
         );
 
@@ -2317,10 +2231,7 @@ mod mmu_tests {
     #[test]
     fn failed_crossing_scalar_store_does_not_write_second_page_when_first_page_lacks_write() {
         let fixture = Fixture::with_page_protections_and_bytes(
-            &[
-                MemProt::READ,
-                MemProt::READ | MemProt::WRITE,
-            ],
+            &[MemProt::READ, MemProt::READ | MemProt::WRITE],
             pattern_byte,
         );
 
@@ -2329,7 +2240,10 @@ mod mmu_tests {
 
         assert!(fixture.mmu.store16_le(start, 0xbeef).is_err());
 
-        assert_eq!(fixture.mmu.load_byte(page_addr(1)).unwrap(), second_page_before);
+        assert_eq!(
+            fixture.mmu.load_byte(page_addr(1)).unwrap(),
+            second_page_before
+        );
     }
 
     #[test]
@@ -2342,9 +2256,11 @@ mod mmu_tests {
 
         assert!(fixture.mmu.store16_le(u64::MAX, 0xbeef).is_err());
         assert!(fixture.mmu.store32_le(u64::MAX - 1, 0xaabb_ccdd).is_err());
-        assert!(fixture
-            .mmu
-            .store64_le(u64::MAX - 3, 0x0123_4567_89ab_cdef)
-            .is_err());
+        assert!(
+            fixture
+                .mmu
+                .store64_le(u64::MAX - 3, 0x0123_4567_89ab_cdef)
+                .is_err()
+        );
     }
 }

@@ -1,18 +1,18 @@
-use std::{cmp, io};
+use flume::TrySendError;
+use rayon::iter::plumbing::UnindexedConsumer;
 use std::io::{BufRead, Read};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use flume::TrySendError;
-use rayon::iter::plumbing::UnindexedConsumer;
+use std::{cmp, io};
 
 enum DataPacket {
     FlushBuffer,
-    NewData(Vec<u8>)
+    NewData(Vec<u8>),
 }
 
 struct CurrentReadBuf {
     buf: Vec<u8>,
-    offset: usize
+    offset: usize,
 }
 
 impl CurrentReadBuf {
@@ -24,10 +24,7 @@ impl CurrentReadBuf {
     }
 
     pub fn new(buf: Vec<u8>) -> Self {
-        Self {
-            buf,
-            offset: 0
-        }
+        Self { buf, offset: 0 }
     }
 
     pub fn slice(&self) -> &[u8] {
@@ -39,7 +36,6 @@ impl CurrentReadBuf {
         self.offset = cmp::min(self.offset, self.buf.len());
     }
 }
-
 
 pub struct TarFileEntry {
     path: PathBuf,
@@ -66,17 +62,17 @@ impl BufRead for TarFileEntry {
         if self.current_read.slice().is_empty() {
             loop {
                 let Some(recv) = self.data_flow.next() else {
-                    return Ok(&[])
+                    return Ok(&[]);
                 };
 
                 match recv? {
                     DataPacket::NewData(data) => {
                         self.current_read = CurrentReadBuf::new(data);
-                        break
-                    },
+                        break;
+                    }
                     DataPacket::FlushBuffer => {
                         self.current_read = CurrentReadBuf::empty();
-                        continue
+                        continue;
                     }
                 }
             }
@@ -94,9 +90,9 @@ impl Read for TarFileEntry {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // avoid stalling an empty buffer if we need to wait for more data
         if buf.is_empty() {
-            return Ok(0)
+            return Ok(0);
         }
-        
+
         let mut reader = self.fill_buf()?;
         let read_amount = reader.read(buf)?;
         self.consume(read_amount);
@@ -125,7 +121,7 @@ impl Read for TarFileEntry {
             // this always holds
             if buf.is_empty() && buf.capacity() <= read_buf.capacity() {
                 *buf = read_buf;
-                continue
+                continue;
             }
 
             buf.extend(read_buf)
@@ -157,7 +153,7 @@ impl BudgetCalculator {
     fn try_refill_budget_from(
         current_budget: &mut usize,
         sender_budget: NonZero<usize>,
-        sender: &ReaderSender
+        sender: &ReaderSender,
     ) -> bool {
         match sender.try_send(Ok(DataPacket::FlushBuffer)) {
             Ok(_) | Err(TrySendError::Disconnected(_)) => {
@@ -169,15 +165,13 @@ impl BudgetCalculator {
     }
 
     fn try_refill_budget(&mut self) {
-        self.pending_operations.retain(|_, &mut (budget, ref sender)| {
-            let sent_flush = Self::try_refill_budget_from(
-                &mut self.current_budget,
-                budget,
-                sender
-            );
+        self.pending_operations
+            .retain(|_, &mut (budget, ref sender)| {
+                let sent_flush =
+                    Self::try_refill_budget_from(&mut self.current_budget, budget, sender);
 
-            !sent_flush
-        })
+                !sent_flush
+            })
     }
 
     #[cold]
@@ -187,19 +181,13 @@ impl BudgetCalculator {
     ) -> (bool, NonZero<usize>) {
         let mut selector = flume::Selector::new();
         for (i, &(budget, ref sender)) in &self.pending_operations {
-            selector = selector.send(
-                sender,
-                Ok(DataPacket::FlushBuffer),
-                move |_| (Some(i), budget)
-            );
+            selector = selector.send(sender, Ok(DataPacket::FlushBuffer), move |_| {
+                (Some(i), budget)
+            });
         }
 
         if let Some((budget, sender)) = sender {
-            selector = selector.send(
-                sender,
-                Ok(DataPacket::FlushBuffer),
-                move |_| (None, budget)
-            );
+            selector = selector.send(sender, Ok(DataPacket::FlushBuffer), move |_| (None, budget));
         }
 
         assert!(!self.pending_operations.is_empty() || sender.is_some());
@@ -212,26 +200,29 @@ impl BudgetCalculator {
         // try again to refill again
         self.try_refill_budget();
 
-        (selector.is_none(), NonZero::new(self.current_budget).unwrap())
+        (
+            selector.is_none(),
+            NonZero::new(self.current_budget).unwrap(),
+        )
     }
 
-    fn get_available_budget_inner(&mut self, sender: Option<(NonZero<usize>, &ReaderSender)>) -> (bool, NonZero<usize>) {
+    fn get_available_budget_inner(
+        &mut self,
+        sender: Option<(NonZero<usize>, &ReaderSender)>,
+    ) -> (bool, NonZero<usize>) {
         if self.pending_operations.len() > 8 || self.current_budget <= 1024 {
             self.try_refill_budget();
         }
 
         let mut flushed_active_sender = false;
         if let Some((budget, sender)) = sender {
-            flushed_active_sender |= Self::try_refill_budget_from(
-                &mut self.current_budget,
-                budget,
-                sender
-            )
+            flushed_active_sender |=
+                Self::try_refill_budget_from(&mut self.current_budget, budget, sender)
         }
 
         match NonZero::new(self.current_budget) {
             Some(budget) => (flushed_active_sender, budget),
-            None => self.refill_budget(sender)
+            None => self.refill_budget(sender),
         }
     }
 
@@ -249,7 +240,6 @@ impl BudgetCalculator {
         self.current_budget = self.current_budget.strict_sub(budget.get());
         self.get_available_budget_inner(Some((budget, sender)))
     }
-
 
     pub fn add_budget(&mut self, amt: NonZero<usize>) {
         let new_budget = self.current_budget.strict_add(amt.get());
@@ -270,7 +260,6 @@ impl BudgetCalculator {
         assert_eq!(budget, self.total_budget.get())
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct TarFileStream(flume::Receiver<io::Result<TarFileEntry>>);
@@ -311,10 +300,8 @@ impl rayon::iter::plumbing::UnindexedProducer for ParTarFileStreamIter {
 
     fn split(self) -> (Self, Option<Self>) {
         let clone = match self.0.0.receiver_count() {
-            count if count < rayon::current_num_threads() => {
-                Some(Self(self.0.clone()))
-            },
-            _ => None
+            count if count < rayon::current_num_threads() => Some(Self(self.0.clone())),
+            _ => None,
         };
 
         (self, clone)
@@ -330,7 +317,7 @@ impl rayon::iter::ParallelIterator for ParTarFileStreamIter {
 
     fn drive_unindexed<C>(self, consumer: C) -> C::Result
     where
-        C: UnindexedConsumer<Self::Item>
+        C: UnindexedConsumer<Self::Item>,
     {
         rayon::iter::plumbing::bridge_unindexed(self, consumer)
     }
@@ -346,16 +333,14 @@ impl TarFileStream {
     }
 }
 
-
 // 32 MiB
 const MAX_BUFFERED_FILE_BYTES: usize = 32 * 1024 * 1024;
 
 fn open_archive_inner(reader: Box<dyn Read + Send + 'static>) -> TarFileStream {
     let (tx, rx) = flume::bounded(192);
 
-    let mut budget_calc = BudgetCalculator::new(const {
-        NonZero::new(MAX_BUFFERED_FILE_BYTES).unwrap()
-    });
+    let mut budget_calc =
+        BudgetCalculator::new(const { NonZero::new(MAX_BUFFERED_FILE_BYTES).unwrap() });
 
     std::thread::spawn(move || {
         let mut archive = tar::Archive::new(reader);
@@ -377,16 +362,16 @@ fn open_archive_inner(reader: Box<dyn Read + Send + 'static>) -> TarFileStream {
                 Ok(entry) => entry,
                 Err(err) => {
                     if tx.send(Err(err)).is_err() {
-                        break
+                        break;
                     }
-                    continue
-                },
+                    continue;
+                }
             };
 
             let (reader_tx, reader_rx) = flume::bounded(1);
 
             if tx.send(Ok(TarFileEntry::create(path, reader_rx))).is_err() {
-                break
+                break;
             }
 
             let mut entry = entry;
@@ -412,8 +397,7 @@ fn open_archive_inner(reader: Box<dyn Read + Send + 'static>) -> TarFileStream {
                 }
             };
 
-            'reading_loop:
-            loop {
+            'reading_loop: loop {
                 let mut data = Vec::with_capacity(budget_for_send.get());
                 let result = entry
                     .by_ref()
@@ -421,14 +405,13 @@ fn open_archive_inner(reader: Box<dyn Read + Send + 'static>) -> TarFileStream {
                     .read_to_end(&mut data)
                     .map(NonZero::new);
 
-
                 match result {
                     Ok(None) => break 'reading_loop,
                     Ok(Some(res)) => {
                         assert_eq!(res.get(), data.len());
                         if reader_tx.send(Ok(DataPacket::NewData(data))).is_err() {
                             flush_in_flight(&mut in_flight, &mut budget_calc);
-                            break 'reading_loop
+                            break 'reading_loop;
                         }
 
                         // Sending new data succeeded. Since this channel is
@@ -442,20 +425,19 @@ fn open_archive_inner(reader: Box<dyn Read + Send + 'static>) -> TarFileStream {
                         // Charge the newly sent chunk against the budget, then try
                         // to reclaim it immediately by sending FlushBuffer. If that
                         // succeeds, the consumer has already drained NewData.
-                        let (flushed_in_flight, new_budget) = budget_calc
-                            .consume(res, &reader_tx);
+                        let (flushed_in_flight, new_budget) = budget_calc.consume(res, &reader_tx);
 
                         if flushed_in_flight {
                             in_flight = None
                         }
 
                         budget_for_send = new_budget;
-                    },
+                    }
                     Err(err) => {
                         let _ = reader_tx.send(Err(err));
                         flush_in_flight(&mut in_flight, &mut budget_calc);
-                        break 'reading_loop
-                    },
+                        break 'reading_loop;
+                    }
                 };
             }
 
@@ -476,8 +458,6 @@ fn open_archive_inner(reader: Box<dyn Read + Send + 'static>) -> TarFileStream {
     TarFileStream(rx)
 }
 
-
-
 fn open_tar_gz_archive_inner(path: &Path) -> io::Result<TarFileStream> {
     let file = std::fs::File::open(path)?;
     let gz_reader = flate2::read::MultiGzDecoder::new(file);
@@ -487,7 +467,6 @@ fn open_tar_gz_archive_inner(path: &Path) -> io::Result<TarFileStream> {
 pub fn open_tar_gz_archive<P: AsRef<Path>>(path: P) -> io::Result<TarFileStream> {
     open_tar_gz_archive_inner(path.as_ref())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -545,7 +524,8 @@ mod tests {
         let (tx, rx) = flume::bounded(8);
         let mut entry = TarFileEntry::create(PathBuf::from("file.txt"), rx);
 
-        tx.send(Ok(DataPacket::NewData(b"abcdef".to_vec()))).unwrap();
+        tx.send(Ok(DataPacket::NewData(b"abcdef".to_vec())))
+            .unwrap();
         tx.send(Ok(DataPacket::NewData(b"gh".to_vec()))).unwrap();
 
         let mut first = [0; 2];
@@ -607,7 +587,11 @@ mod tests {
         let mut entry = TarFileEntry::create(PathBuf::from("file.txt"), rx);
 
         tx.send(Ok(DataPacket::NewData(b"abc".to_vec()))).unwrap();
-        tx.send(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated"))).unwrap();
+        tx.send(Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated",
+        )))
+        .unwrap();
 
         let mut out = Vec::new();
         let err = entry.read_to_end(&mut out).unwrap_err();
@@ -617,10 +601,7 @@ mod tests {
 
     #[test]
     fn open_archive_inner_yields_entries_with_paths_and_contents() -> io::Result<()> {
-        let tar = tar_with_files(&[
-            ("alpha.txt", b"alpha"),
-            ("nested/beta.txt", b"beta beta"),
-        ])?;
+        let tar = tar_with_files(&[("alpha.txt", b"alpha"), ("nested/beta.txt", b"beta beta")])?;
 
         let rx = open_archive_inner(Box::new(Cursor::new(tar)));
         let mut entries = rx.into_iter();

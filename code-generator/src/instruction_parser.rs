@@ -1,3 +1,8 @@
+use crate::instruction_parser::isa::{A64, Isa, IsaEnum};
+use crate::instruction_parser::system_register::SystemRegisters;
+use crate::interner::{Interner, Symbol};
+use compact_str::CompactString;
+use eyre::{Result, bail, ensure};
 use rayon::iter::ParallelIterator;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -7,24 +12,17 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::atomic;
 use std::sync::atomic::AtomicBool;
-use compact_str::CompactString;
-use eyre::{bail, ensure, Result};
 use tempfile::TempDir;
-use crate::instruction_parser::isa::{Isa, IsaEnum, A64};
-use crate::instruction_parser::system_register::SystemRegisters;
-use crate::interner::{Interner, Symbol};
 
-mod tar_ball;
 pub mod isa;
 pub mod operand;
 pub mod system_register;
-
+mod tar_ball;
 
 const A64_ISA_ARCHIVE: &str = "spec/ISA_A64_xml_A_profile-2026-03_96.tar.gz";
 const A64_ISA_XML_FOLDER: &str = "ISA_A64_xml_A_profile_2026-03_96-2026-03_rel";
 const EXPECTED_ISA_IFORM_DTD: &[u8] = include_bytes!("expected-iform-p.dtd");
 const IFORM_FILE_NAME: &str = "iform-p.dtd";
-
 
 #[derive(Debug, Copy, Clone)]
 pub struct AliasInfo {
@@ -36,14 +34,14 @@ pub struct AliasInfo {
 pub struct FeatureExpression {
     pub id: Symbol,
     pub expression: Symbol,
-    pub name: Symbol
+    pub name: Symbol,
 }
 
 #[derive(Debug, Copy, Clone)]
 #[repr(u8)]
 pub enum InstructionClass {
     System,
-    Other
+    Other,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -110,7 +108,7 @@ pub struct Instruction<Arch: Isa> {
     pub operands: Vec<Arch::Operand>,
     pub use_operand_encoding_8bytes: bool,
 
-    _marker: PhantomData<Arch>
+    _marker: PhantomData<Arch>,
 }
 
 impl<Arch: Isa> Instruction<Arch> {
@@ -118,10 +116,10 @@ impl<Arch: Isa> Instruction<Arch> {
         let _ = (interner, filename, file);
         todo!()
     }
-    
+
     pub fn gett_id(interner: &Interner, id: &str) -> Symbol {
         let id = id.trim_end_matches('_');
-        
+
         let mut id = CompactString::new(id);
         match id.find('_') {
             Some(index) if index > 0 => {
@@ -131,11 +129,10 @@ impl<Arch: Isa> Instruction<Arch> {
             }
             _ => id.make_ascii_uppercase(),
         };
-        
+
         interner.get_or_intern(&id)
     }
 }
-
 
 pub struct InstructionSet<Arch: Isa> {
     instruction_id_idx: HashMap<Symbol, usize>,
@@ -153,14 +150,13 @@ impl<Arch: Isa> InstructionSet<Arch> {
     }
 }
 
-
 fn load_instruction_files_from_archive<Arch: Isa>(
     _tempdir: &TempDir,
     interner: &Interner,
 ) -> Result<Vec<Instruction<Arch>>> {
     let arch_name = Arch::NAME;
     let (archive_path, xml_folder) = match Arch::AS_ENUM {
-        IsaEnum::A64 => (A64_ISA_ARCHIVE, A64_ISA_XML_FOLDER)
+        IsaEnum::A64 => (A64_ISA_ARCHIVE, A64_ISA_XML_FOLDER),
     };
 
     let tar_stream = tar_ball::open_tar_gz_archive(archive_path)?;
@@ -169,9 +165,9 @@ fn load_instruction_files_from_archive<Arch: Isa>(
         .into_par_iter()
         .map(|entry| {
             let mut entry = entry?;
-            let path =  entry.path();
+            let path = entry.path();
             let Ok(file_name) = path.strip_prefix(xml_folder) else {
-                return Ok(None)
+                return Ok(None);
             };
 
             let file_name = file_name
@@ -183,17 +179,24 @@ fn load_instruction_files_from_archive<Arch: Isa>(
                 let mut data = Vec::new();
                 entry.read_to_end(&mut data)?;
                 let was_found = found_iform_dtd.swap(true, atomic::Ordering::Relaxed);
-                ensure!(!was_found, "duplicate {IFORM_FILE_NAME} files found in ISA folder");
-                ensure!(data == EXPECTED_ISA_IFORM_DTD, "the {arch_name} ISA format changed!");
-                return Ok(None)
+                ensure!(
+                    !was_found,
+                    "duplicate {IFORM_FILE_NAME} files found in ISA folder"
+                );
+                ensure!(
+                    data == EXPECTED_ISA_IFORM_DTD,
+                    "the {arch_name} ISA format changed!"
+                );
+                return Ok(None);
             }
 
             let insn_name = file_name
                 .filter(|file_name| file_name.extension() == Some(OsStr::new("xml")))
                 .and_then(|name| name.file_stem())
-                .map(|name| name.to_str().ok_or_else(|| {
-                    eyre::eyre!("invalid instruction name `{}`", name.display())
-                }))
+                .map(|name| {
+                    name.to_str()
+                        .ok_or_else(|| eyre::eyre!("invalid instruction name `{}`", name.display()))
+                })
                 .transpose()?;
 
             insn_name
@@ -217,7 +220,9 @@ fn load_instruction_files_from_archive<Arch: Isa>(
     let mut duplicates = None::<HashSet<&str>>;
     for [a, b] in instructions.array_windows::<2>() {
         if a.filename == b.filename {
-            duplicates.get_or_insert_with(HashSet::new).insert(a.filename.as_str());
+            duplicates
+                .get_or_insert_with(HashSet::new)
+                .insert(a.filename.as_str());
         }
     }
 
@@ -236,17 +241,12 @@ fn load_instruction_files_from_archive<Arch: Isa>(
     Ok(instructions)
 }
 
-
 pub struct InstructionSets {
     pub aarch64: InstructionSet<A64>,
 }
 
-
 pub fn load_instruction_sets(tempdir: &TempDir, interner: &Interner) -> Result<InstructionSets> {
-    let a64_instruction_files = load_instruction_files_from_archive::<A64>(
-        tempdir,
-        interner
-    )?;
+    let _a64_instruction_files = load_instruction_files_from_archive::<A64>(tempdir, interner)?;
 
     todo!()
 }

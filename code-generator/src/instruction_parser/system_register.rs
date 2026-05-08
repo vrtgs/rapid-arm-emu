@@ -1,12 +1,12 @@
+use crate::instruction_parser::isa::{Isa, IsaEnum};
+use crate::instruction_parser::{Interner, Symbol, tar_ball};
+use compact_str::CompactString;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter, Write};
 use std::num::NonZero;
 use std::ops::{BitOr, BitOrAssign};
 use std::sync::LazyLock;
-use compact_str::CompactString;
 use tempfile::TempDir;
-use crate::instruction_parser::{tar_ball, Interner, Symbol};
-use crate::instruction_parser::isa::{Isa, IsaEnum};
 
 type InnerBits = u32;
 
@@ -33,7 +33,6 @@ const USAGE_KINDS: u8 = 23;
 
 const _: () = assert!(USAGE_KINDS as u32 <= InnerBits::BITS);
 
-
 struct UsageKindRegistry {
     name_to_kind: HashMap<&'static str, UsageKind>,
     kind_to_str: [&'static str; USAGE_KINDS as usize],
@@ -42,31 +41,10 @@ struct UsageKindRegistry {
 impl UsageKindRegistry {
     pub fn new() -> Self {
         let usages = [
-            "APAS",
-            "AT",
-            "BRB",
-            "CFP",
-            "COSP",
-            "CPP",
-            "DC",
-            "DVP",
-            "GCSPOPCX",
-            "GCSPOPM",
-            "GCSPOPX",
-            "GCSPUSHM",
-            "GCSPUSHX",
-            "GCSSS1",
-            "GCSSS2",
-            "IC",
-            "MRRS",
-            "MRS",
-            "MSR",
-            "MSRR",
-            "TLBI",
-            "TLBIP",
-            "TRCIT",
+            "APAS", "AT", "BRB", "CFP", "COSP", "CPP", "DC", "DVP", "GCSPOPCX", "GCSPOPM",
+            "GCSPOPX", "GCSPUSHM", "GCSPUSHX", "GCSSS1", "GCSSS2", "IC", "MRRS", "MRS", "MSR",
+            "MSRR", "TLBI", "TLBIP", "TRCIT",
         ];
-
 
         let map = usages
             .into_iter()
@@ -93,7 +71,7 @@ impl UsageKind {
                 compact_str = CompactString::new(usage_kind);
                 compact_str.make_ascii_uppercase();
                 compact_str.as_str()
-            },
+            }
             false => usage_kind,
         };
 
@@ -107,14 +85,12 @@ impl UsageKind {
 
 impl Debug for UsageKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f
-            .debug_struct("UsageKind")
+        f.debug_struct("UsageKind")
             .field("name", &self.name())
             .field("index", &self.get_index())
             .finish()
     }
 }
-
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct UsageKinds(InnerBits);
@@ -124,7 +100,7 @@ impl UsageKinds {
         Self(0)
     }
 
-    pub fn iter(self) -> impl Iterator<Item=UsageKind> {
+    pub fn iter(self) -> impl Iterator<Item = UsageKind> {
         let mut current = self.0;
         core::iter::from_fn(move || {
             let isolate_lowest_one = |value: InnerBits| value & value.wrapping_neg();
@@ -166,20 +142,19 @@ impl BitOr<UsageKinds> for UsageKinds {
 }
 
 impl<Rhs> BitOrAssign<Rhs> for UsageKinds
-    where Self: BitOr<Rhs, Output=Self>
+where
+    Self: BitOr<Rhs, Output = Self>,
 {
     fn bitor_assign(&mut self, rhs: Rhs) {
         *self = (*self) | rhs
     }
 }
 
-
 impl Debug for UsageKinds {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_set().entries(self.iter()).finish()
     }
 }
-
 
 #[derive(Copy, Clone)]
 pub struct SystemRegister {
@@ -222,15 +197,13 @@ impl SystemRegister {
     }
 }
 
-
 pub struct SystemRegisters {
     system_register_usage_kinds: UsageKinds,
     system_register_values: HashSet<u16>,
     system_registers_not_handled: HashSet<Symbol>,
     system_registers_handled: HashSet<Symbol>,
-    system_registers: HashMap<Symbol, SystemRegister>
+    system_registers: HashMap<Symbol, SystemRegister>,
 }
-
 
 const SYSTEM_REG_FOLDER: &str = "SysReg_xml_A_profile_2026-03_96-2026-03_rel";
 const SYSTEM_REG_ARCHIVE: &str = "spec/SysReg_xml_A_profile-2026-03_96.tar.gz";
@@ -246,7 +219,6 @@ impl SystemRegisters {
         let archive = tar_ball::open_tar_gz_archive(SYSTEM_REG_ARCHIVE)?;
         for entry in archive {
             let _entry = entry?;
-
         }
 
         todo!()

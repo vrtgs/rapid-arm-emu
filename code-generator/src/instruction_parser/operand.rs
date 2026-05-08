@@ -19,4 +19,3 @@ pub struct Operand<Arch: Isa> {
     inner: Arch::Operand,
     has_bang: bool,
 }
-

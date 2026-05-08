@@ -1,5 +1,5 @@
 pub enum IsaEnum {
-    A64
+    A64,
 }
 
 pub trait Isa: Send + Sync + 'static {
@@ -9,7 +9,6 @@ pub trait Isa: Send + Sync + 'static {
     const NAME: &str;
     const AS_ENUM: IsaEnum;
 }
-
 
 pub enum A64 {}
 

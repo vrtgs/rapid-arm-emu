@@ -1,7 +1,7 @@
-use parking_lot::Mutex;
 use crate::armv9::jit::CodeCache;
 use crate::halt_reason::{AtomicHaltReason, HaltReason, HaltReasonInner};
 use crate::io_mmu::IoMMU;
+use parking_lot::Mutex;
 
 pub(crate) mod jit;
 
@@ -23,12 +23,10 @@ impl PState {
     pub(crate) const CARRY: Self = Self(1 << 29);
     pub(crate) const OVERFLOW: Self = Self(1 << 28);
 
-
     pub(crate) const N: Self = Self::NEGATIVE;
     pub(crate) const Z: Self = Self::ZERO;
     pub(crate) const C: Self = Self::CARRY;
     pub(crate) const V: Self = Self::OVERFLOW;
-
 
     pub(crate) const NZCV_MASK: Self = Self(Self::N.0 | Self::Z.0 | Self::C.0 | Self::V.0);
 }
@@ -87,8 +85,8 @@ impl Armv9CpuCore {
             halt_reason: AtomicHaltReason::new(),
             executing: Mutex::new(ExecutingState {
                 processor_state: ProcessorState::initial(),
-                code_cache: CodeCache::new()
-            })
+                code_cache: CodeCache::new(),
+            }),
         }
     }
 
@@ -103,7 +101,9 @@ impl Armv9CpuCore {
     /// Runs the emulated CPU.
     /// Cannot be recursively called.
     pub fn resume(&self) -> HaltReason {
-        let mut lock = self.executing.try_lock()
+        let mut lock = self
+            .executing
+            .try_lock()
             .unwrap_or_else(|| panic!("the CPU is already executing"));
 
         let state: &mut ExecutingState = &mut lock;
@@ -120,12 +120,12 @@ impl Armv9CpuCore {
             }
 
             if let Some(reason) = HaltReason::from_inner(halt_reason) {
-                break reason
+                break reason;
             }
         }
     }
 
     pub fn halt(&self, reason: HaltReason) {
-        self.halt_reason.add_reasons_full(reason.into_inner())
+        self.halt_reason.halt(reason)
     }
 }

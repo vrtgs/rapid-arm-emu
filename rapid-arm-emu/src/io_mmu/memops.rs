@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 //        not to mention performance tanks, this is also a basic impl with global locks,
 //        perferably this should actually be done with the locks coming from CpuFabric
 
-
 // use crossbeam_utils::CachePadded;
 // // use a Mersenne prime so that collisions are more rare
 // const SHARDED_LOCK_COUNT: usize = 127;
@@ -52,7 +51,6 @@ use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 //     unsafe { std::ptr::write(ptr.cast_mut().cast::<T>(), value) }
 //     drop(lock);
 // }
-
 
 #[inline(always)]
 pub(crate) unsafe fn load64_le_aligned(ptr: *const AtomicU8) -> u64 {
@@ -97,8 +95,6 @@ pub(crate) unsafe fn store_8_unaligned(ptr: *const AtomicU8, value: u8) {
 
     unsafe { (*ptr).store(value, Ordering::Relaxed) }
 }
-
-
 
 // Unaligned 64-bit little-endian access patterns:
 //
@@ -162,7 +158,6 @@ pub(crate) unsafe fn store_8_unaligned(ptr: *const AtomicU8, value: u8) {
 //     [ptr + 5, ptr + 7)
 //     [ptr + 7, ptr + 8)
 
-
 #[inline(always)]
 pub(super) unsafe fn load64_le(ptr: *const AtomicU8) -> u64 {
     const { assert!(align_of::<AtomicU64>() == 8) }
@@ -177,7 +172,7 @@ pub(super) unsafe fn load64_le(ptr: *const AtomicU8) -> u64 {
             let hi = load32_le_aligned(ptr.byte_add(4)) as u64;
 
             (hi << 32) | lo
-        }
+        },
 
         2 | 6 => unsafe {
             cold_path();
@@ -187,7 +182,7 @@ pub(super) unsafe fn load64_le(ptr: *const AtomicU8) -> u64 {
             let hi = load16_le_aligned(ptr.byte_add(6)) as u64;
 
             (hi << 48) | (mid << 16) | lo
-        }
+        },
 
         1 | 5 => unsafe {
             cold_path();
@@ -198,7 +193,7 @@ pub(super) unsafe fn load64_le(ptr: *const AtomicU8) -> u64 {
             let b7 = load_8_unaligned(ptr.byte_add(7)) as u64;
 
             (b7 << 56) | (mid << 24) | (w1 << 8) | b0
-        }
+        },
 
         3 | 7 => unsafe {
             cold_path();
@@ -209,8 +204,8 @@ pub(super) unsafe fn load64_le(ptr: *const AtomicU8) -> u64 {
             let b7 = load_8_unaligned(ptr.byte_add(7)) as u64;
 
             (b7 << 56) | (w5 << 40) | (mid << 8) | b0
-        }
-        _ => unsafe { core::hint::unreachable_unchecked() }
+        },
+        _ => unsafe { core::hint::unreachable_unchecked() },
     }
 }
 
@@ -229,7 +224,7 @@ pub(super) unsafe fn store64_le(ptr: *const AtomicU8, value: u64) {
 
             store32_le_aligned(ptr, lo);
             store32_le_aligned(ptr.byte_add(4), hi);
-        }
+        },
 
         2 | 6 => unsafe {
             cold_path();
@@ -241,7 +236,7 @@ pub(super) unsafe fn store64_le(ptr: *const AtomicU8, value: u64) {
             store16_le_aligned(ptr, lo);
             store32_le_aligned(ptr.byte_add(2), mid);
             store16_le_aligned(ptr.byte_add(6), hi);
-        }
+        },
 
         1 | 5 => unsafe {
             cold_path();
@@ -255,7 +250,7 @@ pub(super) unsafe fn store64_le(ptr: *const AtomicU8, value: u64) {
             store16_le_aligned(ptr.byte_add(1), w1);
             store32_le_aligned(ptr.byte_add(3), mid);
             store_8_unaligned(ptr.byte_add(7), b7);
-        }
+        },
 
         3 | 7 => unsafe {
             cold_path();
@@ -269,15 +264,11 @@ pub(super) unsafe fn store64_le(ptr: *const AtomicU8, value: u64) {
             store32_le_aligned(ptr.byte_add(1), mid);
             store16_le_aligned(ptr.byte_add(5), w5);
             store_8_unaligned(ptr.byte_add(7), b7);
-        }
+        },
 
-        _ => unsafe { core::hint::unreachable_unchecked() }
+        _ => unsafe { core::hint::unreachable_unchecked() },
     }
 }
-
-
-
-
 
 // Unaligned 32-bit little-endian access patterns:
 //
@@ -308,7 +299,6 @@ pub(super) unsafe fn store64_le(ptr: *const AtomicU8, value: u64) {
 //     [ptr + 1, ptr + 3)
 //     [ptr + 3, ptr + 4)
 
-
 #[inline(always)]
 pub(crate) unsafe fn load32_le(ptr: *const AtomicU8) -> u32 {
     const { assert!(align_of::<AtomicU32>() == 4) }
@@ -323,7 +313,7 @@ pub(crate) unsafe fn load32_le(ptr: *const AtomicU8) -> u32 {
             let hi = load16_le_aligned(ptr.byte_add(2)) as u32;
 
             (hi << 16) | lo
-        }
+        },
 
         1 | 3 => unsafe {
             cold_path();
@@ -333,9 +323,9 @@ pub(crate) unsafe fn load32_le(ptr: *const AtomicU8) -> u32 {
             let b3 = load_8_unaligned(ptr.byte_add(3)) as u32;
 
             (b3 << 24) | (mid << 8) | b0
-        }
+        },
 
-        _ => unsafe { core::hint::unreachable_unchecked() }
+        _ => unsafe { core::hint::unreachable_unchecked() },
     }
 }
 
@@ -354,7 +344,7 @@ pub(crate) unsafe fn store32_le(ptr: *const AtomicU8, value: u32) {
 
             store16_le_aligned(ptr, lo);
             store16_le_aligned(ptr.byte_add(2), hi);
-        }
+        },
 
         1 | 3 => unsafe {
             cold_path();
@@ -366,13 +356,11 @@ pub(crate) unsafe fn store32_le(ptr: *const AtomicU8, value: u32) {
             store_8_unaligned(ptr, b0);
             store16_le_aligned(ptr.byte_add(1), mid);
             store_8_unaligned(ptr.byte_add(3), b3);
-        }
+        },
 
-        _ => unsafe { core::hint::unreachable_unchecked() }
+        _ => unsafe { core::hint::unreachable_unchecked() },
     }
 }
-
-
 
 // Unaligned 16-bit little-endian access pattern:
 //
@@ -388,7 +376,6 @@ pub(crate) unsafe fn store32_le(ptr: *const AtomicU8, value: u32) {
 //     [ptr + 0, ptr + 1)
 //     [ptr + 1, ptr + 2)
 
-
 #[inline(always)]
 pub(crate) unsafe fn load16_le(ptr: *const AtomicU8) -> u16 {
     const { assert!(align_of::<AtomicU16>() == 2) }
@@ -403,7 +390,7 @@ pub(crate) unsafe fn load16_le(ptr: *const AtomicU8) -> u16 {
             let b1 = load_8_unaligned(ptr.byte_add(1)) as u16;
 
             (b1 << 8) | b0
-        }
+        },
 
         _ => unsafe { core::hint::unreachable_unchecked() },
     }
@@ -421,7 +408,7 @@ pub(crate) unsafe fn store16_le(ptr: *const AtomicU8, value: u16) {
 
             store_8_unaligned(ptr, value as u8);
             store_8_unaligned(ptr.byte_add(1), (value >> 8) as u8);
-        }
+        },
 
         _ => unsafe { core::hint::unreachable_unchecked() },
     }

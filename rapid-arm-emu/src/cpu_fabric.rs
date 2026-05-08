@@ -10,13 +10,11 @@
 //! small wrapper around the exclusive monitor so cloned CPU contexts can observe
 //! and invalidate the same reservation state.
 
-
+use crate::io_mmu::HostPointer;
+use crossbeam_utils::CachePadded;
+use parking_lot::Mutex;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
-use crossbeam_utils::CachePadded;
-use crate::io_mmu::HostPointer;
-use parking_lot::Mutex;
-
 
 pub(crate) const BUCKET_COUNT: u16 = 257;
 
@@ -95,13 +93,11 @@ pub(crate) struct ReservationSlot {
     version: Version,
 }
 
-
 pub(crate) struct ExclusiveMonitor {
     reservations: [CachePadded<Mutex<ReservationSlot>>; BUCKET_COUNT as usize],
 }
 
 impl ExclusiveMonitor {
-
     /// #
     pub fn init(this: &mut MaybeUninit<Self>) -> &mut Self {
         unsafe {
@@ -112,7 +108,7 @@ impl ExclusiveMonitor {
                     CachePadded::new(Mutex::new(ReservationSlot {
                         ptr: None,
                         version: Version(0),
-                    }))
+                    })),
                 )
             }
 
@@ -139,10 +135,7 @@ impl ExclusiveMonitor {
         let version = lock.version;
 
         let value = load_op();
-        ReservationToken {
-            version,
-            value,
-        }
+        ReservationToken { version, value }
     }
 
     pub(crate) fn strex<T>(
@@ -183,6 +176,14 @@ impl Default for CpuFabric {
     }
 }
 
+impl PartialEq for CpuFabric {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for CpuFabric {}
+
 const _: () = {
     const fn is_sync<T: Sync>() {}
     const fn is_send<T: Send>() {}
@@ -191,14 +192,13 @@ const _: () = {
     is_send::<CpuFabric>();
 };
 
-
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::num::NonZero;
     use std::ptr::NonNull;
-    use super::*;
 
-    use loom::sync::{Arc, Mutex, Condvar};
+    use loom::sync::{Arc, Condvar, Mutex};
 
     struct BarrierState {
         count: usize,
@@ -258,20 +258,18 @@ mod tests {
                 loom::thread::spawn(move || {
                     let ptr = const {
                         HostPointer::new(NonNull::without_provenance(
-                            NonZero::new(0x10000DEAD00BEEF).unwrap()
+                            NonZero::new(0x10000DEAD00BEEF).unwrap(),
                         ))
                     };
 
                     let token = monitor.ldrex(ptr, || ExclusiveMonitorLoad::U8(0));
                     barrier.wait();
-                    let _ = monitor.strex(ptr, token, |val| {
-                        match val {
-                            ExclusiveMonitorLoad::U8(0) => {
-                                *memory.try_lock().unwrap() += 1;
-                                Ok(())
-                            }
-                            _ => Err(())
+                    let _ = monitor.strex(ptr, token, |val| match val {
+                        ExclusiveMonitorLoad::U8(0) => {
+                            *memory.try_lock().unwrap() += 1;
+                            Ok(())
                         }
+                        _ => Err(()),
                     });
                 })
             };

@@ -21,8 +21,7 @@ pub struct RawHandle(NonZero<HandleInt>);
 
 impl Debug for RawHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f
-            .debug_struct("RawHandle")
+        f.debug_struct("RawHandle")
             .field("index", &self.get())
             .finish()
     }
@@ -35,7 +34,7 @@ const _: () = assert!(HandleInt::MIN == 0);
 const fn usize_to_int(x: usize) -> Option<HandleInt> {
     if x >= HandleInt::MAX as usize {
         cold_path();
-        return None
+        return None;
     }
 
     Some(x as HandleInt)
@@ -51,9 +50,9 @@ impl RawHandle {
         match usize_to_int(index) {
             Some(int) => match NonZero::new(int.wrapping_add(1)) {
                 Some(nz) => Some(Self(nz)),
-                None => None
+                None => None,
             },
-            None => None
+            None => None,
         }
     }
 
@@ -61,7 +60,7 @@ impl RawHandle {
     pub const fn new(index: usize) -> Self {
         match Self::try_new(index) {
             Some(handle) => handle,
-            None => panic!("SSA handle overflow")
+            None => panic!("SSA handle overflow"),
         }
     }
 
@@ -69,7 +68,6 @@ impl RawHandle {
         int_to_usize(unsafe { self.0.get().unchecked_sub(1) })
     }
 }
-
 
 /// # Safety
 ///
@@ -88,7 +86,14 @@ const unsafe fn transmute_unckecked<T, U>(from: T) -> U {
         to: ManuallyDrop<U>,
     }
 
-    unsafe { ManuallyDrop::into_inner(Transmute { from: ManuallyDrop::new(from) }.to) }
+    unsafe {
+        ManuallyDrop::into_inner(
+            Transmute {
+                from: ManuallyDrop::new(from),
+            }
+            .to,
+        )
+    }
 }
 
 pub const fn to_raw<H: Handle>(handle: H) -> RawHandle {
@@ -101,7 +106,6 @@ pub const fn from_raw<H: Handle>(handle: RawHandle) -> H {
 
 unsafe impl Handle for RawHandle {}
 
-
 pub trait Storable: Sized {
     type Handle: Handle;
 
@@ -112,9 +116,7 @@ pub trait Storable: Sized {
     }
 }
 
-
 pub struct Arena<S>(Vec<S>);
-
 
 impl<S: Storable> Arena<S> {
     pub fn new() -> Self {
@@ -151,14 +153,19 @@ impl<S: Storable> Arena<S> {
         self.0.len()
     }
 
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item=(S::Handle, &S)> {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (S::Handle, &S)> {
         self.assert_invariants();
-        self.0.iter().enumerate().map(|(i, item)| (from_raw(RawHandle::new(i)), item))
+        self.0
+            .iter()
+            .enumerate()
+            .map(|(i, item)| (from_raw(RawHandle::new(i)), item))
     }
 
-    pub fn keys(&self) -> impl DoubleEndedIterator<Item=S::Handle> {
+    pub fn keys(&self) -> impl DoubleEndedIterator<Item = S::Handle> {
         self.assert_invariants();
-        (0..self.len()).map(RawHandle::new).map(from_raw::<S::Handle>)
+        (0..self.len())
+            .map(RawHandle::new)
+            .map(from_raw::<S::Handle>)
     }
 }
 
@@ -170,7 +177,7 @@ impl<'a, S: Storable> Reservation<'a, S> {
         arena.0.try_reserve(1).ok()?;
         Some(Self(arena))
     }
-    
+
     pub fn store(self, item: S) -> &'a mut S {
         unsafe { hint::assert_unchecked(self.0.0.len() < self.0.0.capacity()) }
         self.0.0.push_mut(item)
@@ -181,11 +188,10 @@ impl<S: Storable> Arena<S> {
     pub fn reserve(&mut self) -> (S::Handle, Reservation<'_, S>) {
         let handle = RawHandle::new(self.0.len());
         let handle = from_raw::<S::Handle>(handle);
-        let reservation = Reservation::try_reserve(self)
-            .expect("TODO: OOM handling");
+        let reservation = Reservation::try_reserve(self).expect("TODO: OOM handling");
         (handle, reservation)
     }
-    
+
     pub fn store_mut(&mut self, item: S) -> (S::Handle, &mut S) {
         let (handle, reserve) = self.reserve();
         (handle, reserve.store(item))
@@ -196,15 +202,12 @@ impl<S: Storable> Arena<S> {
     }
 }
 
-
-
 #[cold]
 #[inline(never)]
 #[track_caller]
 fn indexing_handle_failed<T>() -> T {
     panic!("invalid handle used on arena")
 }
-
 
 impl<S: Storable> Index<S::Handle> for Arena<S> {
     type Output = S;
@@ -228,12 +231,14 @@ impl<S: Debug> Debug for Arena<S> {
     }
 }
 
-
 pub struct ArenaMap<K, V>(Vec<Option<V>>, PhantomData<K>);
 
 impl<K: Handle, V> ArenaMap<K, V> {
     pub fn with_capacity(capacity: usize) -> Self {
-        Self(Vec::from_iter(std::iter::repeat_with(|| None).take(capacity)), PhantomData)
+        Self(
+            Vec::from_iter(std::iter::repeat_with(|| None).take(capacity)),
+            PhantomData,
+        )
     }
 
     pub fn new() -> Self {
@@ -262,26 +267,26 @@ impl<K: Handle, V> ArenaMap<K, V> {
         self.insertion_slot(key).get_or_insert_with(with)
     }
 
-
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         self.insertion_slot(key).replace(value)
+    }
+
+    pub fn insert_unique(&mut self, key: K, value: V) {
+        let old = self.insert(key, value);
+        assert!(old.is_none())
     }
 
     pub fn remove(&mut self, key: K) -> Option<V> {
         self.0.get_mut(to_raw(key).get()).and_then(Option::take)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item=(K, &V)> {
-        self
-            .0
-            .iter()
-            .enumerate()
-            .filter_map(|(i, val)| {
-                val.as_ref().map(|val| (from_raw::<K>(RawHandle::new(i)), val))
-            })
+    pub fn iter(&self) -> impl Iterator<Item = (K, &V)> {
+        self.0.iter().enumerate().filter_map(|(i, val)| {
+            val.as_ref()
+                .map(|val| (from_raw::<K>(RawHandle::new(i)), val))
+        })
     }
 }
-
 
 #[cold]
 #[inline(never)]
@@ -298,7 +303,6 @@ impl<K: Handle, V> Index<K> for ArenaMap<K, V> {
         self.get(index).unwrap_or_else(indexing_map_handle_failed)
     }
 }
-
 
 pub struct ArenaSet<K>(Vec<usize>, PhantomData<K>);
 
@@ -362,7 +366,7 @@ impl<K: Handle> ArenaSet<K> {
     pub fn remove(&mut self, key: K) -> bool {
         let (index, mask) = Self::index_and_mask(key);
         let Some(row) = self.0.get_mut(index) else {
-            return false
+            return false;
         };
 
         let old_row = *row;
@@ -370,9 +374,8 @@ impl<K: Handle> ArenaSet<K> {
         (old_row & mask) != 0
     }
 
-    pub fn iter(&self) -> impl Iterator<Item=K> {
-        self
-            .0
+    pub fn iter(&self) -> impl Iterator<Item = K> {
+        self.0
             .iter()
             .flat_map(|&bits| {
                 std::array::from_fn::<_, { ArenaSet::<RawHandle>::BITS.get() }, _>(|i| {
@@ -387,7 +390,7 @@ impl<K: Handle> ArenaSet<K> {
 }
 
 impl<K: Handle> FromIterator<K> for ArenaSet<K> {
-    fn from_iter<T: IntoIterator<Item=K>>(iter: T) -> Self {
+    fn from_iter<T: IntoIterator<Item = K>>(iter: T) -> Self {
         let iter = iter.into_iter();
         let (lower, _upper) = iter.size_hint();
         let mut this = ArenaSet::with_capacity(lower);
@@ -403,7 +406,6 @@ impl<K: Handle + Debug> Debug for ArenaSet<K> {
         f.debug_set().entries(self.iter()).finish()
     }
 }
-
 
 macro_rules! make_handle {
     ($vis: vis $name: ident) => {
@@ -446,7 +448,7 @@ macro_rules! handle_impl_helper {
             }
         }
     };
-    
+
     (
         @fold
         current_stack: [$($tt:tt),*],
@@ -478,9 +480,10 @@ macro_rules! handle_impl_helper {
 
 macro_rules! impl_storable {
     {
-        $ty: ty as $(impl $vis: vis $impl_name: ident)? $(($existing_handle: path))?$(;$(init: {
+        $ty: ty as $(impl $vis: vis $impl_name: ident)? $(($existing_handle: path))?;
+        $(init: {
             $(const $const_name: ident = $init: expr;)*
-        })?)?
+        })?
     } => {
 
         $($crate::ir::arena::make_handle!($vis $impl_name);)?
@@ -488,11 +491,11 @@ macro_rules! impl_storable {
 
         $($crate::ir::arena::handle_impl_helper! {
             impl const for $impl_name {
-                $($(const $const_name;)*)?
+                $(const $const_name;)*
             }
         })?
 
-        const _: () = { 
+        const _: () = {
             #[allow(dead_code)]
             const LEN: usize = {
                 #[allow(unused_variables, unused_mut)]
@@ -502,7 +505,7 @@ macro_rules! impl_storable {
                 is_impl |= true;
                 )?
 
-                0 $($(+ {
+                0 $(+ {
                     assert!(
                         is_impl,
                         "if storable is using an exisiting handle, it can't add const"
@@ -512,7 +515,7 @@ macro_rules! impl_storable {
                     {
                         <[()]>::len(&[$({ let $const_name: (); }),*])
                     }
-                })?)?
+                })?
             };
 
             impl $crate::ir::arena::Storable for $ty {
@@ -521,7 +524,7 @@ macro_rules! impl_storable {
                 const INITIAL_VEC_LEN: usize = LEN;
 
                 fn initial_vec() -> Vec<Self> {
-                    ::std::vec![$($($($init),*)?)?]
+                    ::std::vec![$($($init),*)?]
                 }
             }
         };
@@ -529,9 +532,8 @@ macro_rules! impl_storable {
     };
 }
 
-
 #[doc(hidden)]
 #[allow(unused_imports)]
-pub(super) use {handle_impl_helper};
+pub(super) use handle_impl_helper;
 
-pub(super) use {make_handle, impl_storable};
+pub(super) use {impl_storable, make_handle};

@@ -1,18 +1,18 @@
-use std::any::Any;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use crate::armv9::ProcessorState;
 use crate::halt_reason::AtomicHaltReason;
 use crate::io_mmu;
 use crate::io_mmu::IoMMU;
-use crate::ir::compiler::cranelift_backend::CraneliftCompiler;
 use crate::ir::ExecIr;
+use crate::ir::compiler::cranelift_backend::CraneliftCompiler;
 use crate::ir::compiler::sync_cell::SyncCell;
+use std::any::Any;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-mod sync_cell;
 mod cranelift_backend;
-mod llvm_backend;
 mod gcc_backend;
+mod llvm_backend;
+mod sync_cell;
 
 type ExecBlockFFI = unsafe extern "C" fn(
     processor_state: &mut ProcessorState,
@@ -32,13 +32,10 @@ pub(crate) struct CompiledExecChunk {
 }
 
 impl CompiledExecChunk {
-    fn new_with_recources(
-        ffi: ExecBlockFFI,
-        resources: impl Any + Send
-    ) -> Self {
+    fn new_with_recources(ffi: ExecBlockFFI, resources: impl Any + Send) -> Self {
         Self {
             ffi,
-            _resources: Arc::new(SyncCell::new(resources))
+            _resources: Arc::new(SyncCell::new(resources)),
         }
     }
 
@@ -51,30 +48,15 @@ impl CompiledExecChunk {
     ) -> u32 {
         let halt_reason: *const AtomicU32 = halt_reason.as_ffi();
         let (pages, page_count) = io_mmu.pages_ffi();
-        unsafe {
-            (self.ffi)(
-                processor_state,
-                pages,
-                page_count,
-                halt_reason,
-                io_mmu
-            )
-        }
+        unsafe { (self.ffi)(processor_state, pages, page_count, halt_reason, io_mmu) }
     }
 }
 
-
 // currently we only support cranelift but that should change soon with LLVM support
-
-enum CodegenBackend {
-
-}
-
 struct CompileOptions {
     function_name: String,
     show_disasm: bool,
 }
-
 
 pub struct ExecIrCompiler {
     next_function_id: AtomicUsize,
@@ -86,10 +68,8 @@ impl ExecIrCompiler {
     pub fn new() -> Self {
         Self {
             next_function_id: AtomicUsize::new(0),
-            cranelift_compiler: CraneliftCompiler::new(
-                cranelift_backend::OptLevel::Speed
-            ).unwrap(),
-            show_disasm: cfg!(test)
+            cranelift_compiler: CraneliftCompiler::new(cranelift_backend::OptLevel::Speed).unwrap(),
+            show_disasm: cfg!(test),
         }
     }
 
@@ -101,14 +81,14 @@ impl ExecIrCompiler {
     pub fn try_compile(&self, exec_ir: ExecIr) -> anyhow::Result<CompiledExecChunk> {
         let function_name = {
             let id = self.next_function_id.fetch_add(1, Ordering::Relaxed);
-            format!("exec_block_{id}")
+            format!("exec_chunk_{id}")
         };
 
         let options = CompileOptions {
             function_name,
             show_disasm: self.show_disasm,
         };
-        
+
         self.cranelift_compiler.try_compile(options, exec_ir)
     }
 }
