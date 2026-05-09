@@ -1,51 +1,11 @@
 [package]
 # maybe armature later if I beat dynarmic
 name = "rapid-arm-emu"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 
 [dependencies]
-parking_lot = "0.12.5"
-bitflags = "2.11.1"
-crossbeam-utils = "0.8.21"
-pastey = "0.2.2"
-thiserror = "2.0.18"
-anyhow = "1.0.102"
-arrayvec = "0.7.6"
-stacker = "0.1.24"
-rpds = "1.2.0"
-smallvec = "2.0.0-alpha.12"
-
-[dependencies.gccjit]
-version = "3.3.0"
-
-[dependencies.inkwell]
-version = "0.9.0"
-features = ["llvm22-1-force-static"]
-
-[dependencies.cranelift]
-version = "0.131.1"
-features = ["jit", "frontend", "native", "module"]
-
-
-[dependencies.bytemuck]
-version = "1.25.0"
-features = [
-    "align_offset",
-    "alloc_uninit",
-    "const_zeroed",
-    "derive",
-    "impl_core_error",
-    "min_const_generics",
-    "must_cast",
-    "must_cast_extra",
-    "pod_saturating",
-    "track_caller",
-    "transparentwrapper_extra",
-    "zeroable_atomics",
-    "zeroable_maybe_uninit",
-    "zeroable_unwind_fn",
-]
-
-[dev-dependencies]
-loom = "0.7"
+emu-abi = { workspace = true }
+io-mmu = { workspace = true }
+exec-ir = { workspace = true }
+parking_lot = { workspace = true }

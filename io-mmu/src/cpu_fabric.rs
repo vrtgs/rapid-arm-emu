@@ -10,13 +10,14 @@
 //! small wrapper around the exclusive monitor so cloned CPU contexts can observe
 //! and invalidate the same reservation state.
 
-use crate::io_mmu::HostPointer;
+use crate::HostPointer;
 use crossbeam_utils::CachePadded;
+use emu_abi::memory::{CACHE_LINE_SHIFT, CACHE_LINE_SIZE};
 use parking_lot::Mutex;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 
-pub(crate) const BUCKET_COUNT: u16 = 257;
+const BUCKET_COUNT: u16 = 257;
 
 struct SplitMixConstants {
     shift1: u32,
@@ -62,7 +63,8 @@ const SPLIT_MIX_CONSTANTS: SplitMixConstants = match usize::BITS {
 
 #[inline(always)]
 fn reservation_index(ptr: HostPointer) -> usize {
-    let mut x = ptr.0.addr().get();
+    const { assert!(CACHE_LINE_SIZE >= size_of::<u128>()) }
+    let mut x = ptr.0.addr().get() >> CACHE_LINE_SHIFT;
     x ^= x >> SPLIT_MIX_CONSTANTS.shift1;
     x = x.wrapping_mul(SPLIT_MIX_CONSTANTS.c1);
     x ^= x >> SPLIT_MIX_CONSTANTS.shift2;
@@ -72,10 +74,19 @@ fn reservation_index(ptr: HostPointer) -> usize {
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
-pub(crate) struct Version(u64);
+pub struct Version(u128);
+
+impl Version {
+    #[cold]
+    #[inline(never)]
+    #[track_caller]
+    fn exhausted<T>() -> T {
+        panic!("version number exaughsted, did we reach the heat death of the universe yet?")
+    }
+}
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
-pub(crate) enum ExclusiveMonitorLoad {
+pub enum ExclusiveMonitorLoad {
     U128(u128),
     U64(u64),
     U32(u32),
@@ -83,22 +94,31 @@ pub(crate) enum ExclusiveMonitorLoad {
     U8(u8),
 }
 
-pub(crate) struct ReservationToken {
+pub struct ReservationToken {
     version: Version,
     value: ExclusiveMonitorLoad,
 }
 
-pub(crate) struct ReservationSlot {
+impl ReservationToken {
+    pub const fn value(&self) -> ExclusiveMonitorLoad {
+        self.value
+    }
+}
+
+pub struct ReservationSlot {
     ptr: Option<HostPointer>,
     version: Version,
 }
 
-pub(crate) struct ExclusiveMonitor {
+#[derive(Debug, Copy, Clone, thiserror::Error)]
+#[error("exclusive reservation was lost")]
+pub struct ReservationLost;
+
+pub struct ExclusiveMonitor {
     reservations: [CachePadded<Mutex<ReservationSlot>>; BUCKET_COUNT as usize],
 }
 
 impl ExclusiveMonitor {
-    /// #
     pub fn init(this: &mut MaybeUninit<Self>) -> &mut Self {
         unsafe {
             let ptr = this.as_mut_ptr();
@@ -123,7 +143,7 @@ impl ExclusiveMonitor {
     }
 
     #[must_use]
-    pub(crate) fn ldrex(
+    pub fn ldrex(
         &self,
         ptr: HostPointer,
         load_op: impl FnOnce() -> ExclusiveMonitorLoad,
@@ -138,23 +158,28 @@ impl ExclusiveMonitor {
         ReservationToken { version, value }
     }
 
-    pub(crate) fn strex<T>(
+    pub fn strex<T>(
         &self,
         ptr: HostPointer,
         tok: ReservationToken,
-        store_op: impl FnOnce(ExclusiveMonitorLoad) -> Result<T, ()>,
-    ) -> Result<T, ()> {
+        store_op: impl FnOnce(ExclusiveMonitorLoad) -> Result<T, ReservationLost>,
+    ) -> Result<T, ReservationLost> {
         let reserve_idx = reservation_index(ptr);
         let mut lock = self.reservations[reserve_idx].lock();
 
         if lock.ptr != Some(ptr) || lock.version != tok.version {
-            return Err(());
+            return Err(ReservationLost);
         }
 
-        // Wrapping is acceptable here: token reuse would require 2^64 successful
-        // invalidations of the same reservation slot before an old token could match again.
+        // version overflow would require 2^128 successful
+        // invalidations of the same reservation slot
+        // before an old token could match again.
         // and there aren't any better alternatives
-        lock.version.0 = lock.version.0.wrapping_add(1);
+        lock.version.0 = lock
+            .version
+            .0
+            .checked_add(1)
+            .unwrap_or_else(Version::exhausted);
 
         store_op(tok.value)
     }
@@ -269,7 +294,7 @@ mod tests {
                             *memory.try_lock().unwrap() += 1;
                             Ok(())
                         }
-                        _ => Err(()),
+                        _ => Err(ReservationLost),
                     });
                 })
             };

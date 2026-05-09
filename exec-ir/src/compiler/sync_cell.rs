@@ -6,10 +6,4 @@ impl<T> SyncCell<T> {
     }
 }
 
-impl<T: ?Sized> SyncCell<T> {
-    pub fn get_mut(&mut self) -> &mut T {
-        &mut self.0
-    }
-}
-
 unsafe impl<T> Sync for SyncCell<T> {}

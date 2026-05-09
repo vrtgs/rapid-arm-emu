@@ -1,8 +1,9 @@
 use super::*;
-use crate::cpu_fabric::CpuFabric;
-use crate::halt_reason::{AtomicHaltReason, HaltReason, HaltReasonInner};
-use crate::io_mmu::{IoMMU, PAGE_SIZE};
-use crate::ir::compiler::{CompiledExecChunk, ExecIrCompiler};
+use crate::compiler::{CompiledExecChunk, ExecIrCompiler};
+use emu_abi::halt_reason::{AtomicHaltReason, HaltReason, HaltReasonInner};
+use emu_abi::memory::PAGE_SIZE;
+use io_mmu::IoMMU;
+use io_mmu::cpu_fabric::CpuFabric;
 use std::alloc::Layout;
 use std::ptr::NonNull;
 use std::sync::LazyLock;
@@ -104,7 +105,7 @@ fn empty_ir_returns_success_and_preserves_basic_state() {
     state.x_registers[0] = 0x3333;
     state.x_registers[1] = 0x4444;
 
-    let builder = ExecIrBuilder::new();
+    let builder = ExecIrBuilder::default();
 
     run_success(builder, &mut state);
 
@@ -116,7 +117,7 @@ fn empty_ir_returns_success_and_preserves_basic_state() {
 
 #[test]
 fn iconst_can_store_to_x_registers_sp_and_pc() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     store_x_const::<0>(&mut builder, 0x0123_4567_89ab_cdef);
     store_x_const::<1>(&mut builder, 0xfedc_ba98_7654_3210);
@@ -138,7 +139,7 @@ fn iconst_can_store_to_x_registers_sp_and_pc() {
 
 #[test]
 fn load_x_reg_const_and_dyn_then_store_roundtrip() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let x0 = builder.load_x_reg::<0>(IntWidth::W64);
     builder.store_x_reg::<2>(x0);
@@ -158,7 +159,7 @@ fn load_x_reg_const_and_dyn_then_store_roundtrip() {
 
 #[test]
 fn load_sp_and_pc_can_feed_arithmetic_and_stores() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let sp = builder.load_sp();
     let sp_delta = u64_const(&mut builder, 0x20);
@@ -182,7 +183,7 @@ fn load_sp_and_pc_can_feed_arithmetic_and_stores() {
 
 #[test]
 fn lower_width_x_register_loads_read_low_order_bits() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let bad = builder.create_block();
 
@@ -225,7 +226,7 @@ fn lower_width_x_register_loads_read_low_order_bits() {
 
 #[test]
 fn wrapping_add_sub_mul_and_neg_work() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let max = u64_const(&mut builder, u64::MAX);
     let one = u64_const(&mut builder, 1);
@@ -256,7 +257,7 @@ fn wrapping_add_sub_mul_and_neg_work() {
 
 #[test]
 fn arithmetic_can_use_loaded_registers() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let x0 = builder.load_x_reg::<0>(IntWidth::W64);
     let x1 = builder.load_x_reg::<1>(IntWidth::W64);
@@ -280,7 +281,7 @@ fn arithmetic_can_use_loaded_registers() {
 
 #[test]
 fn unsigned_division_handles_normal_and_zero_divisors() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let hundred = u64_const(&mut builder, 100);
     let seven = u64_const(&mut builder, 7);
@@ -301,7 +302,7 @@ fn unsigned_division_handles_normal_and_zero_divisors() {
 
 #[test]
 fn signed_division_handles_normal_zero_and_overflow_cases() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let minus_seventeen = u64_const(&mut builder, (-17_i64).cast_unsigned());
     let five = u64_const(&mut builder, 5);
@@ -328,7 +329,7 @@ fn signed_division_handles_normal_zero_and_overflow_cases() {
 
 #[test]
 fn flag_setting_binops_produce_storable_values() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let lhs = builder.load_x_reg::<0>(IntWidth::W64);
     let rhs = builder.load_x_reg::<1>(IntWidth::W64);
@@ -352,7 +353,7 @@ fn flag_setting_binops_produce_storable_values() {
 
 #[test]
 fn brnz_takes_zero_path_for_zero_condition() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let cond = builder.load_x_reg::<0>(IntWidth::W64);
     branch_to_store_x1(cond, &mut builder, 0xaaaa, 0xbbbb);
@@ -367,7 +368,7 @@ fn brnz_takes_zero_path_for_zero_condition() {
 
 #[test]
 fn brnz_takes_non_zero_path_for_non_zero_condition() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let cond = builder.load_x_reg::<0>(IntWidth::W64);
     branch_to_store_x1(cond, &mut builder, 0xaaaa, 0xbbbb);
@@ -382,7 +383,7 @@ fn brnz_takes_non_zero_path_for_non_zero_condition() {
 
 #[test]
 fn brnz_accepts_narrow_integer_conditions() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let cond = builder.load_x_reg::<0>(IntWidth::W8);
     branch_to_store_x1(cond, &mut builder, 0x1111, 0x2222);
@@ -397,7 +398,7 @@ fn brnz_accepts_narrow_integer_conditions() {
         "low byte is zero, so W8 condition must be false",
     );
 
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let cond = builder.load_x_reg::<0>(IntWidth::W8);
     branch_to_store_x1(cond, &mut builder, 0x1111, 0x2222);
@@ -416,7 +417,7 @@ fn brnz_accepts_narrow_integer_conditions() {
 #[test]
 #[allow(clippy::unusual_byte_groupings)]
 fn unconditional_branch_executes_target_block() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let target = builder.create_block();
     builder.terminate(Terminator::Br(target));
@@ -433,7 +434,7 @@ fn unconditional_branch_executes_target_block() {
 #[test]
 fn diamond_control_flow_rejoins_through_processor_state() {
     fn build_program() -> ExecIrBuilder {
-        let mut builder = ExecIrBuilder::new();
+        let mut builder = ExecIrBuilder::default();
 
         let non_zero = builder.create_block();
         let zero = builder.create_block();
@@ -474,7 +475,7 @@ fn diamond_control_flow_rejoins_through_processor_state() {
 
 #[test]
 fn manually_cold_block_still_executes_when_reached() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let hot = builder.create_block();
     let cold = builder.create_block();
@@ -499,7 +500,7 @@ fn manually_cold_block_still_executes_when_reached() {
 
 #[test]
 fn instruction_done_increments_pc_by_four_each_time() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     builder.next_insn();
     builder.next_insn();
@@ -515,7 +516,7 @@ fn instruction_done_increments_pc_by_four_each_time() {
 
 #[test]
 fn explicit_pc_store_then_instruction_done_uses_new_pc() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let pc = u64_const(&mut builder, 0x2000);
     builder.store_pc(pc);
@@ -531,7 +532,7 @@ fn explicit_pc_store_then_instruction_done_uses_new_pc() {
 
 #[test]
 fn simple_counted_loop_executes_until_condition_is_zero() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let loop_block = builder.create_block();
     let exit_block = builder.create_block();
@@ -561,7 +562,7 @@ fn simple_counted_loop_executes_until_condition_is_zero() {
 
 #[test]
 fn compiled_block_can_be_called_more_than_once() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let x0 = builder.load_x_reg::<0>(IntWidth::W64);
     let one = u64_const(&mut builder, 1);
@@ -583,7 +584,7 @@ fn compiled_block_can_be_called_more_than_once() {
 
 #[test]
 fn builder_current_block_tracks_switches() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     assert_eq!(builder.current_block(), Block::ENTRYPOINT);
 
@@ -596,7 +597,7 @@ fn builder_current_block_tracks_switches() {
 #[test]
 #[should_panic(expected = "arithmetic size mismatch")]
 fn builder_rejects_arithmetic_width_mismatch() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let wide = builder.iconst(IConst::u64(1));
     let narrow = builder.iconst(IConst::u32(1));
@@ -607,7 +608,7 @@ fn builder_rejects_arithmetic_width_mismatch() {
 #[test]
 #[should_panic(expected = "can only store 64 bit integers to processor registers")]
 fn builder_rejects_storing_narrow_value_to_processor_register() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let narrow = builder.iconst(IConst::u32(1));
     builder.store_x_reg::<0>(narrow);
@@ -616,7 +617,7 @@ fn builder_rejects_storing_narrow_value_to_processor_register() {
 #[test]
 #[should_panic]
 fn load_x_reg_dyn_rejects_out_of_range_register() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let _ = builder.load_x_reg_dyn(X_REGISTER_COUNT, IntWidth::W64);
 }
@@ -624,7 +625,7 @@ fn load_x_reg_dyn_rejects_out_of_range_register() {
 #[test]
 #[should_panic]
 fn store_x_reg_dyn_rejects_out_of_range_register() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let value = u64_const(&mut builder, 1);
     builder.store_x_reg_dyn(X_REGISTER_COUNT, value);
@@ -682,7 +683,7 @@ fn int_width_metadata_is_exact() {
 
 #[test]
 fn integer_comparisons_cover_signed_unsigned_and_immediates() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let minus_one = builder.iconst(IConst::i64(-1));
     let plus_one = builder.iconst(IConst::u64(1));
@@ -746,7 +747,7 @@ fn integer_comparisons_cover_signed_unsigned_and_immediates() {
 
 #[test]
 fn select_handles_both_paths_and_bool_values() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let x0 = builder.load_x_reg::<0>(IntWidth::W64);
     let cond = builder.icmp_imm(IntCmp::NotEqual, x0, IConst::u64(0));
@@ -780,7 +781,7 @@ fn select_handles_both_paths_and_bool_values() {
 
 #[test]
 fn bitwise_integer_and_bool_ops_cover_reg_and_immediate_forms() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let a = builder.iconst(IConst::u64(0xca));
     let b = builder.iconst(IConst::u64(0xac));
@@ -833,7 +834,7 @@ fn bitwise_integer_and_bool_ops_cover_reg_and_immediate_forms() {
 
 #[test]
 fn narrow_integer_ops_wrap_compare_and_divide_correctly() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let lhs = builder.iconst(IConst::u8(250));
     let rhs = builder.iconst(IConst::u8(10));
@@ -888,7 +889,7 @@ fn narrow_integer_ops_wrap_compare_and_divide_correctly() {
 
 #[test]
 fn signed_and_unsigned_division_cover_more_rounding_edges() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let lhs = builder.iconst(IConst::i64(7));
     let rhs = builder.iconst(IConst::i64(-2));
@@ -921,7 +922,7 @@ fn signed_and_unsigned_division_cover_more_rounding_edges() {
 
 #[test]
 fn dynamic_narrow_register_loads_read_low_order_bits() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let got = builder.load_x_reg_dyn(0, IntWidth::W8);
     store_int_equals_as_x_reg::<1>(&mut builder, got, IConst::u8(0xef));
@@ -944,7 +945,7 @@ fn dynamic_narrow_register_loads_read_low_order_bits() {
 
 #[test]
 fn set_nzcv_flags_preserves_non_flag_bits_and_replaces_old_flags() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let preserved = 0x00ff_00ff & !PState::NZCV_MASK.0;
     let initial = preserved | PState::NZCV_MASK.0;
@@ -971,7 +972,7 @@ fn set_nzcv_flags_preserves_non_flag_bits_and_replaces_old_flags() {
 
 #[test]
 fn adds_and_subs_set_arm_nzcv_flags_for_wrap_carry_and_overflow() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     clear_pstate(&mut builder);
     let lhs = builder.iconst(IConst::u64(u64::MAX));
@@ -1019,7 +1020,7 @@ fn adds_and_subs_set_arm_nzcv_flags_for_wrap_carry_and_overflow() {
 
 #[test]
 fn return_fail_returns_halt_reason_and_preserves_prior_stores() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     store_x_const::<0>(&mut builder, 0x1234);
 
@@ -1033,7 +1034,7 @@ fn return_fail_returns_halt_reason_and_preserves_prior_stores() {
 
 #[test]
 fn branch_to_return_fail_only_fails_on_taken_path() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let fail = builder.create_block();
     let ok = builder.create_block();
@@ -1063,7 +1064,7 @@ fn branch_to_return_fail_only_fails_on_taken_path() {
 
 #[test]
 fn unreachable_blocks_do_not_execute() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let unreachable = builder.create_block();
 
@@ -1100,7 +1101,7 @@ fn explicit_halt_check_every_instruction_still_retires_all_instructions() {
 
 #[test]
 fn automatic_halt_check_split_at_default_interval_preserves_pc_progress() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     for _ in 0..520 {
         builder.next_insn();
@@ -1116,7 +1117,7 @@ fn automatic_halt_check_split_at_default_interval_preserves_pc_progress() {
 
 #[test]
 fn backedge_halt_guard_after_instruction_done_preserves_loop_retirement() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let loop_block = builder.create_block();
     let exit_block = builder.create_block();
@@ -1148,7 +1149,7 @@ fn backedge_halt_guard_after_instruction_done_preserves_loop_retirement() {
 #[test]
 #[should_panic(expected = "condition must have bool type")]
 fn builder_rejects_select_with_integer_condition() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let cond = builder.iconst(IConst::u64(1));
     let if_true = builder.iconst(IConst::u64(2));
@@ -1160,7 +1161,7 @@ fn builder_rejects_select_with_integer_condition() {
 #[test]
 #[should_panic(expected = "select type mismatch")]
 fn builder_rejects_select_value_type_mismatch() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let one = builder.iconst(IConst::u64(1));
     let cond = builder.icmp_imm(IntCmp::Equal, one, IConst::u64(1));
@@ -1174,7 +1175,7 @@ fn builder_rejects_select_value_type_mismatch() {
 #[test]
 #[should_panic(expected = "arithmetic size mismatch")]
 fn builder_rejects_comparison_width_mismatch() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let wide = builder.iconst(IConst::u64(1));
     let _ = builder.icmp_imm(IntCmp::Equal, wide, IConst::u32(1));
@@ -1183,7 +1184,7 @@ fn builder_rejects_comparison_width_mismatch() {
 #[test]
 #[should_panic(expected = "mismatched integer widths used for bitwise op")]
 fn builder_rejects_bitwise_width_mismatch() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let wide = builder.iconst(IConst::u64(1));
     let narrow = builder.iconst(IConst::u32(1));
@@ -1194,7 +1195,7 @@ fn builder_rejects_bitwise_width_mismatch() {
 #[test]
 #[should_panic(expected = "mismatched integer widths used for bitwise op")]
 fn builder_rejects_bitwise_imm_width_mismatch() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let wide = builder.iconst(IConst::u64(1));
 
@@ -1204,14 +1205,14 @@ fn builder_rejects_bitwise_imm_width_mismatch() {
 #[test]
 #[should_panic(expected = "can't do pointer bitwise operations currently")]
 fn builder_rejects_pointer_bitwise_operations() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let _ = builder.bitor(SSAValue::ARG_PROCESSOR_STATE, SSAValue::ARG_PAGES);
 }
 
 #[test]
 fn terminator_accept_bool_branch_condition() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let one = builder.iconst(IConst::u64(1));
     let cond = builder.icmp_imm(IntCmp::Equal, one, IConst::u64(1));
@@ -1223,7 +1224,7 @@ fn terminator_accept_bool_branch_condition() {
 #[test]
 #[should_panic]
 fn terminator_rejects_bool_return_fail_reason() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let one = builder.iconst(IConst::u64(1));
     let halt_reason = builder.icmp_imm(IntCmp::Equal, one, IConst::u64(1));
@@ -1234,7 +1235,7 @@ fn terminator_rejects_bool_return_fail_reason() {
 #[test]
 #[should_panic(expected = "can only store 32 bit integers to pstate")]
 fn builder_rejects_storing_non_w32_to_pstate() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let wide = builder.iconst(IConst::u64(0));
     builder.store_pstate(wide);
@@ -1242,7 +1243,7 @@ fn builder_rejects_storing_non_w32_to_pstate() {
 
 #[test]
 fn halts_inifnite_loop() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let new_block = builder.create_block();
     // can't loop back to entry point; invalid IR
@@ -1275,7 +1276,7 @@ fn halts_inifnite_loop() {
 #[test]
 #[should_panic]
 fn inifnite_loop_with_no_safepoint() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let new_block = builder.create_block();
     // can't loop back to entry point; invalid IR
@@ -1288,7 +1289,7 @@ fn inifnite_loop_with_no_safepoint() {
 
 #[test]
 fn block_parameter_passed_by_unconditional_branch_is_visible_in_target() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let target = builder.create_block();
     let param = builder.add_block_parameter_at(target, Type::I64);
@@ -1314,7 +1315,7 @@ fn block_parameter_passed_by_unconditional_branch_is_visible_in_target() {
 
 #[test]
 fn block_parameter_arguments_act_like_phi_for_conditional_branch() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let join = builder.create_block();
     let value = builder.add_block_parameter_at(join, Type::I64);
@@ -1349,7 +1350,7 @@ fn block_parameter_arguments_act_like_phi_for_conditional_branch() {
 
 #[test]
 fn brz_same_target_same_arguments_keeps_block_arguments() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let join = builder.create_block();
     let value = builder.add_block_parameter_at(join, Type::I64);
@@ -1377,7 +1378,7 @@ fn brz_same_target_same_arguments_keeps_block_arguments() {
 
 #[test]
 fn loop_carried_block_parameters_update_on_backedge() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let loop_block = builder.create_block();
     let exit_block = builder.create_block();
@@ -1540,7 +1541,7 @@ fn assert_memory_trap(code: u32) {
 
 #[test]
 fn vm_load64_fast_path_reads_mapped_memory() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, 8);
     let loaded = builder.vm_load(addr, IntWidth::W64);
@@ -1559,7 +1560,7 @@ fn vm_load64_fast_path_reads_mapped_memory() {
 
 #[test]
 fn vm_store64_fast_path_writes_mapped_memory() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, 16);
     let value = builder.iconst(IConst::u64(0x0123_4567_89ab_cdef));
@@ -1575,7 +1576,7 @@ fn vm_store64_fast_path_writes_mapped_memory() {
 
 #[test]
 fn vm_unaligned_load32_uses_iommu_fallback() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, 3);
     let loaded = builder.vm_load(addr, IntWidth::W32);
@@ -1595,7 +1596,7 @@ fn vm_unaligned_load32_uses_iommu_fallback() {
 
 #[test]
 fn vm_unaligned_store32_uses_iommu_fallback() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, 3);
     let value = builder.iconst(IConst::u32(0x89ab_cdef));
@@ -1611,7 +1612,7 @@ fn vm_unaligned_store32_uses_iommu_fallback() {
 
 #[test]
 fn vm_cross_page_load64_uses_iommu_fallback() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let start = u64::try_from(PAGE_SIZE - 4).unwrap();
     let addr = u64_const(&mut builder, start);
@@ -1633,7 +1634,7 @@ fn vm_cross_page_load64_uses_iommu_fallback() {
 
 #[test]
 fn vm_cross_page_store64_uses_iommu_fallback() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let start = u64::try_from(PAGE_SIZE - 4).unwrap();
     let addr = u64_const(&mut builder, start);
@@ -1650,7 +1651,7 @@ fn vm_cross_page_store64_uses_iommu_fallback() {
 
 #[test]
 fn vm_load_traps_when_page_is_out_of_bounds() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, VM_BASE);
     let loaded = builder.vm_load(addr, IntWidth::W64);
@@ -1667,7 +1668,7 @@ fn vm_load_traps_when_page_is_out_of_bounds() {
 
 #[test]
 fn vm_load_traps_on_missing_read_permission() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, VM_BASE);
     let loaded = builder.vm_load(addr, IntWidth::W64);
@@ -1685,7 +1686,7 @@ fn vm_load_traps_on_missing_read_permission() {
 
 #[test]
 fn vm_store_traps_on_missing_write_permission_and_does_not_modify_memory() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, 8);
     let value = builder.iconst(IConst::u64(0x0123_4567_89ab_cdef));
@@ -1704,7 +1705,7 @@ fn vm_store_traps_on_missing_write_permission_and_does_not_modify_memory() {
 #[test]
 #[should_panic]
 fn vm_load_rejects_non_i64_virtual_address() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = builder.iconst(IConst::u32(0));
     let _ = builder.vm_load(addr, IntWidth::W64);
@@ -1713,7 +1714,7 @@ fn vm_load_rejects_non_i64_virtual_address() {
 #[test]
 #[should_panic(expected = "can only do integer vm stores on integers")]
 fn vm_store_rejects_non_integer_value() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, VM_BASE);
     let one = u64_const(&mut builder, 1);
@@ -1749,7 +1750,7 @@ fn vm_expected_iconst(width: IntWidth, start: usize) -> IConst {
 
 #[test]
 fn vm_aligned_fast_path_loads_all_widths_from_page0_nonzero_offsets() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, 1);
     let value = builder.vm_load(addr, IntWidth::W8);
@@ -1783,7 +1784,7 @@ fn vm_aligned_fast_path_loads_all_widths_from_page0_nonzero_offsets() {
 
 #[test]
 fn vm_aligned_fast_path_stores_all_widths_to_page0_nonzero_offsets() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, 1);
     let value = builder.iconst(IConst::u8(0xa7));
@@ -1814,7 +1815,7 @@ fn vm_aligned_fast_path_stores_all_widths_to_page0_nonzero_offsets() {
 
 #[test]
 fn vm_fast_path_load_uses_page_number_not_page_offset_for_page0_offset8() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, 8);
     let loaded = builder.vm_load(addr, IntWidth::W64);
@@ -1839,7 +1840,7 @@ fn vm_fast_path_load_uses_page_number_not_page_offset_for_page0_offset8() {
 
 #[test]
 fn vm_fast_path_load_uses_page_number_not_zero_for_page1_offset0() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, vm_page_addr(1));
     let loaded = builder.vm_load(addr, IntWidth::W64);
@@ -1858,7 +1859,7 @@ fn vm_fast_path_load_uses_page_number_not_zero_for_page1_offset0() {
 
 #[test]
 fn vm_fast_path_store_uses_page_number_not_zero_for_page1_offset0() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, vm_page_addr(1));
     let value = builder.iconst(IConst::u64(0xfeed_face_cafe_beef));
@@ -1878,7 +1879,7 @@ fn vm_fast_path_store_uses_page_number_not_zero_for_page1_offset0() {
 
 #[test]
 fn vm_fast_path_load_uses_page_number_not_page_offset_for_nonzero_page_nonzero_offset() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let start = PAGE_SIZE.strict_mul(2).strict_add(24);
     let addr = u64_const(&mut builder, u64::try_from(start).unwrap());
@@ -1906,7 +1907,7 @@ fn vm_fast_path_load_uses_page_number_not_page_offset_for_nonzero_page_nonzero_o
 
 #[test]
 fn vm_fast_path_load_permission_check_uses_target_page_not_offset_page() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, vm_page_addr(1));
     let loaded = builder.vm_load(addr, IntWidth::W64);
@@ -1928,7 +1929,7 @@ fn vm_fast_path_load_permission_check_uses_target_page_not_offset_page() {
 
 #[test]
 fn vm_fast_path_store_permission_check_uses_target_page_not_offset_page() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, vm_page_addr(1));
     let value = builder.iconst(IConst::u64(0xfeed_face_cafe_beef));
@@ -1950,7 +1951,7 @@ fn vm_fast_path_store_permission_check_uses_target_page_not_offset_page() {
 
 #[test]
 fn vm_fast_path_load_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let start16 = PAGE_SIZE - 2;
     let addr = u64_const(&mut builder, u64::try_from(start16).unwrap());
@@ -1991,7 +1992,7 @@ fn vm_fast_path_load_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
 #[test]
 fn vm_fast_path_store_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
     {
-        let mut builder = ExecIrBuilder::new();
+        let mut builder = ExecIrBuilder::default();
 
         let start = PAGE_SIZE - 2;
         let addr = u64_const(&mut builder, u64::try_from(start).unwrap());
@@ -2013,7 +2014,7 @@ fn vm_fast_path_store_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
     }
 
     {
-        let mut builder = ExecIrBuilder::new();
+        let mut builder = ExecIrBuilder::default();
 
         let start = PAGE_SIZE - 4;
         let addr = u64_const(&mut builder, u64::try_from(start).unwrap());
@@ -2035,7 +2036,7 @@ fn vm_fast_path_store_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
     }
 
     {
-        let mut builder = ExecIrBuilder::new();
+        let mut builder = ExecIrBuilder::default();
 
         let start = PAGE_SIZE - 8;
         let addr = u64_const(&mut builder, u64::try_from(start).unwrap());
@@ -2059,7 +2060,7 @@ fn vm_fast_path_store_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
 
 #[test]
 fn vm_byte_access_at_last_byte_of_page_uses_fast_path_and_succeeds() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let last = PAGE_SIZE - 1;
 
@@ -2084,7 +2085,7 @@ fn vm_byte_access_at_last_byte_of_page_uses_fast_path_and_succeeds() {
 
 #[test]
 fn vm_dynamic_load_can_take_fast_path_and_fallback_path_in_same_compiled_chunk() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = builder.load_x_reg::<0>(IntWidth::W64);
     let loaded = builder.vm_load(addr, IntWidth::W64);
@@ -2130,7 +2131,7 @@ fn vm_dynamic_load_can_take_fast_path_and_fallback_path_in_same_compiled_chunk()
 
 #[test]
 fn vm_dynamic_store_can_take_fast_path_and_fallback_path_in_same_compiled_chunk() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = builder.load_x_reg::<0>(IntWidth::W64);
     let value = builder.load_x_reg::<1>(IntWidth::W64);
@@ -2181,7 +2182,7 @@ fn vm_dynamic_store_can_take_fast_path_and_fallback_path_in_same_compiled_chunk(
 
 #[test]
 fn vm_cross_page_load16_traps_when_second_page_lacks_read_permission() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let start = PAGE_SIZE - 1;
     let addr = u64_const(&mut builder, u64::try_from(start).unwrap());
@@ -2204,7 +2205,7 @@ fn vm_cross_page_load16_traps_when_second_page_lacks_read_permission() {
 
 #[test]
 fn vm_cross_page_store32_traps_when_second_page_lacks_write_and_does_not_partially_store() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let start = PAGE_SIZE - 2;
     let addr = u64_const(&mut builder, u64::try_from(start).unwrap());
@@ -2252,7 +2253,7 @@ fn vm_cross_page_store32_traps_when_second_page_lacks_write_and_does_not_partial
 
 #[test]
 fn vm_cross_page_load64_roundtrips_exact_little_endian_bytes() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let start = PAGE_SIZE - 3;
     let addr = u64_const(&mut builder, u64::try_from(start).unwrap());
@@ -2272,7 +2273,7 @@ fn vm_cross_page_load64_roundtrips_exact_little_endian_bytes() {
 
 #[test]
 fn vm_cross_page_store64_roundtrips_exact_little_endian_bytes() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let start = PAGE_SIZE - 3;
     let addr = u64_const(&mut builder, u64::try_from(start).unwrap());
@@ -2295,7 +2296,7 @@ fn vm_cross_page_store64_roundtrips_exact_little_endian_bytes() {
 
 #[test]
 fn vm_store_then_load_same_address_in_same_ir_sees_new_value_fast_path() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, 32);
     let stored = builder.iconst(IConst::u64(0x9988_7766_5544_3322));
@@ -2315,7 +2316,7 @@ fn vm_store_then_load_same_address_in_same_ir_sees_new_value_fast_path() {
 
 #[test]
 fn vm_store_then_load_same_unaligned_address_in_same_ir_sees_new_value_fallback_path() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, 33);
     let stored = builder.iconst(IConst::u64(0x8877_6655_4433_2211));
@@ -2335,7 +2336,7 @@ fn vm_store_then_load_same_unaligned_address_in_same_ir_sees_new_value_fallback_
 
 #[test]
 fn vm_load_fast_path_traps_when_page_number_equals_page_count() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, vm_page_addr(1));
     let loaded = builder.vm_load(addr, IntWidth::W64);
@@ -2353,7 +2354,7 @@ fn vm_load_fast_path_traps_when_page_number_equals_page_count() {
 
 #[test]
 fn vm_store_fast_path_traps_when_page_number_equals_page_count() {
-    let mut builder = ExecIrBuilder::new();
+    let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, vm_page_addr(1));
     let value = builder.iconst(IConst::u64(0x0123_4567_89ab_cdef));

@@ -1,4 +1,4 @@
-use crate::io_mmu::IoMMU;
+use io_mmu::IoMMU;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]

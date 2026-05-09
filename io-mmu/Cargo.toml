@@ -1,0 +1,15 @@
+[package]
+name = "io-mmu"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+emu-abi = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-utils = { workspace = true }
+thiserror = { workspace = true }
+pastey = { workspace = true }
+
+[dev-dependencies]
+loom = "0.7.2"

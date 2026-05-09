@@ -1,6 +1,7 @@
 use crate::armv9::{Armv9CpuCore, ProcessorState};
-use crate::halt_reason::HaltReasonInner;
-use crate::io_mmu::HostPointer;
+use emu_abi::halt_reason::HaltReasonInner;
+use emu_abi::memory::HostPointer;
+use emu_abi::memory::PagePointer;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -30,7 +31,7 @@ pub(crate) struct CodeBlock {
     /// `start` is not guaranteed to be the entrypoint of the chunk.
     addr: Range<HostPointer>,
 
-    machine_code_handle: crate::ir::compiler::CompiledExecChunk,
+    machine_code_handle: exec_ir::compiler::CompiledExecChunk,
 }
 
 impl CodeBlock {
@@ -54,7 +55,8 @@ impl CodeCache {
         todo!()
     }
 
-    pub fn invalidate_cache(&mut self, range: Range<HostPointer>) {
+    pub fn invalidate_cached_page(&mut self, page: PagePointer) {
+        let range = page.as_range();
         self.cache.retain(move |_entrypoint, block| {
             let collides = range.start < block.addr.end && block.addr.start < range.end;
             !collides

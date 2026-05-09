@@ -1,11 +1,11 @@
-use std::fmt::{Debug, Formatter};
+use crate::as_ffi::AsFFI;
 use std::num::NonZero;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     #[repr(transparent)]
-    pub(crate) struct HaltReasonInner: u32 {
+    pub struct HaltReasonInner: u32 {
         // internal reasons; these don't override, and instead stack
         // example one can step on an invalidate instruction cache instruction
         // in that case we stopped for 2 reasons; 1st of all we have successfully stepped
@@ -34,6 +34,7 @@ const INVALID_INSN: NonZero<u8> = NonZero::new(1).unwrap();
 const UNALIGNED_PC: NonZero<u8> = NonZero::new(2).unwrap();
 const MEMORY_TRAP: NonZero<u8> = NonZero::new(3).unwrap();
 
+#[derive(Debug)] // TODO: better debug repr
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HaltReason {
     pub opcode: NonZero<u8>,
@@ -45,6 +46,16 @@ impl HaltReason {
         Self { opcode, payload }
     }
 
+    pub const INVALID_INSN: Self = Self {
+        opcode: INVALID_INSN,
+        payload: 0,
+    };
+
+    pub const UNALIGNED_PC: Self = Self {
+        opcode: UNALIGNED_PC,
+        payload: 0,
+    };
+
     pub const MEMORY_TRAP: Self = Self {
         opcode: MEMORY_TRAP,
         payload: 0,
@@ -52,7 +63,7 @@ impl HaltReason {
 }
 
 impl HaltReason {
-    pub(crate) const fn from_inner(reason: HaltReasonInner) -> Option<Self> {
+    pub const fn from_inner(reason: HaltReasonInner) -> Option<Self> {
         let bits = reason.bits();
         let Some(opcode) = NonZero::new(((bits >> 8) & 0xFF) as u8) else {
             return None;
@@ -61,27 +72,27 @@ impl HaltReason {
         Some(Self { opcode, payload })
     }
 
-    pub(crate) const fn into_inner(self) -> HaltReasonInner {
+    pub const fn into_inner(self) -> HaltReasonInner {
         let bits = ((self.payload as u32) << 16) | ((self.opcode.get() as u32) << 8);
         HaltReasonInner::from_bits_retain(bits)
     }
 }
 
-impl Debug for HaltReason {
-    fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+pub struct AtomicHaltReason(AtomicU32);
+
+impl Default for AtomicHaltReason {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-pub(crate) struct AtomicHaltReason(AtomicU32);
-
 impl AtomicHaltReason {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self(AtomicU32::new(0))
     }
 
     #[inline]
-    pub(crate) fn add_reasons_full(&self, reason: HaltReasonInner) -> HaltReasonInner {
+    pub fn add_reasons_full(&self, reason: HaltReasonInner) -> HaltReasonInner {
         // CAS loop
         // the lsb gets `or`ed and the top 24 bits get replaced
         let bits = self.0.update(Ordering::Release, Ordering::Relaxed, |bits| {
@@ -101,8 +112,12 @@ impl AtomicHaltReason {
     pub fn take(&self) -> HaltReasonInner {
         HaltReasonInner::from_bits_retain(self.0.swap(0, Ordering::AcqRel))
     }
+}
 
-    pub(crate) fn as_ffi(&self) -> &AtomicU32 {
+impl AsFFI for AtomicHaltReason {
+    type Inetrface<'a> = &'a AtomicU32;
+
+    fn as_ffi(&self) -> Self::Inetrface<'_> {
         &self.0
     }
 }

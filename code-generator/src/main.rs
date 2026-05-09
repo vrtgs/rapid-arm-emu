@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(dead_code, unused)]
 
 use crate::instruction_parser::InstructionSets;
 use crate::interner::Interner;

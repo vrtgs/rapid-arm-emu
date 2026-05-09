@@ -1,16 +1,18 @@
-use crate::armv9::{PState, ProcessorState, X_REGISTER_COUNT};
-use crate::array_helper;
-use crate::halt_reason::HaltReason;
-use crate::io_mmu::{IoMMU, MemProt, PAGE_OFFSET_MASK, PAGE_SHIFT, PAGE_SIZE_U64, Page};
-use crate::ir::arena::{Arena, ArenaSet, impl_storable};
-use crate::ir::ffi_support::IoMmuStatus;
+use crate::arena::{Arena, ArenaSet, impl_storable};
+use crate::ffi_support::IoMmuStatus;
 use arrayvec::ArrayVec;
+use emu_abi::array_helper;
+use emu_abi::halt_reason::{HaltReason, HaltReasonInner};
+use emu_abi::memory::{MemProt, PAGE_OFFSET_MASK, PAGE_SHIFT, PAGE_SIZE_U64, Page};
+use emu_abi::processor_state::{PState, ProcessorState, X_REGISTER_COUNT};
+use io_mmu::IoMMU;
 use smallvec::{SmallVec, smallvec};
+use std::collections::HashMap;
 use std::mem::offset_of;
 use std::num::NonZero;
 
 mod arena;
-pub(crate) mod compiler;
+pub mod compiler;
 mod ffi_support;
 mod halt_check_pass;
 
@@ -96,7 +98,7 @@ impl_storable! {
 
 #[derive(Debug)]
 struct StackSlotData {
-    size: u8,
+    size: u32,
     align: u8,
 }
 
@@ -290,9 +292,9 @@ enum BitwiseOp {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum ShiftOp {
-    SignExtendShr,
+    // SignExtendShr,
     ZeroExtendShr,
-    Shl,
+    // Shl,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -502,6 +504,11 @@ enum StmtKind {
         elem_size: NonZero<usize>,
     },
 
+    PtrOffsetImm {
+        base_ptr: SSAValue,
+        offset: isize,
+    },
+
     HostCallback {
         func: HostCallback,
         signature: CallbackSignature,
@@ -523,11 +530,20 @@ enum StmtKind {
     },
 
     /// loads the halt reason found at Arg::HaltReasonPtr
+    /// implemntation:
+    /// its a relaxed atomic 32 bit native entain load
     LoadHaltReason,
 
     /// takes the halt reason found at Arg::HaltReasonPtr
     /// and replaces it with 0
+    /// implementation: AcqRel xchg \[HaltReasonPtr] 0
     TakeHaltReason,
+
+    /// relaxed atomic byte load
+    LoadInstructionDirtyFlag(SSAValue),
+
+    /// **release** atomic byte store to the value `1`
+    SetInstructionDirtyFlag(SSAValue),
 
     Safepoint,
 }
@@ -640,6 +656,11 @@ impl Terminator {
             kind: TerminatorKind::BrZ { cond },
         }
     }
+
+    pub fn BrNZ(cond: SSAValue, non_zero: impl Into<Jump>, zero: impl Into<Jump>) -> Self {
+        // just swap the arguments
+        Self::BrZ(cond, zero, non_zero)
+    }
 }
 
 #[derive(Debug)]
@@ -674,17 +695,16 @@ impl_storable! {
 }
 
 #[derive(Debug)]
-pub(crate) struct ExecIr {
+pub struct ExecIr {
     ssa_values: Arena<SSAValueData>,
     blocks: Arena<BlockData>,
     stmts: Arena<StmtData>,
     stack_slots: Arena<StackSlotData>,
     signatures: Arena<CallbackSignatureData>,
     block_compile_order: Vec<Block>,
-    halt_check_every: NonZero<u32>,
 }
 
-pub(crate) struct ExecIrBuilder {
+pub struct ExecIrBuilder {
     ssa_values: Arena<SSAValueData>,
     blocks: Arena<BlockData>,
     stmts: Arena<StmtData>,
@@ -692,12 +712,27 @@ pub(crate) struct ExecIrBuilder {
     signatures: Arena<CallbackSignatureData>,
     scratch_space: Option<StackSlot>,
     leave_and_take_halt: Option<Block>,
+    halt_blocks: HashMap<HaltReasonInner, Block>,
     current_block: Block,
     halt_check_every: NonZero<u32>,
 }
 
-pub(crate) struct IrBuilderConfig {
-    halt_check_every: NonZero<u32>,
+pub struct IrBuilderConfig {
+    pub halt_check_every: NonZero<u32>,
+}
+
+impl Default for IrBuilderConfig {
+    fn default() -> Self {
+        Self {
+            halt_check_every: const { NonZero::new(128).unwrap() },
+        }
+    }
+}
+
+impl Default for ExecIrBuilder {
+    fn default() -> Self {
+        Self::with_config(IrBuilderConfig::default())
+    }
 }
 
 impl ExecIrBuilder {
@@ -710,14 +745,10 @@ impl ExecIrBuilder {
             signatures: Arena::new(),
             scratch_space: None,
             leave_and_take_halt: None,
+            halt_blocks: HashMap::new(),
             current_block: Block::ENTRYPOINT,
             halt_check_every: config.halt_check_every,
         }
-    }
-
-    pub fn new() -> Self {
-        let halt_check_every = const { NonZero::new(64).unwrap() };
-        Self::with_config(IrBuilderConfig { halt_check_every })
     }
 
     pub fn current_block(&self) -> Block {
@@ -737,6 +768,21 @@ impl ExecIrBuilder {
         block: Block,
     ) -> arrayvec::IntoIter<Block, { Terminator::MAX_TARGETS }> {
         self.blocks[block].terminator.block_targets()
+    }
+
+    pub fn mark_block_bold(&mut self, block: Block) {
+        // a cold entrypoint is insane and should never be true
+        // it will always run when the resulting block is compiled
+        // it can't be cold
+        // this is made just so that if an exec block always unconditionally fails at the end
+        // this doesn't accedentally mark that cold
+        if block != Block::ENTRYPOINT {
+            self.blocks[block].is_cold = true;
+        }
+    }
+
+    pub fn mark_current_block_cold(&mut self) {
+        self.mark_block_bold(self.current_block)
     }
 
     pub fn terminate_block(&mut self, block: Block, mut terminator: Terminator) {
@@ -781,17 +827,6 @@ impl ExecIrBuilder {
         self.terminate_block(current_block, terminator)
     }
 
-    pub fn mark_block_bold(&mut self, block: Block) {
-        // a cold entrypoint is insane and should never be true
-        // it will always run when the resulting block is compiled
-        // it can't be cold
-        // this is made just so that if an exec block always unconditionally fails at the end
-        // this doesn't accedentally mark that cold
-        if block != Block::ENTRYPOINT {
-            self.blocks[block].is_cold = true;
-        }
-    }
-
     pub fn add_block_parameter_at(&mut self, block: Block, ty: Type) -> SSAValue {
         let ssa_value = self.ssa_values.store(SSAValueData { ty });
         self.blocks[block].parameters.push(ssa_value);
@@ -833,9 +868,9 @@ impl ExecIrBuilder {
 
             StmtKind::StoreHost { .. } => empty_iter(),
 
-            StmtKind::LoadStackPtr { .. } => iter_from_arr([Type::HostPtr]),
-
-            StmtKind::PtrAdd { .. } => iter_from_arr([Type::HostPtr]),
+            StmtKind::PtrOffsetImm { .. }
+            | StmtKind::LoadStackPtr { .. }
+            | StmtKind::PtrAdd { .. } => iter_from_arr([Type::HostPtr]),
 
             StmtKind::HostCallback { signature, .. } => match self.signatures[signature].ret {
                 None => empty_iter(),
@@ -846,6 +881,10 @@ impl ExecIrBuilder {
             StmtKind::VMStoreRaw { .. } => empty_iter(),
 
             StmtKind::LoadHaltReason | StmtKind::TakeHaltReason => iter_from_arr([Type::I32]),
+
+            StmtKind::LoadInstructionDirtyFlag { .. } => iter_from_arr([Type::I8]),
+            StmtKind::SetInstructionDirtyFlag { .. } => empty_iter(),
+
             StmtKind::Safepoint => empty_iter(),
         }
     }
@@ -912,7 +951,7 @@ impl ExecIrBuilder {
         (value1, value2)
     }
 
-    pub fn create_stack_slot(&mut self, size: u8, align: u8) -> StackSlot {
+    pub fn create_stack_slot(&mut self, size: u32, align: u8) -> StackSlot {
         assert!(align.is_power_of_two());
 
         self.stack_slots.store(StackSlotData { size, align })
@@ -1407,7 +1446,7 @@ impl ExecIrBuilder {
         self.use_stack_slot(self.scratch_space.unwrap())
     }
 
-    pub fn assert_or_jmp_to(&mut self, cond: SSAValue, expected: bool, fail: Block) {
+    pub fn assert_or_jmp_to(&mut self, cond: SSAValue, expected: bool, fail: Block) -> Block {
         self.mark_block_bold(fail);
         let success = self.create_block();
         let (zero, non_zero) = match expected {
@@ -1417,25 +1456,47 @@ impl ExecIrBuilder {
             false => (success, fail),
         };
         self.terminate(Terminator::BrZ(cond, zero, non_zero));
-        self.switch_to(success)
+        self.switch_to(success);
+        success
     }
 
     fn get_leave_and_take_halt(&mut self) -> Block {
         if self.leave_and_take_halt.is_none() {
             let fail = self.create_block();
-            self.mark_block_bold(fail);
 
-            let final_halt_reason = self.block_scope(fail, |this| unsafe {
-                this.emit_1ret_stmt(StmtKind::TakeHaltReason)
+            self.block_scope(fail, |this| {
+                this.mark_current_block_cold();
+                let final_halt_reason = unsafe { this.emit_1ret_stmt(StmtKind::TakeHaltReason) };
+
+                this.terminate(Terminator::ReturnCode(final_halt_reason));
             });
-
-            self.terminate_block(fail, Terminator::ReturnCode(final_halt_reason));
 
             assert!(self.leave_and_take_halt.is_none());
             self.leave_and_take_halt = Some(fail)
         }
 
         self.leave_and_take_halt.unwrap()
+    }
+
+    fn get_halt_block(&mut self, reason: HaltReasonInner) -> Block {
+        assert_ne!(reason.bits(), 0);
+
+        if let Some(&existing_block) = self.halt_blocks.get(&reason) {
+            return existing_block;
+        }
+
+        let fail_block = self.create_block();
+
+        self.block_scope(fail_block, |this| {
+            let trap_value = this.iconst(IConst::u32(reason.bits()));
+            this.terminate(Terminator::ReturnCode(trap_value));
+            this.mark_current_block_cold()
+        });
+
+        let old_value = self.halt_blocks.insert(reason, fail_block);
+        assert!(old_value.is_none());
+
+        fail_block
     }
 
     /// Inserts a halt check immediately after a safepoint in `block`.
@@ -1556,8 +1617,8 @@ impl ExecIrBuilder {
         return_trap_block: Block,
     ) -> FallbackAccess {
         let fallback_block = self.create_block();
-        self.mark_block_bold(fallback_block);
         self.block_scope(fallback_block, |this| {
+            this.mark_current_block_cold();
             let (out_param, (host_cb, sig), args) = match access {
                 VmAccessKind::Load { .. } => {
                     let stack_ptr = this.get_scratch_space_ptr(width);
@@ -1597,6 +1658,8 @@ impl ExecIrBuilder {
         })
     }
 
+    // TODO
+    //   - actually dirty the pages
     fn vm_access(&mut self, vaddr: SSAValue, access: VmAccessKind) -> Option<SSAValue> {
         assert!(matches!(self.ssa_values[vaddr].ty, Type::I64));
 
@@ -1609,18 +1672,7 @@ impl ExecIrBuilder {
             SSAValue::ARG_PAGE_COUNT,
         );
 
-        let return_trap_block = {
-            let fail_block = self.create_block();
-
-            let trap_value = self.block_scope(fail_block, |this| {
-                this.iconst(IConst::u32(HaltReason::MEMORY_TRAP.into_inner().bits()))
-            });
-
-            self.terminate_block(fail_block, Terminator::ReturnCode(trap_value));
-            self.mark_block_bold(fail_block);
-            fail_block
-        };
-
+        let return_trap_block = self.get_halt_block(HaltReason::MEMORY_TRAP.into_inner());
         self.assert_or_jmp_to(page_is_in_bounds, true, return_trap_block);
 
         let page_offset = self.bitand_imm(vaddr, IConst::u64(PAGE_OFFSET_MASK));
@@ -1680,10 +1732,8 @@ impl ExecIrBuilder {
             })
         };
 
-        let required_perms = IConst::u8(access.required_perms().bits());
-        let op_allowed = self.bitand_imm(page_protections, required_perms);
-        self.assert_or_jmp_to(op_allowed, true, return_trap_block);
-
+        // this is loaded before the assert, so that it can be moved to inside after the assert
+        // or stay here; whichever the optimizer finds best
         let aligned_page_ptr = unsafe {
             self.emit_1ret_stmt(StmtKind::LoadHost {
                 ty: LoadType::HostPtr,
@@ -1693,6 +1743,10 @@ impl ExecIrBuilder {
                 can_move: false,
             })
         };
+
+        let required_perms = IConst::u8(access.required_perms().bits());
+        let op_allowed = self.bitand_imm(page_protections, required_perms);
+        self.assert_or_jmp_to(op_allowed, true, return_trap_block);
 
         let ret_value = {
             match access {
@@ -1715,6 +1769,42 @@ impl ExecIrBuilder {
                 }
             }
         };
+
+        if let VmAccessKind::Store { .. } = access {
+            // if page_is_executable # cold
+            //    if page_not_alredy_dirty # cold
+            //       set_page_dirty
+
+            let executable = IConst::u8(MemProt::EXECUTE.bits());
+            let page_is_executable = self.bitand_imm(page_protections, executable);
+            let check_if_not_already_dirty = self.create_block();
+            let continuation =
+                self.assert_or_jmp_to(page_is_executable, false, check_if_not_already_dirty);
+
+            self.block_scope(check_if_not_already_dirty, |this| {
+                let insn_dirty_ptr = unsafe {
+                    this.emit_1ret_stmt(StmtKind::PtrOffsetImm {
+                        base_ptr: page_info_ptr,
+                        offset: isize::try_from(offset_of!(Page, insn_dirty)).unwrap(),
+                    })
+                };
+
+                let already_dirty = unsafe {
+                    this.emit_1ret_stmt(StmtKind::LoadInstructionDirtyFlag(page_info_ptr))
+                };
+
+                let set_insn_dirty = this.create_block();
+                this.terminate(Terminator::BrZ(already_dirty, continuation, set_insn_dirty));
+
+                this.block_scope(set_insn_dirty, |this| {
+                    unsafe {
+                        this.emit_void_stmt(StmtKind::SetInstructionDirtyFlag(insn_dirty_ptr))
+                    }
+
+                    this.terminate(Terminator::Br(continuation))
+                })
+            })
+        }
 
         let Some(fallback_access) = fallback_access else {
             return ret_value;
@@ -1819,7 +1909,6 @@ impl ExecIrBuilder {
             stmts: self.stmts,
             stack_slots: self.stack_slots,
             signatures: self.signatures,
-            halt_check_every: self.halt_check_every,
             block_compile_order: reverse_post_order,
         }
     }

@@ -17,6 +17,12 @@ pub fn iter_from_arr<T, const N: usize, const M: usize>(array: [T; N]) -> IntoIt
     from_arr(array).into_iter()
 }
 
+#[inline(always)]
+pub const fn empty<T, const N: usize>() -> ArrayVec<T, N> {
+    ArrayVec::new_const()
+}
+
+#[inline(always)]
 pub fn empty_iter<T, const N: usize>() -> IntoIter<T, N> {
-    ArrayVec::new_const().into_iter()
+    empty().into_iter()
 }

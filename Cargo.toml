@@ -3,4 +3,51 @@ opt-level = 1
 
 [workspace]
 resolver = "3"
-members = ["code-generator", "rapid-arm-emu"]
+members = ["code-generator", "emu-abi", "exec-ir", "io-mmu", "rapid-arm-emu"]
+
+[workspace.dependencies]
+parking_lot = { version = "0.12.5", features = ["hardware-lock-elision"] }
+crossbeam-utils = "0.8.21"
+arrayvec = "0.7.6"
+smallvec = "2.0.0-alpha.12"
+thiserror = "2.0.18"
+anyhow = "1.0.102"
+pastey = "0.2.2"
+
+# internal crates
+emu-abi = { path = "./emu-abi" }
+io-mmu = { path = "./io-mmu" }
+exec-ir = { path = "./exec-ir" }
+
+[workspace.dependencies.bytemuck]
+version = "1.25.0"
+features = [
+    "align_offset",
+    "alloc_uninit",
+    "const_zeroed",
+    "derive",
+    "impl_core_error",
+    "min_const_generics",
+    "must_cast",
+    "must_cast_extra",
+    "pod_saturating",
+    "track_caller",
+    "transparentwrapper_extra",
+    "zeroable_atomics",
+    "zeroable_maybe_uninit",
+    "zeroable_unwind_fn",
+]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "forbid"
+
+[workspace.lints.clippy]
+# F32 -> F64, Int -> Float, etc.
+cast_precision_loss = "deny"
+# U32 -> U8, etc.
+cast_possible_truncation = "deny"
+# Signed -> Unsigned, etc.
+cast_possible_wrap = "deny"
+# Signed -> Unsigned
+cast_sign_loss = "deny"
+arithmetic_side_effects = "deny"

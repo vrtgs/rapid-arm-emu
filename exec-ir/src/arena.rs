@@ -411,10 +411,10 @@ macro_rules! make_handle {
     ($vis: vis $name: ident) => {
         #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
         #[repr(transparent)]
-        $vis struct $name($crate::ir::arena::RawHandle);
+        $vis struct $name($crate::arena::RawHandle);
 
         const _: () = {
-            unsafe impl $crate::ir::arena::Handle for $name {}
+            unsafe impl $crate::arena::Handle for $name {}
         };
     };
 }
@@ -425,12 +425,12 @@ macro_rules! handle_impl_helper {
     ) => {
         impl $name {
             pub const fn new(index: usize) -> Self {
-                let raw = $crate::ir::arena::RawHandle::new(index);
-                $crate::ir::arena::from_raw(raw)
+                let raw = $crate::arena::RawHandle::new(index);
+                $crate::arena::from_raw(raw)
             }
 
             pub const fn get(self) -> usize {
-                $crate::ir::arena::to_raw(self).get()
+                $crate::arena::to_raw(self).get()
             }
         }
     };
@@ -441,7 +441,7 @@ macro_rules! handle_impl_helper {
         }
     ) => {
         impl $name {
-            $crate::ir::arena::handle_impl_helper! {
+            $crate::arena::handle_impl_helper! {
                 @fold
                 current_stack: [],
                 munching: { $(const $const_name;)* }
@@ -458,13 +458,13 @@ macro_rules! handle_impl_helper {
         }
     ) => {
         const $const_name: Self = {
-            match $crate::ir::arena::RawHandle::try_new(<[()]>::len(&[$($tt),*])) {
-                Some(x) => $crate::ir::arena::from_raw(x),
+            match $crate::arena::RawHandle::try_new(<[()]>::len(&[$($tt),*])) {
+                Some(x) => $crate::arena::from_raw(x),
                 None => panic!("too many constants declared")
             }
         };
 
-        $crate::ir::arena::handle_impl_helper! {
+        $crate::arena::handle_impl_helper! {
             @fold
             current_stack: [$($tt,)* ()],
             munching: { $($rest)* }
@@ -486,10 +486,10 @@ macro_rules! impl_storable {
         })?
     } => {
 
-        $($crate::ir::arena::make_handle!($vis $impl_name);)?
+        $($crate::arena::make_handle!($vis $impl_name);)?
 
 
-        $($crate::ir::arena::handle_impl_helper! {
+        $($crate::arena::handle_impl_helper! {
             impl const for $impl_name {
                 $(const $const_name;)*
             }
@@ -518,7 +518,7 @@ macro_rules! impl_storable {
                 })?
             };
 
-            impl $crate::ir::arena::Storable for $ty {
+            impl $crate::arena::Storable for $ty {
                 type Handle = $($existing_handle)? $($impl_name)?;
 
                 const INITIAL_VEC_LEN: usize = LEN;

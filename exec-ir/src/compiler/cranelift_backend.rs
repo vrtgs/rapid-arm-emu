@@ -1,12 +1,12 @@
+use crate::arena::ArenaMap;
 use crate::array_helper;
-use crate::ir::arena::ArenaMap;
-use crate::ir::compiler::{CompileOptions, CompiledExecChunk, ExecBlockFFI};
-use crate::ir::{
+use crate::compiler::{CompileOptions, CompiledExecChunk, ExecBlockFFI};
+use crate::{
     Arg, ArithBinOp, BitwiseOp, CallbackSignature, ExecIr, HOST_CB_SMALL_ARGS, IConst, IntCmp,
     IntWidth, LoadType, MAX_STMT_OUTPUTS, OverflowingBinOp, SSAValue, ShiftOp, StackSlot, StmtData,
     StmtKind, Terminator, TerminatorKind,
 };
-use crate::ir::{Block as IrBlock, Jump as IrJump, Type as IrType};
+use crate::{Block as IrBlock, Jump as IrJump, Type as IrType};
 use anyhow::{Context, anyhow, ensure};
 use arrayvec::ArrayVec;
 use cranelift::codegen::ir as clif_ir;
@@ -71,10 +71,6 @@ impl<'a> FunctionLowering<'a> {
         Ok(())
     }
 
-    fn ir_ty_to_clif_ty(&self, ty: IrType) -> clif_ir::Type {
-        ir_ty_to_clif_ty(self.ptr_ty, ty)
-    }
-
     fn new(
         mut builder: FunctionBuilder<'a>,
         module: &'a JITModule,
@@ -91,7 +87,7 @@ impl<'a> FunctionLowering<'a> {
             let align_shift = u8::try_from(data.align.ilog2())?;
             let clif_stack_slot = builder.create_sized_stack_slot(clif_ir::StackSlotData {
                 kind: clif_ir::StackSlotKind::ExplicitSlot,
-                size: 0,
+                size: data.size,
                 align_shift,
                 key: None,
             });
@@ -433,9 +429,9 @@ impl<'a> FunctionLowering<'a> {
                 let ins = self.builder.ins();
                 let shift_ammount = i64::from(shift_ammount);
                 let output = match op {
-                    ShiftOp::SignExtendShr => ins.sshr_imm(value, shift_ammount),
+                    // ShiftOp::SignExtendShr => ins.sshr_imm(value, shift_ammount),
                     ShiftOp::ZeroExtendShr => ins.ushr_imm(value, shift_ammount),
-                    ShiftOp::Shl => ins.ishl_imm(value, shift_ammount),
+                    // ShiftOp::Shl => ins.ishl_imm(value, shift_ammount),
                 };
                 array_helper::from_arr([output])
             }
@@ -485,6 +481,13 @@ impl<'a> FunctionLowering<'a> {
             } => {
                 let out_ptr = self.ptr_add(base_ptr, offset, elem_size)?;
                 array_helper::from_arr([out_ptr])
+            }
+
+            StmtKind::PtrOffsetImm { base_ptr, offset } => {
+                let base_ptr = self.use_value(base_ptr)?;
+                let imm64 = i64::try_from(offset)?;
+                let output = self.builder.ins().iadd_imm(base_ptr, imm64);
+                array_helper::from_arr([output])
             }
 
             StmtKind::HostCallback {
@@ -563,6 +566,29 @@ impl<'a> FunctionLowering<'a> {
                 );
 
                 array_helper::from_arr([value])
+            }
+
+            StmtKind::LoadInstructionDirtyFlag(insn_dirty) => {
+                // same reasons as `StmtKind::LoadHaltReason` stated above
+                let can_move = false;
+                let ptr = self.use_value(insn_dirty)?;
+                let value = self.builder.ins().atomic_load(
+                    clif_ir::types::I8,
+                    Self::host_memory_flags(can_move),
+                    ptr,
+                );
+                array_helper::from_arr([value])
+            }
+
+            StmtKind::SetInstructionDirtyFlag(insn_dirty) => {
+                // same reasons as `StmtKind::LoadHaltReason` stated above
+                let can_move = false;
+                let ptr = self.use_value(insn_dirty)?;
+                let true_val = self.iconst(IConst::u8(1));
+                self.builder
+                    .ins()
+                    .atomic_store(Self::host_memory_flags(can_move), true_val, ptr);
+                array_helper::empty()
             }
 
             StmtKind::Safepoint => array_helper::from_arr([]),

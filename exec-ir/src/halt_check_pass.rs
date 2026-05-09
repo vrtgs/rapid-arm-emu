@@ -64,8 +64,8 @@
 //! the old block to the continuation block, keeping both forward and reverse
 //! edge maps consistent.
 
-use crate::ir::arena::{Arena, ArenaMap, ArenaSet, Storable, handle_impl_helper, make_handle};
-use crate::ir::{Block, ExecIrBuilder, Stmt, StmtKind};
+use crate::arena::{Arena, ArenaMap, ArenaSet, Storable, handle_impl_helper, make_handle};
+use crate::{Block, ExecIrBuilder, Stmt, StmtKind};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZero;

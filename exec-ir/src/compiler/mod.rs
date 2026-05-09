@@ -1,10 +1,10 @@
-use crate::armv9::ProcessorState;
-use crate::halt_reason::AtomicHaltReason;
-use crate::io_mmu;
-use crate::io_mmu::IoMMU;
-use crate::ir::ExecIr;
-use crate::ir::compiler::cranelift_backend::CraneliftCompiler;
-use crate::ir::compiler::sync_cell::SyncCell;
+use crate::ExecIr;
+use crate::compiler::cranelift_backend::CraneliftCompiler;
+use crate::compiler::sync_cell::SyncCell;
+use emu_abi::as_ffi::AsFFI;
+use emu_abi::halt_reason::AtomicHaltReason;
+use emu_abi::processor_state::ProcessorState;
+use io_mmu::IoMMU;
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -16,14 +16,14 @@ mod sync_cell;
 
 type ExecBlockFFI = unsafe extern "C" fn(
     processor_state: &mut ProcessorState,
-    pages: *const io_mmu::Page,
+    pages: *const emu_abi::memory::Page,
     page_count: u64,
     halt_reason_ptr: *const AtomicU32,
     io_mmu: *const IoMMU,
 ) -> u32;
 
 #[derive(Clone)]
-pub(crate) struct CompiledExecChunk {
+pub struct CompiledExecChunk {
     ffi: ExecBlockFFI,
 
     // Keeps the JIT resources alive for at least as long as the fn pointer.
@@ -47,7 +47,7 @@ impl CompiledExecChunk {
         io_mmu: &IoMMU,
     ) -> u32 {
         let halt_reason: *const AtomicU32 = halt_reason.as_ffi();
-        let (pages, page_count) = io_mmu.pages_ffi();
+        let (pages, page_count, _liftime_marker) = io_mmu.as_ffi();
         unsafe { (self.ffi)(processor_state, pages, page_count, halt_reason, io_mmu) }
     }
 }
@@ -62,6 +62,12 @@ pub struct ExecIrCompiler {
     next_function_id: AtomicUsize,
     cranelift_compiler: CraneliftCompiler,
     show_disasm: bool,
+}
+
+impl Default for ExecIrCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExecIrCompiler {
