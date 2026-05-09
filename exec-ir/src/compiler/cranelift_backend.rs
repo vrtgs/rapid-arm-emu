@@ -1,6 +1,6 @@
 use crate::arena::ArenaMap;
 use crate::array_helper;
-use crate::compiler::{CompileOptions, CompiledExecChunk, ExecBlockFFI};
+use crate::compiler::{CompileBlockOptions, CompiledExecChunk, ExecBlockFFI};
 use crate::{
     Arg, ArithBinOp, BitwiseOp, CallbackSignature, ExecIr, HOST_CB_SMALL_ARGS, IConst, IntCmp,
     IntWidth, LoadType, MAX_STMT_OUTPUTS, OverflowingBinOp, SSAValue, ShiftOp, StackSlot, StmtData,
@@ -731,7 +731,7 @@ impl CraneliftCompiler {
 
     pub fn try_compile(
         &self,
-        options: CompileOptions,
+        options: CompileBlockOptions,
         exec_ir: ExecIr,
     ) -> anyhow::Result<CompiledExecChunk> {
         let builder =

@@ -15,7 +15,8 @@ pub fn empty_io_mmu() -> IoMMU {
     IoMMU::new(CpuFabric::new())
 }
 
-static COMPILER: LazyLock<ExecIrCompiler> = LazyLock::new(ExecIrCompiler::new);
+static COMPILER: LazyLock<ExecIrCompiler> =
+    LazyLock::new(|| ExecIrCompiler::default().with_show_disassmbly());
 
 pub fn compile(builder: ExecIrBuilder) -> CompiledExecChunk {
     COMPILER.compile(builder.build())

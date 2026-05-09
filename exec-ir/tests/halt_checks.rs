@@ -1,4 +1,4 @@
-use crate::helper::{empty_io_mmu, run_full, run_success, store_x_const};
+use crate::helper::{call_compiled, compile, empty_io_mmu, run_full, run_success, store_x_const};
 use emu_abi::halt_reason::{HaltReason, HaltReasonInner};
 use emu_abi::processor_state::ProcessorState;
 use exec_ir::{ExecIrBuilder, IConst, IntWidth, IrBuilderConfig, Terminator};
@@ -45,16 +45,20 @@ fn explicit_halt_check_every_instruction_still_retires_all_instructions() {
 fn automatic_halt_check_split_at_default_interval_preserves_pc_progress() {
     let mut builder = ExecIrBuilder::default();
 
-    for _ in 0..520 {
+    let instructions = 1024_u64;
+
+    for _ in 0..instructions {
         builder.next_insn();
     }
 
+    let compiled = compile(builder);
+
     let mut state = ProcessorState::initial();
-    state.pc = 0x1000;
-
-    run_success(builder, &mut state);
-
-    assert_eq!(state.pc, 0x1000 + 520_u64 * 4);
+    for inital_pc in [0x1000, 0x1100, 0x8080] {
+        state.pc = inital_pc;
+        call_compiled(&compiled, &mut state);
+        assert_eq!(state.pc, inital_pc.strict_add(instructions.strict_mul(4)));
+    }
 }
 
 #[test]

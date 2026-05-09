@@ -53,7 +53,7 @@ impl CompiledExecChunk {
 }
 
 // currently we only support cranelift but that should change soon with LLVM support
-struct CompileOptions {
+struct CompileBlockOptions {
     function_name: String,
     show_disasm: bool,
 }
@@ -66,17 +66,18 @@ pub struct ExecIrCompiler {
 
 impl Default for ExecIrCompiler {
     fn default() -> Self {
-        Self::new()
+        Self {
+            next_function_id: AtomicUsize::new(0),
+            cranelift_compiler: CraneliftCompiler::new(cranelift_backend::OptLevel::Speed).unwrap(),
+            show_disasm: true,
+        }
     }
 }
 
 impl ExecIrCompiler {
-    pub fn new() -> Self {
-        Self {
-            next_function_id: AtomicUsize::new(0),
-            cranelift_compiler: CraneliftCompiler::new(cranelift_backend::OptLevel::Speed).unwrap(),
-            show_disasm: cfg!(test),
-        }
+    pub fn with_show_disassmbly(mut self) -> Self {
+        self.show_disasm = true;
+        self
     }
 
     pub fn compile(&self, exec_ir: ExecIr) -> CompiledExecChunk {
@@ -90,7 +91,7 @@ impl ExecIrCompiler {
             format!("exec_chunk_{id}")
         };
 
-        let options = CompileOptions {
+        let options = CompileBlockOptions {
             function_name,
             show_disasm: self.show_disasm,
         };
