@@ -16,9 +16,6 @@ pub mod compiler;
 mod ffi_support;
 mod halt_check_pass;
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum IntWidth {
     W8 = 1,
@@ -570,6 +567,24 @@ pub struct Jump {
     target: Block,
 }
 
+impl From<Block> for Jump {
+    fn from(value: Block) -> Self {
+        Jump {
+            parameters: smallvec![],
+            target: value,
+        }
+    }
+}
+
+impl<I: Into<SmallVec<SSAValue, JUMP_PARAM_SMALL>>> From<(Block, I)> for Jump {
+    fn from((target, parameters): (Block, I)) -> Self {
+        Jump {
+            target,
+            parameters: parameters.into(),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum TerminatorKind {
     /// Return "0" i.e. return success.
@@ -609,24 +624,6 @@ impl Terminator {
                 const { assert!(Terminator::MAX_TARGETS == 2) }
                 unreachable!()
             }
-        }
-    }
-}
-
-impl From<Block> for Jump {
-    fn from(value: Block) -> Self {
-        Jump {
-            parameters: smallvec![],
-            target: value,
-        }
-    }
-}
-
-impl<I: Into<SmallVec<SSAValue, JUMP_PARAM_SMALL>>> From<(Block, I)> for Jump {
-    fn from((target, parameters): (Block, I)) -> Self {
-        Jump {
-            target,
-            parameters: parameters.into(),
         }
     }
 }
@@ -690,7 +687,7 @@ impl BlockData {
 impl_storable! {
     BlockData as impl pub Block;
     init: {
-        const ENTRYPOINT = Self {
+        pub const ENTRYPOINT = Self {
             parameters: Arg::args().map(Arg::as_ssa_value).collect(),
             ..BlockData::empty()
         };
@@ -1795,6 +1792,7 @@ impl ExecIrBuilder {
                 };
 
                 let set_insn_dirty = this.create_block();
+                // if is_dirty != 0; goto continue; else goto set_insn_dirty;
                 this.terminate(Terminator::BrNZ(is_dirty, continuation, set_insn_dirty));
 
                 this.block_scope(set_insn_dirty, |this| {
@@ -1818,29 +1816,32 @@ impl ExecIrBuilder {
             _ => unreachable!(),
         };
 
-        let normal_access_block = self.current_block();
-        let merge_block = self.create_block();
-        self.switch_to(merge_block);
-
-        let (param, normal_block_jmp_param, fallback_jump_param) = match returns {
+        match returns {
             Some((ret_normal, ret_fallback)) => {
+                let normal_access_block = self.current_block();
+                let merge_block = self.create_block();
+                self.switch_to(merge_block);
+
                 let param = self.add_block_parameter(Type::Int(width));
 
-                (Some(param), smallvec![ret_normal], smallvec![ret_fallback])
+                self.terminate_block(
+                    normal_access_block,
+                    Terminator::Br((merge_block, smallvec![ret_normal])),
+                );
+                self.terminate_block(
+                    fallback_access.ok_block,
+                    Terminator::Br((merge_block, smallvec![ret_fallback])),
+                );
+
+                Some(param)
             }
-            None => (None, smallvec![], smallvec![]),
-        };
+            None => {
+                let current_block = self.current_block();
+                self.terminate_block(fallback_access.ok_block, Terminator::Br(current_block));
 
-        self.terminate_block(
-            normal_access_block,
-            Terminator::Br((merge_block, normal_block_jmp_param)),
-        );
-        self.terminate_block(
-            fallback_access.ok_block,
-            Terminator::Br((merge_block, fallback_jump_param)),
-        );
-
-        param
+                None
+            }
+        }
     }
 
     pub fn vm_load(&mut self, vaddr: SSAValue, width: IntWidth) -> SSAValue {

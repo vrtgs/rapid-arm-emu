@@ -437,14 +437,14 @@ macro_rules! handle_impl_helper {
 
     (
         impl const for $name: path {
-            $(const $const_name: ident;)*
+            $($vis_const: vis const $const_name: ident;)*
         }
     ) => {
         impl $name {
             $crate::arena::handle_impl_helper! {
                 @fold
                 current_stack: [],
-                munching: { $(const $const_name;)* }
+                munching: { $($vis_const const $const_name;)* }
             }
         }
     };
@@ -453,11 +453,11 @@ macro_rules! handle_impl_helper {
         @fold
         current_stack: [$($tt:tt),*],
         munching: {
-            const $const_name: ident;
+            $vis_const: vis const $const_name: ident;
             $($rest:tt)*
         }
     ) => {
-        const $const_name: Self = {
+        $vis_const const $const_name: Self = {
             match $crate::arena::RawHandle::try_new(<[()]>::len(&[$($tt),*])) {
                 Some(x) => $crate::arena::from_raw(x),
                 None => panic!("too many constants declared")
@@ -482,7 +482,7 @@ macro_rules! impl_storable {
     {
         $ty: ty as $(impl $vis: vis $impl_name: ident)? $(($existing_handle: path))?;
         $(init: {
-            $(const $const_name: ident = $init: expr;)*
+            $($vis_const: vis const $const_name: ident = $init: expr;)*
         })?
     } => {
 
@@ -491,7 +491,7 @@ macro_rules! impl_storable {
 
         $($crate::arena::handle_impl_helper! {
             impl const for $impl_name {
-                $(const $const_name;)*
+                $($vis_const const $const_name;)*
             }
         })?
 
