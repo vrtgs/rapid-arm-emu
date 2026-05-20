@@ -661,11 +661,13 @@ dependencies = [
 name = "io-mmu"
 version = "0.0.0"
 dependencies = [
+ "bytemuck",
  "crossbeam-utils",
  "emu-abi",
  "loom",
  "parking_lot",
  "pastey",
+ "rpds",
  "thiserror",
 ]
 

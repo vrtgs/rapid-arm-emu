@@ -1,3 +1,6 @@
+[lints]
+workspace = true
+
 [package]
 name = "io-mmu"
 version = "0.0.0"
@@ -10,6 +13,8 @@ parking_lot = { workspace = true }
 crossbeam-utils = { workspace = true }
 thiserror = { workspace = true }
 pastey = { workspace = true }
+rpds = { workspace = true }
+bytemuck = { workspace = true }
 
 [dev-dependencies]
 loom = "0.7.2"

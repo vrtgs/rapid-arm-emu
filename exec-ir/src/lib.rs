@@ -3,15 +3,16 @@ use crate::ffi_support::IoMmuStatus;
 use arrayvec::ArrayVec;
 use emu_abi::array_helper;
 use emu_abi::halt_reason::{HaltReason, HaltReasonInner};
+use emu_abi::internal_traits::ICache;
 use emu_abi::memory::{
-    MemProt, PAGE_OFFSET_MASK, PAGE_SHIFT, PAGE_SIZE, TLB_MASK, TLB_SIZE, TlbEntry,
+    MemProt, PAGE_OFFSET_MASK_U64, PAGE_SHIFT, PAGE_SIZE, TLB_MASK, TLB_SIZE, TlbEntry,
 };
 use emu_abi::processor_state::{PState, ProcessorState, X_REGISTER_COUNT};
 use io_mmu::IoMMU;
 use smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::mem::offset_of;
+use std::mem::{MaybeUninit, offset_of};
 use std::num::NonZero;
 
 mod arena;
@@ -90,7 +91,7 @@ impl_storable! {
     init: {
         const ARG_PROCESSOR_STATE = SSAValueData { ty: Type::HostPtr };
         const ARG_TLB_PTR = SSAValueData { ty: Type::HostPtr };
-        const ARG_IO_MMU_GENERATION = SSAValueData { ty: Type::I64 };
+        const ARG_IO_MMU_IDENT = SSAValueData { ty: Type::HostPtr };
         const ARG_HALT_REASON_PTR = SSAValueData { ty: Type::HostPtr };
         const ARG_IO_MMU = SSAValueData { ty: Type::HostPtr };
     }
@@ -111,7 +112,7 @@ impl_storable! {
 pub enum Arg {
     ProcessorState,
     Tlb,
-    IoMMUGeneration,
+    IoMMUIdentifier,
     HaltReasonPtr,
     IoMMU,
 }
@@ -138,7 +139,7 @@ impl Arg {
             }};
         }
 
-        let this = make_arr![ProcessorState, Tlb, IoMMUGeneration, HaltReasonPtr, IoMMU];
+        let this = make_arr![ProcessorState, Tlb, IoMMUIdentifier, HaltReasonPtr, IoMMU];
 
         this.into_iter()
     }
@@ -147,7 +148,7 @@ impl Arg {
         match self {
             Arg::ProcessorState => Type::HostPtr,
             Arg::Tlb => Type::HostPtr,
-            Arg::IoMMUGeneration => Type::I64,
+            Arg::IoMMUIdentifier => Type::I64,
             Arg::HaltReasonPtr => Type::HostPtr,
             Arg::IoMMU => Type::HostPtr,
         }
@@ -157,7 +158,7 @@ impl Arg {
         match self {
             Arg::ProcessorState => SSAValue::ARG_PROCESSOR_STATE,
             Arg::Tlb => SSAValue::ARG_TLB_PTR,
-            Arg::IoMMUGeneration => SSAValue::ARG_IO_MMU_GENERATION,
+            Arg::IoMMUIdentifier => SSAValue::ARG_IO_MMU_IDENT,
             Arg::HaltReasonPtr => SSAValue::ARG_HALT_REASON_PTR,
             Arg::IoMMU => SSAValue::ARG_IO_MMU,
         }
@@ -360,10 +361,10 @@ impl_storable! {
 fn io_mmu_load_callback_for_width(width: IntWidth) -> (HostCallback, CallbackSignature) {
     fn cast<T>(
         f: unsafe extern "C" fn(
-            *const IoMMU,
-            *mut [TlbEntry; TLB_SIZE],
+            &IoMMU<dyn ICache + '_>,
+            &mut [TlbEntry; TLB_SIZE],
             u64,
-            *mut T,
+            &mut MaybeUninit<T>,
         ) -> IoMmuStatus,
     ) -> HostCallback {
         unsafe { std::mem::transmute(f) }
@@ -381,7 +382,12 @@ fn io_mmu_load_callback_for_width(width: IntWidth) -> (HostCallback, CallbackSig
 
 fn io_mmu_store_callback_for_width(width: IntWidth) -> (HostCallback, CallbackSignature) {
     fn cast<T>(
-        f: unsafe extern "C" fn(*const IoMMU, *mut [TlbEntry; TLB_SIZE], u64, T) -> IoMmuStatus,
+        f: unsafe extern "C" fn(
+            &IoMMU<dyn ICache + '_>,
+            &mut [TlbEntry; TLB_SIZE],
+            u64,
+            T,
+        ) -> IoMmuStatus,
     ) -> unsafe extern "C" fn(...) {
         unsafe { std::mem::transmute(f) }
     }
@@ -509,7 +515,7 @@ enum StmtKind {
         elem_size: NonZero<usize>,
     },
 
-    IsNotNull(SSAValue),
+    PtrEq(SSAValue, SSAValue),
 
     HasTag {
         ptr: SSAValue,
@@ -887,7 +893,7 @@ impl ExecIrBuilder {
                 iter_from_arr([Type::HostPtr])
             }
 
-            StmtKind::IsNotNull(_) => iter_from_arr([Type::Bool]),
+            StmtKind::PtrEq(..) => iter_from_arr([Type::Bool]),
             StmtKind::HasTag { .. } => iter_from_arr([Type::Bool]),
             StmtKind::Untag { .. } => iter_from_arr([Type::HostPtr]),
 
@@ -1625,11 +1631,6 @@ struct FallbackAccess {
 }
 
 impl ExecIrBuilder {
-    fn ptr_is_not_null(&mut self, ptr: SSAValue) -> SSAValue {
-        assert_eq!(self.ssa_values[ptr].ty, Type::HostPtr);
-        unsafe { self.emit_1ret_stmt(StmtKind::IsNotNull(ptr)) }
-    }
-
     fn has_tag(&mut self, ptr: SSAValue, tag_bits: u8) -> SSAValue {
         assert_eq!(self.ssa_values[ptr].ty, Type::HostPtr);
         unsafe { self.emit_1ret_stmt(StmtKind::HasTag { ptr, tag_bits }) }
@@ -1714,24 +1715,22 @@ impl ExecIrBuilder {
             })
         };
 
-        let tlb_generation = unsafe {
+        let tlb_identifier = unsafe {
             self.emit_1ret_stmt(StmtKind::LoadHost {
-                ty: LoadType::Int(IntWidth::W64),
+                ty: LoadType::HostPtr,
                 base_ptr: tlb_entry_ptr,
-                offset: offset_of!(TlbEntry, generation),
+                offset: offset_of!(TlbEntry, tlb_identifier),
                 // tlb access is always valid; since there are always TLB_SIZE
                 // entries
                 can_move: true,
             })
         };
 
-        let io_mmu_generation_matches = self.icmp(
-            IntCmp::Equal,
-            SSAValue::ARG_IO_MMU_GENERATION,
-            tlb_generation,
-        );
+        let io_mmu_matches = unsafe {
+            self.emit_1ret_stmt(StmtKind::PtrEq(tlb_identifier, SSAValue::ARG_IO_MMU_IDENT))
+        };
 
-        self.assert_or_jmp_to(io_mmu_generation_matches, true, fallback_access.block);
+        self.assert_or_jmp_to(io_mmu_matches, true, fallback_access.block);
 
         let page_number_found = unsafe {
             self.emit_1ret_stmt(StmtKind::LoadHost {
@@ -1759,11 +1758,7 @@ impl ExecIrBuilder {
             })
         };
 
-        let is_mapped = self.ptr_is_not_null(tagged_page_ptr);
-
-        self.assert_or_jmp_to(is_mapped, true, fallback_access.block);
-
-        let page_offset = self.bitand_imm(vaddr, IConst::u64(PAGE_OFFSET_MASK));
+        let page_offset = self.bitand_imm(vaddr, IConst::u64(PAGE_OFFSET_MASK_U64));
 
         // a byte ptr only accesses the byte it is on and is always aligned
         if !matches!(width, IntWidth::W8) {
@@ -1785,7 +1780,7 @@ impl ExecIrBuilder {
         let op_allowed = self.has_tag(tagged_page_ptr, required_perms);
         self.assert_or_jmp_to(op_allowed, true, return_trap_block);
 
-        let aligned_page_ptr = self.untag_ptr(tagged_page_ptr, MemProt::all().bits());
+        let aligned_page_ptr = self.untag_ptr(tagged_page_ptr, MemProt::ALL.bits());
         let ret_value = {
             match access {
                 VmAccessKind::Load { .. } => Some(unsafe {

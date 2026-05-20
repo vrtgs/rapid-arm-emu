@@ -1,7 +1,6 @@
 use crate::armv9::{Armv9CpuCore, ProcessorState};
 use emu_abi::halt_reason::HaltReasonInner;
 use emu_abi::memory::HostPointer;
-use emu_abi::memory::PagePointer;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -51,11 +50,7 @@ impl CodeCache {
         todo!()
     }
 
-    pub fn invalidate_cached_page(&mut self, page: PagePointer) {
-        let range = page.as_range();
-        self.cache.retain(move |_entrypoint, block| {
-            let collides = range.start < block.addr.end && block.addr.start < range.end;
-            !collides
-        })
+    pub fn invalidate(&mut self) {
+        self.cache.clear()
     }
 }

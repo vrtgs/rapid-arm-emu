@@ -1,3 +1,6 @@
+[lints]
+workspace = true
+
 [package]
 # maybe armature later if I beat dynarmic
 name = "rapid-arm-emu"

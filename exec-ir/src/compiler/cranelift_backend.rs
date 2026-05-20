@@ -482,9 +482,12 @@ impl<'a> FunctionLowering<'a> {
                 array_helper::from_arr([out_ptr])
             }
 
-            StmtKind::IsNotNull(ptr) => {
-                let ptr = self.use_value(ptr)?;
-                let output = self.builder.ins().icmp_imm(IntCC::NotEqual, ptr, 0);
+            StmtKind::PtrEq(ptr_a, ptr_b) => {
+                let ptr_a = self.use_value(ptr_a)?;
+                let ptr_b = self.use_value(ptr_b)?;
+                self.assert_value_ty(ptr_a, self.ptr_ty, "PtrEq ptr_a")?;
+                self.assert_value_ty(ptr_b, self.ptr_ty, "PtrEq ptr_b")?;
+                let output = self.builder.ins().icmp(IntCC::Equal, ptr_a, ptr_b);
                 array_helper::from_arr([output])
             }
 

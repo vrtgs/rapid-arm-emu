@@ -117,7 +117,10 @@ impl AtomicHaltReason {
 impl AsFFI for AtomicHaltReason {
     type Inetrface<'a> = &'a AtomicU32;
 
-    fn as_ffi(&self) -> Self::Inetrface<'_> {
+    fn as_ffi<'a>(&'a self) -> Self::Inetrface<'a>
+    where
+        Self: 'a,
+    {
         &self.0
     }
 }

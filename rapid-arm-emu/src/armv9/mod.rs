@@ -1,7 +1,7 @@
 use crate::armv9::jit::CodeCache;
+use crate::io_mmu::IoMMU;
 use emu_abi::halt_reason::{AtomicHaltReason, HaltReason, HaltReasonInner};
 use emu_abi::processor_state::ProcessorState;
-use io_mmu::IoMMU;
 use parking_lot::Mutex;
 
 pub(crate) mod jit;
@@ -14,12 +14,6 @@ struct ExecutingState {
 impl ExecutingState {
     fn resume(&mut self, cpu: &Armv9CpuCore) -> HaltReasonInner {
         self.code_cache.run(&mut self.processor_state, cpu)
-    }
-
-    fn invalidate_instruction_cache(&mut self, cpu: &Armv9CpuCore) {
-        for dirty_range in cpu.mmu.drain_dirty_icache_pages() {
-            self.code_cache.invalidate_cached_page(dirty_range)
-        }
     }
 }
 
@@ -67,7 +61,8 @@ impl Armv9CpuCore {
             debug_assert!(!halt_reason.is_empty());
 
             if halt_reason.contains(HaltReasonInner::InvalidateInsnCache) {
-                state.invalidate_instruction_cache(self);
+                state.code_cache.invalidate();
+                self.mmu.flush_dirty_pages();
             }
 
             if let Some(reason) = HaltReason::from_inner(halt_reason) {
