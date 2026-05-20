@@ -1,81 +1,168 @@
 use crate::internal_traits::AsFFI;
+use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::num::NonZero;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    #[repr(transparent)]
-    pub struct HaltReasonInner: u32 {
-        // internal reasons; these don't override, and instead stack
-        // example one can step on an invalidate instruction cache instruction
-        // in that case we stopped for 2 reasons; 1st of all we have successfully stepped
-        // and second is that we invalidated the instruction cache
-        const Step                = 0x00_00_00_01;
-        const InvalidateInsnCache = 0x00_00_00_02;
-        // the top 16 bits are for the trap's code
-        // and the second byte represents the trap opcode
-        const TrapBits            = 0xFF_FF_FF_00;
-    }
-}
-
-impl HaltReasonInner {
-    fn merge_halt_reason(a: Self, b: Self) -> Self {
-        let internal_reasons = (a.bits() | b.bits()) & 0xFF;
-        let trap_mask = HaltReasonInner::TrapBits.bits();
-        let a_trap = a.bits() & trap_mask;
-        let b_trap = b.bits() & trap_mask;
-        let trap = std::hint::select_unpredictable(a_trap != 0, a_trap, b_trap);
-
-        Self::from_bits_retain(trap | internal_reasons)
-    }
-}
-
-const INVALID_INSN: NonZero<u8> = NonZero::new(1).unwrap();
-const UNALIGNED_PC: NonZero<u8> = NonZero::new(2).unwrap();
-const MEMORY_TRAP: NonZero<u8> = NonZero::new(3).unwrap();
-
-#[derive(Debug)] // TODO: better debug repr
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone)]
+#[repr(C, align(4))]
 pub struct HaltReason {
-    pub opcode: NonZero<u8>,
-    pub payload: u16,
+    pub opcode: NonZero<u16>,
+    pub metadata: u16,
+}
+
+impl fmt::Debug for HaltReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.opcode {
+            Self::OPCODE_FLUSH_INSN_CACHE => write!(f, "HaltReason::FlushInsnCache"),
+            Self::OPCODE_INVALID_INSN => write!(f, "HaltReason::InvalidInsn"),
+            Self::OPCODE_UNALIGNED_PC => write!(f, "HaltReason::UnalignedPc"),
+            Self::OPCODE_MEMORY_TRAP => {
+                write!(f, "HaltReason::MemoryTrap({} bytes)", self.metadata)
+            }
+            Self::OPCODE_IPI => write!(f, "HaltReason::Ipi({})", self.metadata),
+            _ => write!(
+                f,
+                "HaltReason::Unknown({:#06x}, {})",
+                self.opcode, self.metadata
+            ),
+        }
+    }
+}
+
+const _: () = {
+    assert!(size_of::<u32>() == 4);
+    assert!(size_of::<HaltReason>() == 4);
+    assert!(align_of::<HaltReason>() == 4);
+};
+
+impl HaltReason {
+    pub const fn as_nz_u32(self) -> NonZero<u32> {
+        unsafe { core::mem::transmute::<Self, NonZero<u32>>(self) }
+    }
+
+    pub const fn from_u32(bits: NonZero<u32>) -> Self {
+        unsafe { core::mem::transmute::<NonZero<u32>, Self>(bits) }
+    }
+}
+
+impl PartialEq for HaltReason {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_nz_u32() == other.as_nz_u32()
+    }
+}
+
+impl Eq for HaltReason {}
+
+impl PartialOrd for HaltReason {
+    #[inline(always)]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(Self::cmp(self, other))
+    }
+
+    #[inline(always)]
+    fn lt(&self, other: &Self) -> bool {
+        self.as_nz_u32() < other.as_nz_u32()
+    }
+
+    #[inline(always)]
+    fn le(&self, other: &Self) -> bool {
+        self.as_nz_u32() <= other.as_nz_u32()
+    }
+
+    #[inline(always)]
+    fn gt(&self, other: &Self) -> bool {
+        self.as_nz_u32() > other.as_nz_u32()
+    }
+
+    #[inline(always)]
+    fn ge(&self, other: &Self) -> bool {
+        self.as_nz_u32() >= other.as_nz_u32()
+    }
+}
+
+impl Ord for HaltReason {
+    #[inline(always)]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        <NonZero<u32> as Ord>::cmp(&self.as_nz_u32(), &other.as_nz_u32())
+    }
+
+    #[inline]
+    fn max(self, other: Self) -> Self {
+        let this = self.as_nz_u32();
+        let other = other.as_nz_u32();
+        let max = <NonZero<u32> as Ord>::max(this, other);
+        // SAFETY: The maximum of two trap codes is still a trap code.
+        Self::from_u32(max)
+    }
+
+    #[inline]
+    fn min(self, other: Self) -> Self {
+        let this = self.as_nz_u32();
+        let other = other.as_nz_u32();
+        let max = <NonZero<u32> as Ord>::min(this, other);
+        // SAFETY: The minimum of two trap codes is still a trap code.
+        Self::from_u32(max)
+    }
+
+    #[inline]
+    fn clamp(self, min: Self, max: Self) -> Self {
+        let this = self.as_nz_u32();
+        let min = min.as_nz_u32();
+        let max = max.as_nz_u32();
+        let clamped = <NonZero<u32> as Ord>::clamp(this, min, max);
+        // SAFETY: A trap code value clamped between two trap code values is still a trap code.
+        Self::from_u32(clamped)
+    }
+}
+
+impl Hash for HaltReason {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u32(self.as_nz_u32().get())
+    }
+
+    fn hash_slice<H: Hasher>(data: &[Self], state: &mut H)
+    where
+        Self: Sized,
+    {
+        const {
+            assert!(size_of::<Self>() == size_of::<u32>());
+            assert!(align_of::<Self>() >= align_of::<u32>());
+        }
+
+        let data = unsafe { core::slice::from_raw_parts(data.as_ptr().cast::<u32>(), data.len()) };
+
+        <u32 as Hash>::hash_slice(data, state)
+    }
 }
 
 impl HaltReason {
-    pub const fn new(opcode: NonZero<u8>, payload: u16) -> Self {
-        Self { opcode, payload }
+    #[inline(always)]
+    pub const fn new(opcode: NonZero<u16>, metadata: u16) -> Self {
+        Self { opcode, metadata }
     }
 
-    pub const INVALID_INSN: Self = Self {
-        opcode: INVALID_INSN,
-        payload: 0,
-    };
+    // Associated constants instead of module-level private consts
+    pub const OPCODE_INVALID_INSN: NonZero<u16> = NonZero::new(1).unwrap();
+    pub const OPCODE_FLUSH_INSN_CACHE: NonZero<u16> = NonZero::new(2).unwrap();
+    pub const OPCODE_UNALIGNED_PC: NonZero<u16> = NonZero::new(3).unwrap();
+    pub const OPCODE_MEMORY_TRAP: NonZero<u16> = NonZero::new(4).unwrap();
+    pub const OPCODE_IPI: NonZero<u16> = NonZero::new(5).unwrap();
 
-    pub const UNALIGNED_PC: Self = Self {
-        opcode: UNALIGNED_PC,
-        payload: 0,
-    };
+    pub const IPI_SYNC_TAG: u16 = 1;
 
-    pub const MEMORY_TRAP: Self = Self {
-        opcode: MEMORY_TRAP,
-        payload: 0,
-    };
-}
+    pub const FLUSH_INSN_CACHE: Self = Self::new(Self::OPCODE_FLUSH_INSN_CACHE, 0);
 
-impl HaltReason {
-    pub const fn from_inner(reason: HaltReasonInner) -> Option<Self> {
-        let bits = reason.bits();
-        let Some(opcode) = NonZero::new(((bits >> 8) & 0xFF) as u8) else {
-            return None;
-        };
-        let payload = (bits >> 16) as u16;
-        Some(Self { opcode, payload })
+    pub const INVALID_INSN: Self = Self::new(Self::OPCODE_INVALID_INSN, 0);
+
+    pub const UNALIGNED_PC: Self = Self::new(Self::OPCODE_UNALIGNED_PC, 0);
+
+    pub const fn memory_trap(access_size_in_bytes: u8) -> Self {
+        Self::new(Self::OPCODE_MEMORY_TRAP, access_size_in_bytes as u16)
     }
 
-    pub const fn into_inner(self) -> HaltReasonInner {
-        let bits = ((self.payload as u32) << 16) | ((self.opcode.get() as u32) << 8);
-        HaltReasonInner::from_bits_retain(bits)
-    }
+    pub const IPI_SYNC: Self = Self::new(Self::OPCODE_IPI, Self::IPI_SYNC_TAG);
 }
 
 pub struct AtomicHaltReason(AtomicU32);
@@ -87,37 +174,38 @@ impl Default for AtomicHaltReason {
 }
 
 impl AtomicHaltReason {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self(AtomicU32::new(0))
     }
 
-    #[inline]
-    pub fn add_reasons_full(&self, reason: HaltReasonInner) -> HaltReasonInner {
-        // CAS loop
-        // the lsb gets `or`ed and the top 24 bits get replaced
-        let bits = self.0.update(Ordering::Release, Ordering::Relaxed, |bits| {
-            let new_reason =
-                HaltReasonInner::merge_halt_reason(reason, HaltReasonInner::from_bits_retain(bits));
-
-            new_reason.bits()
-        });
-
-        HaltReasonInner::from_bits_retain(bits)
-    }
-
     pub fn halt(&self, reason: HaltReason) {
-        self.add_reasons_full(reason.into_inner());
+        self.0.store(reason.as_nz_u32().get(), Ordering::Release)
     }
 
-    pub fn take(&self) -> HaltReasonInner {
-        HaltReasonInner::from_bits_retain(self.0.swap(0, Ordering::AcqRel))
+    #[inline]
+    pub fn take(&self) -> Option<HaltReason> {
+        let bits = self.0.swap(0, Ordering::AcqRel);
+        NonZero::new(bits).map(HaltReason::from_u32)
+    }
+
+    /// Signals the CPU to trap if it isn't already halting
+    pub fn try_signal_sync(&self) -> bool {
+        let trap = const { HaltReason::IPI_SYNC.as_nz_u32() };
+        let res = self
+            .0
+            .compare_exchange(0, trap.get(), Ordering::AcqRel, Ordering::Acquire);
+
+        res.is_ok()
     }
 }
 
 impl AsFFI for AtomicHaltReason {
-    type Inetrface<'a> = &'a AtomicU32;
+    type Interface<'a> = &'a AtomicU32;
 
-    fn as_ffi(&self) -> Self::Inetrface<'_> {
+    fn as_ffi<'a>(&'a self) -> Self::Interface<'a>
+    where
+        Self: 'a,
+    {
         &self.0
     }
 }

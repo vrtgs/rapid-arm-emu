@@ -1,5 +1,5 @@
 use crate::helper::{call_compiled, compile, empty_io_mmu, run_full, run_success, store_x_const};
-use emu_abi::halt_reason::{HaltReason, HaltReasonInner};
+use emu_abi::halt_reason::HaltReason;
 use emu_abi::processor_state::ProcessorState;
 use exec_ir::{ExecIrBuilder, IConst, IntWidth, IrBuilderConfig, Terminator};
 use std::num::NonZero;
@@ -107,7 +107,7 @@ fn halts_inifnite_loop() {
 
     let expected_code = HaltReason {
         opcode: NonZero::new(121).unwrap(),
-        payload: 0xbeef,
+        metadata: 0xbeef,
     };
 
     let code = run_full(
@@ -117,13 +117,10 @@ fn halts_inifnite_loop() {
         |_processor_state, _io_mmu, halt_reason| {
             halt_reason.halt(expected_code);
         },
-        |_, _, halt| assert_eq!(halt.take().bits(), 0),
+        |_, _, halt| assert!(halt.take().is_none()),
     );
 
-    assert_eq!(
-        Some(expected_code),
-        HaltReason::from_inner(HaltReasonInner::from_bits_retain(code))
-    )
+    assert_eq!(expected_code.as_nz_u32().get(), code)
 }
 
 #[test]

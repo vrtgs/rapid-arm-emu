@@ -4,13 +4,33 @@
 )]
 
 use emu_abi::halt_reason::AtomicHaltReason;
-use emu_abi::memory::Tlb;
+use emu_abi::internal_traits::{ICache, InitInPlace};
+use emu_abi::memory::{PagePointer, Tlb};
 use emu_abi::processor_state::ProcessorState;
 use exec_ir::compiler::{CompileTier, CompiledExecChunk, ExecIrCompiler};
 use exec_ir::{ExecIrBuilder, IConst, IntCmp, SSAValue, Terminator};
-use io_mmu::IoMMU;
 use io_mmu::cpu_fabric::CpuFabric;
+use std::cell::RefCell;
+use std::mem::MaybeUninit;
 use std::sync::LazyLock;
+
+pub struct ICacheSink(());
+
+impl ICache for ICacheSink {
+    fn invalidate(&self, _: PagePointer) {}
+}
+
+unsafe impl InitInPlace for ICacheSink {
+    fn init(this: &mut MaybeUninit<Self>) -> &mut Self {
+        this.write(ICacheSink(()))
+    }
+}
+
+thread_local! {
+    pub static TLB: RefCell<Tlb> = const { RefCell::new(Tlb::new()) };
+}
+
+pub type IoMMU<T = ICacheSink> = io_mmu::IoMMU<T>;
 
 pub fn empty_io_mmu() -> IoMMU {
     IoMMU::new(CpuFabric::new())
@@ -23,20 +43,22 @@ pub fn compile(builder: ExecIrBuilder) -> CompiledExecChunk {
     COMPILER.compile(&builder.build(), CompileTier::Tier1)
 }
 
-pub fn call_compiled_full(
+pub fn call_compiled_full<T: ICache>(
     compiled: &CompiledExecChunk,
     processor_state: &mut ProcessorState,
-    io_mmu: &IoMMU,
-    setup: impl FnOnce(&mut ProcessorState, &IoMMU, &AtomicHaltReason),
-    post_process: impl FnOnce(&mut ProcessorState, &IoMMU, &AtomicHaltReason),
+    io_mmu: &IoMMU<T>,
+    setup: impl FnOnce(&mut ProcessorState, &IoMMU<T>, &AtomicHaltReason),
+    post_process: impl FnOnce(&mut ProcessorState, &IoMMU<T>, &AtomicHaltReason),
 ) -> u32 {
     let halt_reason = AtomicHaltReason::new();
     setup(processor_state, io_mmu, &halt_reason);
-    let tlb = &mut *Tlb::new_boxed();
-    // Safety: this is a new fresh Tlb so it has no entries filled already
-    let trap = unsafe { compiled.call(processor_state, tlb, &halt_reason, io_mmu) };
-    post_process(processor_state, io_mmu, &halt_reason);
-    trap
+
+    TLB.with_borrow_mut(|tlb| {
+        // FIXME VERY TEMPORARAY
+        let trap = compiled.call::<T>(processor_state, tlb, &halt_reason, io_mmu);
+        post_process(processor_state, io_mmu, &halt_reason);
+        trap
+    })
 }
 
 pub fn call_compiled(compiled: &CompiledExecChunk, processor_state: &mut ProcessorState) -> u32 {
@@ -49,21 +71,21 @@ pub fn call_compiled(compiled: &CompiledExecChunk, processor_state: &mut Process
     )
 }
 
-pub fn run_full(
+pub fn run_full<T: ICache>(
     builder: ExecIrBuilder,
     processor_state: &mut ProcessorState,
-    io_mmu: &IoMMU,
-    setup: impl FnOnce(&mut ProcessorState, &IoMMU, &AtomicHaltReason),
-    post_process: impl FnOnce(&mut ProcessorState, &IoMMU, &AtomicHaltReason),
+    io_mmu: &IoMMU<T>,
+    setup: impl FnOnce(&mut ProcessorState, &IoMMU<T>, &AtomicHaltReason),
+    post_process: impl FnOnce(&mut ProcessorState, &IoMMU<T>, &AtomicHaltReason),
 ) -> u32 {
     let compiled = compile(builder);
     call_compiled_full(&compiled, processor_state, io_mmu, setup, post_process)
 }
 
-pub fn run_with_mmu(
+pub fn run_with_mmu<T: ICache>(
     builder: ExecIrBuilder,
     processor_state: &mut ProcessorState,
-    io_mmu: &IoMMU,
+    io_mmu: &IoMMU<T>,
 ) -> u32 {
     run_full(builder, processor_state, io_mmu, |_, _, _| {}, |_, _, _| {})
 }

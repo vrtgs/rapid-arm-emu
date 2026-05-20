@@ -1,10 +1,8 @@
 use crate::armv9::{Armv9CpuCore, ProcessorState};
-use emu_abi::halt_reason::HaltReasonInner;
+use emu_abi::halt_reason::HaltReason;
 use emu_abi::memory::HostPointer;
-use emu_abi::memory::PagePointer;
 use std::collections::HashMap;
 use std::ops::Range;
-
 // this might seem wierd, but when compiling a basic block,
 // we might start from one place, and go back
 // like:
@@ -29,7 +27,7 @@ pub(crate) struct CodeBlock {
     /// This is used for cache invalidation, not for dispatch lookup.
     ///
     /// `start` is not guaranteed to be the entrypoint of the chunk.
-    addr: Range<HostPointer>,
+    _addr: Range<HostPointer>,
 
     _machine_code_handle: exec_ir::compiler::CompiledExecChunk,
 }
@@ -47,15 +45,11 @@ impl CodeCache {
         }
     }
 
-    pub fn run(&mut self, _state: &mut ProcessorState, _cpu: &Armv9CpuCore) -> HaltReasonInner {
+    pub fn run(&mut self, _state: &mut ProcessorState, _cpu: &Armv9CpuCore) -> Option<HaltReason> {
         todo!()
     }
 
-    pub fn invalidate_cached_page(&mut self, page: PagePointer) {
-        let range = page.as_range();
-        self.cache.retain(move |_entrypoint, block| {
-            let collides = range.start < block.addr.end && block.addr.start < range.end;
-            !collides
-        })
+    pub fn invalidate(&mut self) {
+        self.cache.clear()
     }
 }

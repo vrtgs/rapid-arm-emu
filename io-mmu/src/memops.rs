@@ -1,3 +1,12 @@
+//! FIXME/SOUNDNESS:
+//! This memory backend relies on mixed-size atomic accesses that are currently
+//! UB under Rust's memory model, although current rustc/LLVM codegen preserves
+//! the intended hardware behavior on supported targets as of rust 1.95.0.
+//!
+//! This is accepted for the initial 0.0.x emulator backend. The implementation
+//! is intentionally isolated in `memops` so it can be replaced by a sound
+//! backend if Rust does not legalize mixed-size atomics.
+
 #![allow(
     clippy::cast_possible_truncation,
     reason = "all truncation here is actually handled,\
@@ -7,14 +16,7 @@
 use std::hint::cold_path;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
-// FIXME: currently, the live implementation UB, it just happens to work for rust 1.95.0,
-//        but mixed sized atomic access is UB, and I am explictly doing UB
-//        if it ever stops being UB, thats GREAT, otherwise, this needs to be fixed
-//        which is quite easy with decentish performance as is commented out
-//        this makes FFI with the JIT code a pain, doable but a pain,
-//        not to mention performance tanks, this is also a basic impl with global locks,
-//        perferably this should actually be done with the locks coming from CpuFabric
-
+// example sound impl of memops
 // use crossbeam_utils::CachePadded;
 // // use a Mersenne prime so that collisions are more rare
 // const SHARDED_LOCK_COUNT: usize = 127;

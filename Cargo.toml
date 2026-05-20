@@ -2,6 +2,11 @@
 resolver = "3"
 members = ["code-generator", "emu-abi", "exec-ir", "io-mmu", "rapid-arm-emu"]
 
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+
 [workspace.dependencies]
 parking_lot = { version = "0.12.5", features = ["hardware-lock-elision"] }
 crossbeam-utils = "0.8.21"
@@ -10,6 +15,7 @@ smallvec = "2.0.0-alpha.12"
 thiserror = "2.0.18"
 anyhow = "1.0.102"
 pastey = "0.2.2"
+rpds = "1.2.0"
 
 # internal crates
 emu-abi = { path = "./emu-abi" }

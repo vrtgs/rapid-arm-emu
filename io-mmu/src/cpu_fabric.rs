@@ -12,9 +12,10 @@
 
 use crate::HostPointer;
 use crossbeam_utils::CachePadded;
+use emu_abi::internal_traits::{CpuFabricPrivate, ICache, InitInPlace};
 use emu_abi::memory::{CACHE_LINE_SHIFT, CACHE_LINE_SIZE};
 use parking_lot::Mutex;
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::sync::Arc;
 
 const BUCKET_COUNT: u16 = 257;
@@ -118,8 +119,8 @@ pub struct ExclusiveMonitor {
     reservations: [CachePadded<Mutex<ReservationSlot>>; BUCKET_COUNT as usize],
 }
 
-impl ExclusiveMonitor {
-    pub fn init(this: &mut MaybeUninit<Self>) -> &mut Self {
+unsafe impl InitInPlace for ExclusiveMonitor {
+    fn init(this: &mut MaybeUninit<Self>) -> &mut Self {
         unsafe {
             let ptr = this.as_mut_ptr();
             for i in 0..BUCKET_COUNT {
@@ -135,13 +136,9 @@ impl ExclusiveMonitor {
             this.assume_init_mut()
         }
     }
+}
 
-    pub fn new_arc() -> Arc<Self> {
-        let mut uninit = Arc::new_uninit();
-        Self::init(Arc::get_mut(&mut uninit).unwrap());
-        unsafe { uninit.assume_init() }
-    }
-
+impl ExclusiveMonitor {
     #[must_use]
     pub fn ldrex(
         &self,
@@ -185,37 +182,118 @@ impl ExclusiveMonitor {
     }
 }
 
-#[derive(Clone)]
-#[repr(transparent)]
-pub struct CpuFabric(Arc<ExclusiveMonitor>);
+// dirty page manager
+struct CpuFabricInner<T: ?Sized + ICache> {
+    monitor: ExclusiveMonitor,
+    instruction_cache: T,
+}
 
-impl CpuFabric {
-    pub fn new() -> Self {
-        Self(ExclusiveMonitor::new_arc())
+#[repr(transparent)]
+pub struct CpuFabric<T: ?Sized + ICache>(Arc<CpuFabricInner<T>>);
+
+impl<T: Sized + ICache> CpuFabric<T> {
+    pub(crate) fn into_dyn<'a>(self) -> CpuFabric<dyn ICache + 'a>
+    where
+        T: 'a,
+    {
+        CpuFabric(self.0)
     }
 }
 
-impl Default for CpuFabric {
+impl<T: ?Sized + ICache> Clone for CpuFabric<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T: ICache + InitInPlace> Default for CpuFabric<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl PartialEq for CpuFabric {
+impl<T: ICache> CpuFabric<T> {
+    pub fn new() -> Self
+    where
+        T: InitInPlace,
+    {
+        macro_rules! impl_init_in_place {
+            (@{ folded } $($field: ident: $ty: ty),*) => {{
+                fn _assert_all_fields_mentioned_and_unique<T: ICache>(inner: &CpuFabricInner<T>) {
+                    let CpuFabricInner { $($field),* } = inner;
+                    $(let _: &$ty = $field;)*
+                }
+
+                struct InitGuard<'a, T>(&'a mut ManuallyDrop<T>);
+
+                impl<T> Drop for InitGuard<'_, T> {
+                    fn drop(&mut self) {
+                        unsafe { ManuallyDrop::<T>::drop(self.0) }
+                    }
+                }
+
+                let mut arc: Arc<MaybeUninit<CpuFabricInner<T>>> = Arc::new_uninit();
+                let init_mut: &mut MaybeUninit<CpuFabricInner<T>> = Arc::get_mut(&mut arc).unwrap();
+
+                let init_ptr: *mut CpuFabricInner<T> = init_mut.as_mut_ptr();
+
+                $(let $field: InitGuard<$ty> = {
+                    let ptr: *mut $ty = unsafe { &raw mut ((*init_ptr).$field) };
+                    let maybe_uninit_ref: &mut MaybeUninit<$ty> = unsafe {
+                        ptr.cast::<MaybeUninit<$ty>>().as_mut_unchecked()
+                    };
+                    let init_ref: &mut $ty = <$ty as InitInPlace>::init(maybe_uninit_ref);
+                    let manualy_drop: &mut ManuallyDrop<$ty> = unsafe {
+                        &mut *(init_ref as *mut $ty as *mut ManuallyDrop<$ty>)
+                    };
+
+                    InitGuard(manualy_drop)
+                };)*
+
+                $(std::mem::forget($field);)*
+
+                unsafe { arc.assume_init() }
+            }};
+            () => { impl_init_in_place!(@{ folded }) };
+            ($($field: ident : $ty: ty),+ $(,)?) => {
+                impl_init_in_place!(@{ folded } $($field: $ty),*)
+            }
+        }
+
+        let inner = impl_init_in_place! {
+            monitor: ExclusiveMonitor,
+            instruction_cache: T,
+        };
+
+        CpuFabric(inner)
+    }
+}
+
+impl<T: ICache> PartialEq for CpuFabric<T> {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
-impl Eq for CpuFabric {}
+impl<T: ICache> Eq for CpuFabric<T> {}
 
 const _: () = {
-    const fn is_sync<T: Sync>() {}
-    const fn is_send<T: Send>() {}
+    fn _assert_cpu_fabric_send_sync<T: ICache + Send + Sync>() {
+        const fn is_sync<T: Sync>() {}
+        const fn is_send<T: Send>() {}
 
-    is_sync::<CpuFabric>();
-    is_send::<CpuFabric>();
+        is_send::<CpuFabric<T>>();
+        is_sync::<CpuFabric<T>>();
+    }
 };
+
+impl<T: ?Sized + ICache> CpuFabricPrivate for CpuFabric<T> {
+    type ICache = T;
+
+    fn icache(&self) -> &Self::ICache {
+        &self.0.instruction_cache
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -265,6 +343,12 @@ mod tests {
         }
     }
 
+    pub fn new_arc_monitor() -> std::sync::Arc<ExclusiveMonitor> {
+        let mut uninit = std::sync::Arc::new_uninit();
+        ExclusiveMonitor::init(std::sync::Arc::get_mut(&mut uninit).unwrap());
+        unsafe { uninit.assume_init() }
+    }
+
     #[test]
     fn test_exclusive_monitor() {
         if cfg!(miri) {
@@ -272,7 +356,7 @@ mod tests {
         }
 
         loom::model(move || {
-            let monitor = Arc::from_std(ExclusiveMonitor::new_arc());
+            let monitor = Arc::from_std(new_arc_monitor());
             let memory = Arc::new(Mutex::new(0_u32));
             let barrier = Arc::new(Barrier::new(2));
 

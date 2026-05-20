@@ -1,14 +1,17 @@
 use crate::helper::{
-    call_compiled_full, compile, run_with_mmu, store_int_equals_as_x_reg, u64_const,
+    TLB, call_compiled_full, compile, run_with_mmu, store_int_equals_as_x_reg, u64_const,
 };
-use emu_abi::halt_reason::{HaltReason, HaltReasonInner};
-use emu_abi::memory::{MemProt, PAGE_SIZE, TLB_SIZE};
+use emu_abi::halt_reason::HaltReason;
+use emu_abi::internal_traits::{CpuFabricPrivate, ICache, InitInPlace};
+use emu_abi::memory::{MemProt, PAGE_SIZE, PAGE_SIZE_U64, PagePointer, TLB_SIZE};
 use emu_abi::processor_state::ProcessorState;
 use exec_ir::{ExecIrBuilder, IConst, IntCmp, IntWidth};
-use io_mmu::IoMMU;
+use io_mmu::NoCache;
 use io_mmu::cpu_fabric::CpuFabric;
-use std::alloc::Layout;
-use std::ptr::NonNull;
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::mem::MaybeUninit;
+use std::num::NonZero;
 
 mod helper;
 
@@ -27,137 +30,79 @@ fn vm_pattern_array<const N: usize>(start: usize) -> [u8; N] {
     std::array::from_fn(|i| vm_pattern_byte(start.wrapping_add(i)))
 }
 
-struct VmPageBacking {
-    ptr: NonNull<u8>,
-    len: usize,
-}
+struct ICacheSink(RefCell<HashSet<PagePointer>>);
 
-impl Drop for VmPageBacking {
-    fn drop(&mut self) {
-        unsafe {
-            std::alloc::dealloc(
-                self.ptr.as_ptr(),
-                Layout::from_size_align_unchecked(self.len, PAGE_SIZE),
-            );
-        }
+impl ICache for ICacheSink {
+    fn invalidate(&self, page: PagePointer) {
+        self.0.borrow_mut().insert(page);
     }
 }
 
-impl VmPageBacking {
-    fn new(pages: usize) -> Self {
-        assert!(pages > 0);
-
-        let len = pages.strict_mul(PAGE_SIZE);
-        let layout = Layout::from_size_align(len, PAGE_SIZE).unwrap();
-
-        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
-        let ptr = NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
-
-        Self { ptr, len }
-    }
-
-    fn get_page(&mut self, page: usize) -> &mut [u8; PAGE_SIZE] {
-        let index = page.checked_mul(PAGE_SIZE).unwrap();
-        assert!(index < self.len);
-
-        unsafe { &mut *self.ptr.as_ptr().add(index).cast() }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+unsafe impl InitInPlace for ICacheSink {
+    fn init(this: &mut MaybeUninit<Self>) -> &mut Self {
+        this.write(ICacheSink(RefCell::new(HashSet::new())))
     }
 }
 
-struct VmFixture {
-    mmu: IoMMU,
-    _backing: VmPageBacking,
-}
+type IoMMU = io_mmu::IoMMU<ICacheSink>;
 
-impl VmFixture {
-    fn new(pages: usize, protections: MemProt) -> Self {
-        Self::with_bytes(pages, protections, |_| 0)
-    }
+fn iommu_with_sparse_page_protections_and_bytes(
+    protections: &[(usize, MemProt)],
+    mut byte: impl FnMut(usize, usize) -> u8,
+) -> IoMMU {
+    assert!(!protections.is_empty());
 
-    fn with_bytes(pages: usize, protections: MemProt, byte: impl FnMut(usize) -> u8) -> Self {
-        let protections = vec![protections; pages];
-        Self::with_page_protections_and_bytes(&protections, byte)
-    }
+    let mut mmu = IoMMU::new(CpuFabric::new());
+    let page_size = u64::try_from(PAGE_SIZE).unwrap();
 
-    fn with_page_protections_and_bytes(
-        protections: &[MemProt],
-        mut byte: impl FnMut(usize) -> u8,
-    ) -> Self {
-        assert!(!protections.is_empty());
+    let mut needs_flush = false;
 
-        let mut backing = VmPageBacking::new(protections.len());
+    for &(page, protections) in protections {
+        let base = vm_page_addr(page);
+        mmu.map(base, page_size, protections).unwrap();
 
-        for (i, dst) in backing.as_mut_slice().iter_mut().enumerate() {
-            *dst = byte(i);
-        }
+        let mut needs_store = false;
+        let page = std::array::from_fn::<u8, PAGE_SIZE, _>(|i| {
+            let byte = byte(page, i);
+            needs_store |= byte != 0;
+            byte
+        });
 
-        let mut mmu = IoMMU::new(CpuFabric::new());
-        let page_size = u64::try_from(PAGE_SIZE).unwrap();
-
-        for (page, protections) in protections.iter().copied().enumerate() {
-            unsafe {
-                mmu.map_memory(
-                    vm_page_addr(page),
-                    backing.get_page(page).as_mut_ptr(),
-                    page_size,
-                    protections,
-                )
-                .unwrap();
+        if needs_store {
+            TLB.with_borrow_mut(|tlb| {
+                mmu.store_force(tlb, base, &page).unwrap();
+            });
+            if protections.contains(MemProt::EXECUTE) {
+                needs_flush = true;
             }
         }
-
-        Self {
-            mmu,
-            _backing: backing,
-        }
     }
+
+    if needs_flush {
+        mmu.flush_dirty_pages();
+        mmu.get_fabric().icache().0.borrow_mut().clear();
+    }
+
+    mmu
 }
 
-struct SparseVmFixture {
-    mmu: IoMMU,
-    _backing: Vec<VmPageBacking>,
+fn iommu_with_page_protections_and_bytes(
+    protections: &[MemProt],
+    mut byte: impl FnMut(usize) -> u8,
+) -> IoMMU {
+    iommu_with_sparse_page_protections_and_bytes(
+        &protections.iter().copied().enumerate().collect::<Vec<_>>(),
+        |page, i| byte(page.strict_mul(PAGE_SIZE).strict_add(i)),
+    )
 }
 
-impl SparseVmFixture {
-    fn with_mapped_pages_and_bytes(
-        pages: &[(usize, MemProt)],
-        mut byte: impl FnMut(usize, usize) -> u8,
-    ) -> Self {
-        assert!(!pages.is_empty());
+fn iommu_with_bytes(pages: usize, protections: MemProt, byte: impl FnMut(usize) -> u8) -> IoMMU {
+    let protections = (0..pages).map(|_| protections).collect::<Vec<_>>();
+    iommu_with_page_protections_and_bytes(&protections, byte)
+}
 
-        let mut mmu = IoMMU::new(CpuFabric::new());
-        let mut backing = Vec::with_capacity(pages.len());
-        let page_size = u64::try_from(PAGE_SIZE).unwrap();
-
-        for &(page, protections) in pages {
-            let mut page_backing = VmPageBacking::new(1);
-
-            for (offset, dst) in page_backing.as_mut_slice().iter_mut().enumerate() {
-                *dst = byte(page, offset);
-            }
-
-            unsafe {
-                mmu.map_memory(
-                    vm_page_addr(page),
-                    page_backing.get_page(0).as_mut_ptr(),
-                    page_size,
-                    protections,
-                )
-                .unwrap();
-            }
-
-            backing.push(page_backing);
-        }
-
-        Self {
-            mmu,
-            _backing: backing,
-        }
-    }
+fn new_iommu(pages: usize, protections: MemProt) -> IoMMU {
+    iommu_with_bytes(pages, protections, |_| 0)
 }
 
 fn run_success_with_mmu(
@@ -168,11 +113,14 @@ fn run_success_with_mmu(
     assert_eq!(run_with_mmu(builder, processor_state, io_mmu), 0);
 }
 
+#[track_caller]
+#[inline(always)]
 fn assert_memory_trap(code: u32) {
-    assert_eq!(
-        Some(HaltReason::MEMORY_TRAP),
-        HaltReason::from_inner(HaltReasonInner::from_bits_retain(code))
-    );
+    let code = NonZero::new(code)
+        .map(HaltReason::from_u32)
+        .map(|reason| reason.opcode);
+
+    assert_eq!(Some(HaltReason::OPCODE_MEMORY_TRAP), code);
 }
 
 #[test]
@@ -183,10 +131,10 @@ fn vm_load64_reads_mapped_memory_after_tlb_miss() {
     let loaded = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let fixture = VmFixture::with_bytes(1, MemProt::READ | MemProt::WRITE, vm_pattern_byte);
+    let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_pattern_byte);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(
         state.x_registers[0],
@@ -202,12 +150,12 @@ fn vm_store64_writes_mapped_memory_after_tlb_miss() {
     let value = builder.iconst(IConst::u64(0x0123_4567_89ab_cdef));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE);
+    let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
-    assert_eq!(fixture.mmu.load64_le(16).unwrap(), 0x0123_4567_89ab_cdef,);
+    assert_eq!(mmu.load64_le(NoCache, 16).unwrap(), 0x0123_4567_89ab_cdef,);
 }
 
 #[test]
@@ -222,10 +170,10 @@ fn vm_unaligned_load32_uses_iommu_fallback() {
         IConst::u32(u32::from_le_bytes(vm_pattern_array::<4>(3))),
     );
 
-    let fixture = VmFixture::with_bytes(1, MemProt::READ | MemProt::WRITE, vm_pattern_byte);
+    let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_pattern_byte);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(state.x_registers[0], 1);
 }
@@ -238,12 +186,12 @@ fn vm_unaligned_store32_uses_iommu_fallback() {
     let value = builder.iconst(IConst::u32(0x89ab_cdef));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE);
+    let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
-    assert_eq!(fixture.mmu.load32_le(3).unwrap(), 0x89ab_cdef);
+    assert_eq!(mmu.load32_le(NoCache, 3).unwrap(), 0x89ab_cdef);
 }
 
 #[test]
@@ -260,10 +208,10 @@ fn vm_cross_page_load64_uses_iommu_fallback() {
         IConst::u64(u64::from_le_bytes(vm_pattern_array::<8>(PAGE_SIZE - 4))),
     );
 
-    let fixture = VmFixture::with_bytes(2, MemProt::READ | MemProt::WRITE, vm_pattern_byte);
+    let mmu = iommu_with_bytes(2, MemProt::READ | MemProt::WRITE, vm_pattern_byte);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(state.x_registers[0], 1);
 }
@@ -277,12 +225,15 @@ fn vm_cross_page_store64_uses_iommu_fallback() {
     let value = builder.iconst(IConst::u64(0x0123_4567_89ab_cdef));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::new(2, MemProt::READ | MemProt::WRITE);
+    let mmu = new_iommu(2, MemProt::READ | MemProt::WRITE);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
-    assert_eq!(fixture.mmu.load64_le(start).unwrap(), 0x0123_4567_89ab_cdef,);
+    assert_eq!(
+        mmu.load64_le(NoCache, start).unwrap(),
+        0x0123_4567_89ab_cdef,
+    );
 }
 
 #[test]
@@ -311,11 +262,11 @@ fn vm_load_traps_on_missing_read_permission() {
     let loaded = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let fixture = VmFixture::new(1, MemProt::WRITE);
+    let mmu = new_iommu(1, MemProt::WRITE);
     let mut state = ProcessorState::initial();
     state.x_registers[0] = 0xfeed_face;
 
-    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
+    let code = run_with_mmu(builder, &mut state, &mmu);
 
     assert_memory_trap(code);
     assert_eq!(state.x_registers[0], 0xfeed_face);
@@ -329,14 +280,14 @@ fn vm_store_traps_on_missing_write_permission_and_does_not_modify_memory() {
     let value = builder.iconst(IConst::u64(0x0123_4567_89ab_cdef));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::with_bytes(1, MemProt::READ, vm_pattern_byte);
+    let mmu = iommu_with_bytes(1, MemProt::READ, vm_pattern_byte);
     let expected = u64::from_le_bytes(vm_pattern_array::<8>(8));
 
     let mut state = ProcessorState::initial();
-    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
-
+    let code = run_with_mmu(builder, &mut state, &mmu);
     assert_memory_trap(code);
-    assert_eq!(fixture.mmu.load64_le(8).unwrap(), expected);
+
+    assert_eq!(mmu.load64_le(NoCache, 8).unwrap(), expected);
 }
 
 #[test]
@@ -405,10 +356,10 @@ fn vm_aligned_fast_path_loads_all_widths_from_page0_nonzero_offsets() {
     let value = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<3>(value);
 
-    let fixture = VmFixture::with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
+    let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(state.x_registers[0], 1);
     assert_eq!(state.x_registers[1], 1);
@@ -439,15 +390,17 @@ fn vm_aligned_fast_path_stores_all_widths_to_page0_nonzero_offsets() {
     let value = builder.iconst(IConst::u64(0x0123_4567_89ab_cdef));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE);
+    let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
-    assert_eq!(fixture.mmu.load_byte(1).unwrap(), 0xa7);
-    assert_eq!(fixture.mmu.load16_le(2).unwrap(), 0xb8c9);
-    assert_eq!(fixture.mmu.load32_le(4).unwrap(), 0xdade_beef);
-    assert_eq!(fixture.mmu.load64_le(8).unwrap(), 0x0123_4567_89ab_cdef);
+    TLB.with_borrow_mut(|tlb| {
+        assert_eq!(mmu.load_byte(&mut *tlb, 1).unwrap(), 0xa7);
+        assert_eq!(mmu.load16_le(&mut *tlb, 2).unwrap(), 0xb8c9);
+        assert_eq!(mmu.load32_le(&mut *tlb, 4).unwrap(), 0xdade_beef);
+        assert_eq!(mmu.load64_le(&mut *tlb, 8).unwrap(), 0x0123_4567_89ab_cdef);
+    });
 }
 
 #[test]
@@ -461,10 +414,10 @@ fn vm_tlb_hit_load_uses_cached_entry_for_same_page_and_offset() {
     let loaded = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let fixture = VmFixture::with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
+    let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(
         state.x_registers[0],
@@ -486,7 +439,7 @@ fn vm_tlb_collision_load_does_not_reuse_different_virtual_page_entry() {
     let alias_loaded = builder.vm_load(alias_addr, IntWidth::W64);
     builder.store_x_reg::<1>(alias_loaded);
 
-    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+    let mmu = iommu_with_sparse_page_protections_and_bytes(
         &[
             (0, MemProt::READ | MemProt::WRITE),
             (alias_page, MemProt::READ | MemProt::WRITE),
@@ -495,7 +448,7 @@ fn vm_tlb_collision_load_does_not_reuse_different_virtual_page_entry() {
     );
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(
         state.x_registers[0],
@@ -524,7 +477,7 @@ fn vm_tlb_collision_store_does_not_write_through_different_virtual_page_entry() 
     let alias_value = builder.iconst(IConst::u64(0xaaaa_bbbb_cccc_dddd));
     builder.vm_store(alias_addr, alias_value);
 
-    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+    let mmu = iommu_with_sparse_page_protections_and_bytes(
         &[
             (0, MemProt::READ | MemProt::WRITE),
             (alias_page, MemProt::READ | MemProt::WRITE),
@@ -533,16 +486,18 @@ fn vm_tlb_collision_store_does_not_write_through_different_virtual_page_entry() 
     );
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
-    assert_eq!(
-        fixture.mmu.load64_le(vm_page_addr(0)).unwrap(),
-        0x1111_2222_3333_4444,
-    );
-    assert_eq!(
-        fixture.mmu.load64_le(vm_page_addr(alias_page)).unwrap(),
-        0xaaaa_bbbb_cccc_dddd,
-    );
+    TLB.with_borrow_mut(|tlb| {
+        assert_eq!(
+            mmu.load64_le(&mut *tlb, vm_page_addr(0)).unwrap(),
+            0x1111_2222_3333_4444,
+        );
+        assert_eq!(
+            mmu.load64_le(&mut *tlb, vm_page_addr(alias_page)).unwrap(),
+            0xaaaa_bbbb_cccc_dddd,
+        );
+    });
 }
 
 #[test]
@@ -557,14 +512,14 @@ fn vm_tlb_collision_load_to_unmapped_page_traps_instead_of_reusing_old_entry() {
     let loaded = builder.vm_load(alias_addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+    let mmu = iommu_with_sparse_page_protections_and_bytes(
         &[(0, MemProt::READ | MemProt::WRITE)],
         |page, offset| tlb_collision_byte(page, offset, alias_page),
     );
     let mut state = ProcessorState::initial();
     state.x_registers[0] = 0x1234_5678_9abc_def0;
 
-    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
+    let code = run_with_mmu(builder, &mut state, &mmu);
 
     assert_memory_trap(code);
     assert_eq!(state.x_registers[0], 0x1234_5678_9abc_def0);
@@ -583,19 +538,19 @@ fn vm_tlb_collision_store_to_unmapped_page_traps_instead_of_reusing_old_entry() 
     let alias_value = builder.iconst(IConst::u64(0xaaaa_bbbb_cccc_dddd));
     builder.vm_store(alias_addr, alias_value);
 
-    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+    let mmu = iommu_with_sparse_page_protections_and_bytes(
         &[(0, MemProt::READ | MemProt::WRITE)],
         |page, offset| tlb_collision_byte(page, offset, alias_page),
     );
-    let page0_before = fixture.mmu.load64_le(vm_page_addr(0)).unwrap();
+    let page0_before = TLB.with_borrow_mut(|tlb| mmu.load64_le(tlb, vm_page_addr(0)).unwrap());
     let mut state = ProcessorState::initial();
 
-    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
+    let code = run_with_mmu(builder, &mut state, &mmu);
 
     assert_memory_trap(code);
     assert_eq!(
-        fixture.mmu.load64_le(vm_page_addr(0)).unwrap(),
-        page0_before
+        TLB.with_borrow_mut(|tlb| mmu.load64_le(tlb, vm_page_addr(0)).unwrap()),
+        page0_before,
     );
 }
 
@@ -611,7 +566,7 @@ fn vm_tlb_collision_load_permission_check_uses_colliding_target_page() {
     let loaded = builder.vm_load(alias_addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+    let mmu = iommu_with_sparse_page_protections_and_bytes(
         &[
             (0, MemProt::READ | MemProt::WRITE),
             (alias_page, MemProt::WRITE),
@@ -622,7 +577,7 @@ fn vm_tlb_collision_load_permission_check_uses_colliding_target_page() {
     let mut state = ProcessorState::initial();
     state.x_registers[0] = 0x1111_2222_3333_4444;
 
-    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
+    let code = run_with_mmu(builder, &mut state, &mmu);
 
     assert_memory_trap(code);
     assert_eq!(state.x_registers[0], 0x1111_2222_3333_4444);
@@ -641,7 +596,7 @@ fn vm_tlb_collision_store_permission_check_uses_colliding_target_page() {
     let alias_value = builder.iconst(IConst::u64(0xaaaa_bbbb_cccc_dddd));
     builder.vm_store(alias_addr, alias_value);
 
-    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+    let mmu = iommu_with_sparse_page_protections_and_bytes(
         &[
             (0, MemProt::READ | MemProt::WRITE),
             (alias_page, MemProt::READ),
@@ -651,20 +606,26 @@ fn vm_tlb_collision_store_permission_check_uses_colliding_target_page() {
 
     let mut state = ProcessorState::initial();
 
-    let page0_before = fixture.mmu.load64_le(vm_page_addr(0)).unwrap();
-    let alias_before = fixture.mmu.load64_le(vm_page_addr(alias_page)).unwrap();
+    let (page0_before, alias_before) = TLB.with_borrow_mut(|tlb| {
+        let page0_before = mmu.load64_le(&mut *tlb, vm_page_addr(0)).unwrap();
+        let alias_before = mmu.load64_le(&mut *tlb, vm_page_addr(alias_page)).unwrap();
 
-    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
+        (page0_before, alias_before)
+    });
 
+    let code = run_with_mmu(builder, &mut state, &mmu);
     assert_memory_trap(code);
-    assert_eq!(
-        fixture.mmu.load64_le(vm_page_addr(0)).unwrap(),
-        page0_before
-    );
-    assert_eq!(
-        fixture.mmu.load64_le(vm_page_addr(alias_page)).unwrap(),
-        alias_before,
-    );
+
+    TLB.with_borrow_mut(|tlb| {
+        assert_eq!(
+            mmu.load64_le(&mut *tlb, vm_page_addr(0)).unwrap(),
+            page0_before
+        );
+        assert_eq!(
+            mmu.load64_le(&mut *tlb, vm_page_addr(alias_page)).unwrap(),
+            alias_before,
+        );
+    });
 }
 
 #[test]
@@ -676,10 +637,10 @@ fn vm_tlb_hit_load_uses_page_number_not_zero_for_page1_offset0() {
     let loaded = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let fixture = VmFixture::with_bytes(2, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
+    let mmu = iommu_with_bytes(2, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(
         state.x_registers[0],
@@ -697,16 +658,18 @@ fn vm_tlb_hit_store_uses_page_number_not_zero_for_page1_offset0() {
     let value = builder.iconst(IConst::u64(0xfeed_face_cafe_beef));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::new(2, MemProt::READ | MemProt::WRITE);
+    let mmu = new_iommu(2, MemProt::READ | MemProt::WRITE);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
-    assert_eq!(fixture.mmu.load64_le(vm_page_addr(0)).unwrap(), 0);
-    assert_eq!(
-        fixture.mmu.load64_le(vm_page_addr(1)).unwrap(),
-        0xfeed_face_cafe_beef,
-    );
+    TLB.with_borrow_mut(|tlb| {
+        assert_eq!(mmu.load64_le(&mut *tlb, vm_page_addr(0)).unwrap(), 0);
+        assert_eq!(
+            mmu.load64_le(&mut *tlb, vm_page_addr(1)).unwrap(),
+            0xfeed_face_cafe_beef,
+        );
+    });
 }
 
 #[test]
@@ -736,10 +699,10 @@ fn vm_fast_path_load_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
     let value = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<2>(value);
 
-    let fixture = VmFixture::with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
+    let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(state.x_registers[0], 1);
     assert_eq!(state.x_registers[1], 1);
@@ -759,15 +722,13 @@ fn vm_fast_path_store_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
         let value = builder.iconst(IConst::u16(0x1234));
         builder.vm_store(addr, value);
 
-        let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE);
+        let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
         let mut state = ProcessorState::initial();
 
-        run_success_with_mmu(builder, &mut state, &fixture.mmu);
+        run_success_with_mmu(builder, &mut state, &mmu);
 
         assert_eq!(
-            fixture
-                .mmu
-                .load16_le(u64::try_from(start).unwrap())
+            mmu.load16_le(NoCache, u64::try_from(start).unwrap())
                 .unwrap(),
             0x1234,
         );
@@ -781,15 +742,13 @@ fn vm_fast_path_store_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
         let value = builder.iconst(IConst::u32(0x4567_89ab));
         builder.vm_store(addr, value);
 
-        let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE);
+        let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
         let mut state = ProcessorState::initial();
 
-        run_success_with_mmu(builder, &mut state, &fixture.mmu);
+        run_success_with_mmu(builder, &mut state, &mmu);
 
         assert_eq!(
-            fixture
-                .mmu
-                .load32_le(u64::try_from(start).unwrap())
+            mmu.load32_le(NoCache, u64::try_from(start).unwrap())
                 .unwrap(),
             0x4567_89ab,
         );
@@ -803,15 +762,13 @@ fn vm_fast_path_store_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
         let value = builder.iconst(IConst::u64(0x0123_4567_89ab_cdef));
         builder.vm_store(addr, value);
 
-        let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE);
+        let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
         let mut state = ProcessorState::initial();
 
-        run_success_with_mmu(builder, &mut state, &fixture.mmu);
+        run_success_with_mmu(builder, &mut state, &mmu);
 
         assert_eq!(
-            fixture
-                .mmu
-                .load64_le(u64::try_from(start).unwrap())
+            mmu.load64_le(NoCache, u64::try_from(start).unwrap())
                 .unwrap(),
             0x0123_4567_89ab_cdef,
         );
@@ -831,14 +788,15 @@ fn vm_byte_access_at_last_byte_of_page_uses_fast_path_and_succeeds() {
     let value = builder.iconst(IConst::u8(0xee));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
+    let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(state.x_registers[0], 1);
     assert_eq!(
-        fixture.mmu.load_byte(u64::try_from(last).unwrap()).unwrap(),
+        mmu.load_byte(NoCache, u64::try_from(last).unwrap())
+            .unwrap(),
         0xee,
     );
 }
@@ -852,7 +810,7 @@ fn vm_dynamic_load_can_take_fast_path_and_fallback_path_in_same_compiled_chunk()
     builder.store_x_reg::<1>(loaded);
 
     let compiled = compile(builder);
-    let fixture = VmFixture::with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
+    let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
 
     let mut aligned_state = ProcessorState::initial();
     aligned_state.x_registers[0] = 8;
@@ -860,7 +818,7 @@ fn vm_dynamic_load_can_take_fast_path_and_fallback_path_in_same_compiled_chunk()
         call_compiled_full(
             &compiled,
             &mut aligned_state,
-            &fixture.mmu,
+            &mmu,
             |_, _, _| {},
             |_, _, _| {},
         ),
@@ -877,7 +835,7 @@ fn vm_dynamic_load_can_take_fast_path_and_fallback_path_in_same_compiled_chunk()
         call_compiled_full(
             &compiled,
             &mut unaligned_state,
-            &fixture.mmu,
+            &mmu,
             |_, _, _| {},
             |_, _, _| {},
         ),
@@ -899,7 +857,7 @@ fn vm_dynamic_store_can_take_fast_path_and_fallback_path_in_same_compiled_chunk(
 
     let compiled = compile(builder);
 
-    let aligned_fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE);
+    let aligned_mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
     let mut aligned_state = ProcessorState::initial();
     aligned_state.x_registers[0] = 8;
     aligned_state.x_registers[1] = 0x1111_2222_3333_4444;
@@ -908,18 +866,18 @@ fn vm_dynamic_store_can_take_fast_path_and_fallback_path_in_same_compiled_chunk(
         call_compiled_full(
             &compiled,
             &mut aligned_state,
-            &aligned_fixture.mmu,
+            &aligned_mmu,
             |_, _, _| {},
             |_, _, _| {},
         ),
         0
     );
     assert_eq!(
-        aligned_fixture.mmu.load64_le(8).unwrap(),
+        aligned_mmu.load64_le(NoCache, 8).unwrap(),
         0x1111_2222_3333_4444,
     );
 
-    let fallback_fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE);
+    let fallback_mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
     let mut fallback_state = ProcessorState::initial();
     fallback_state.x_registers[0] = 3;
     fallback_state.x_registers[1] = 0xaaaa_bbbb_cccc_dddd;
@@ -928,14 +886,14 @@ fn vm_dynamic_store_can_take_fast_path_and_fallback_path_in_same_compiled_chunk(
         call_compiled_full(
             &compiled,
             &mut fallback_state,
-            &fallback_fixture.mmu,
+            &fallback_mmu,
             |_, _, _| {},
             |_, _, _| {},
         ),
         0
     );
     assert_eq!(
-        fallback_fixture.mmu.load64_le(3).unwrap(),
+        fallback_mmu.load64_le(NoCache, 3).unwrap(),
         0xaaaa_bbbb_cccc_dddd,
     );
 }
@@ -949,7 +907,7 @@ fn vm_cross_page_load16_traps_when_second_page_lacks_read_permission() {
     let loaded = builder.vm_load(addr, IntWidth::W16);
     store_int_equals_as_x_reg::<0>(&mut builder, loaded, IConst::u16(0));
 
-    let fixture = VmFixture::with_page_protections_and_bytes(
+    let mmu = iommu_with_page_protections_and_bytes(
         &[MemProt::READ | MemProt::WRITE, MemProt::WRITE],
         vm_page_tagged_byte,
     );
@@ -957,7 +915,7 @@ fn vm_cross_page_load16_traps_when_second_page_lacks_read_permission() {
     let mut state = ProcessorState::initial();
     state.x_registers[0] = 0xdead_beef;
 
-    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
+    let code = run_with_mmu(builder, &mut state, &mmu);
 
     assert_memory_trap(code);
     assert_eq!(state.x_registers[0], 0xdead_beef);
@@ -972,43 +930,29 @@ fn vm_cross_page_store32_traps_when_second_page_lacks_write_and_does_not_partial
     let value = builder.iconst(IConst::u32(0x0123_4567));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::with_page_protections_and_bytes(
+    let mmu = iommu_with_page_protections_and_bytes(
         &[MemProt::READ | MemProt::WRITE, MemProt::READ],
         vm_page_tagged_byte,
     );
 
-    let before0 = fixture
-        .mmu
-        .load_byte(u64::try_from(PAGE_SIZE - 2).unwrap())
-        .unwrap();
-    let before1 = fixture
-        .mmu
-        .load_byte(u64::try_from(PAGE_SIZE - 1).unwrap())
-        .unwrap();
-    let before2 = fixture.mmu.load_byte(vm_page_addr(1)).unwrap();
-    let before3 = fixture.mmu.load_byte(vm_page_addr(1) + 1).unwrap();
+    let addrs = [
+        PAGE_SIZE_U64.strict_sub(2),
+        PAGE_SIZE_U64.strict_sub(1),
+        vm_page_addr(1),
+        vm_page_addr(1) + 1,
+    ];
+
+    let read_bytes =
+        || TLB.with_borrow_mut(|tlb| addrs.map(|vaddr| mmu.load_byte(&mut *tlb, vaddr).unwrap()));
+
+    let before = read_bytes();
 
     let mut state = ProcessorState::initial();
-    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
-
+    let code = run_with_mmu(builder, &mut state, &mmu);
     assert_memory_trap(code);
 
-    assert_eq!(
-        fixture
-            .mmu
-            .load_byte(u64::try_from(PAGE_SIZE - 2).unwrap())
-            .unwrap(),
-        before0,
-    );
-    assert_eq!(
-        fixture
-            .mmu
-            .load_byte(u64::try_from(PAGE_SIZE - 1).unwrap())
-            .unwrap(),
-        before1,
-    );
-    assert_eq!(fixture.mmu.load_byte(vm_page_addr(1)).unwrap(), before2);
-    assert_eq!(fixture.mmu.load_byte(vm_page_addr(1) + 1).unwrap(), before3);
+    let after = read_bytes();
+    assert_eq!(before, after);
 }
 
 #[test]
@@ -1020,10 +964,10 @@ fn vm_cross_page_load64_roundtrips_exact_little_endian_bytes() {
     let loaded = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let fixture = VmFixture::with_bytes(2, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
+    let mmu = iommu_with_bytes(2, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(
         state.x_registers[0],
@@ -1040,15 +984,13 @@ fn vm_cross_page_store64_roundtrips_exact_little_endian_bytes() {
     let value = builder.iconst(IConst::u64(0x1020_3040_5060_7080));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::new(2, MemProt::READ | MemProt::WRITE);
+    let mmu = new_iommu(2, MemProt::READ | MemProt::WRITE);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(
-        fixture
-            .mmu
-            .load64_le(u64::try_from(start).unwrap())
+        mmu.load64_le(NoCache, u64::try_from(start).unwrap())
             .unwrap(),
         0x1020_3040_5060_7080,
     );
@@ -1065,13 +1007,13 @@ fn vm_store_then_load_same_address_in_same_ir_sees_new_value_fast_path() {
     let loaded = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE);
+    let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(state.x_registers[0], 0x9988_7766_5544_3322);
-    assert_eq!(fixture.mmu.load64_le(32).unwrap(), 0x9988_7766_5544_3322);
+    assert_eq!(mmu.load64_le(NoCache, 32).unwrap(), 0x9988_7766_5544_3322);
 }
 
 #[test]
@@ -1085,13 +1027,13 @@ fn vm_store_then_load_same_unaligned_address_in_same_ir_sees_new_value_fallback_
     let loaded = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE);
+    let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(state.x_registers[0], 0x8877_6655_4433_2211);
-    assert_eq!(fixture.mmu.load64_le(33).unwrap(), 0x8877_6655_4433_2211);
+    assert_eq!(mmu.load64_le(NoCache, 33).unwrap(), 0x8877_6655_4433_2211);
 }
 
 #[test]
@@ -1102,14 +1044,14 @@ fn vm_load_traps_when_tlb_miss_fallback_reports_unmapped_page() {
     let loaded = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+    let mmu = iommu_with_sparse_page_protections_and_bytes(
         &[(0, MemProt::READ | MemProt::WRITE)],
         |page, offset| tlb_collision_byte(page, offset, usize::MAX),
     );
     let mut state = ProcessorState::initial();
     state.x_registers[0] = 0xaaaa_bbbb_cccc_dddd;
 
-    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
+    let code = run_with_mmu(builder, &mut state, &mmu);
 
     assert_memory_trap(code);
     assert_eq!(state.x_registers[0], 0xaaaa_bbbb_cccc_dddd);
@@ -1123,16 +1065,16 @@ fn vm_store_traps_when_tlb_miss_fallback_reports_unmapped_page() {
     let value = builder.iconst(IConst::u64(0x0123_4567_89ab_cdef));
     builder.vm_store(addr, value);
 
-    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+    let mmu = iommu_with_sparse_page_protections_and_bytes(
         &[(0, MemProt::READ | MemProt::WRITE)],
         |_, _| 0,
     );
     let mut state = ProcessorState::initial();
 
-    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
+    let code = run_with_mmu(builder, &mut state, &mmu);
 
     assert_memory_trap(code);
-    assert_eq!(fixture.mmu.load64_le(0).unwrap(), 0);
+    assert_eq!(mmu.load64_le(NoCache, 0).unwrap(), 0);
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -1145,6 +1087,14 @@ fn tlb_collision_array<const N: usize>(page: usize, start: usize, alias_page: us
     std::array::from_fn(|i| tlb_collision_byte(page, start.wrapping_add(i), alias_page))
 }
 
+fn drain_dirty_icache_pages(mmu: &IoMMU) -> usize {
+    mmu.flush_dirty_pages();
+    let lock = &mut *mmu.get_fabric().icache().0.borrow_mut();
+    let count = lock.len();
+    lock.clear();
+    count
+}
+
 #[test]
 fn vm_store_to_non_executable_page_does_not_dirty_icache_page() {
     let mut builder = ExecIrBuilder::default();
@@ -1153,16 +1103,16 @@ fn vm_store_to_non_executable_page_does_not_dirty_icache_page() {
     let value = builder.iconst(IConst::u64(0x0123_4567_89ab_cdef));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE);
+    let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
     let mut state = ProcessorState::initial();
 
-    assert_eq!(fixture.mmu.drain_dirty_icache_pages().count(), 0);
+    assert_eq!(drain_dirty_icache_pages(&mmu), 0);
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
-    assert_eq!(fixture.mmu.load64_le(16).unwrap(), 0x0123_4567_89ab_cdef);
+    assert_eq!(mmu.load64_le(NoCache, 16).unwrap(), 0x0123_4567_89ab_cdef);
     assert_eq!(
-        fixture.mmu.drain_dirty_icache_pages().count(),
+        drain_dirty_icache_pages(&mmu),
         0,
         "stores to non-executable pages must not dirty icache state",
     );
@@ -1176,21 +1126,21 @@ fn vm_store_to_executable_page_dirties_icache_page() {
     let value = builder.iconst(IConst::u64(0xfeed_face_cafe_beef));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
+    let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
     let mut state = ProcessorState::initial();
 
-    assert_eq!(fixture.mmu.drain_dirty_icache_pages().count(), 0);
+    assert_eq!(drain_dirty_icache_pages(&mmu), 0);
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
-    assert_eq!(fixture.mmu.load64_le(16).unwrap(), 0xfeed_face_cafe_beef);
+    assert_eq!(mmu.load64_le(NoCache, 16).unwrap(), 0xfeed_face_cafe_beef);
     assert_eq!(
-        fixture.mmu.drain_dirty_icache_pages().count(),
+        drain_dirty_icache_pages(&mmu),
         1,
         "stores to executable pages must mark exactly that page dirty",
     );
     assert_eq!(
-        fixture.mmu.drain_dirty_icache_pages().count(),
+        drain_dirty_icache_pages(&mmu),
         0,
         "draining dirty icache pages must clear the dirty state",
     );
@@ -1204,23 +1154,23 @@ fn vm_load_from_executable_page_does_not_dirty_icache_page() {
     let loaded = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let fixture = VmFixture::with_bytes(
+    let mmu = iommu_with_bytes(
         1,
         MemProt::READ | MemProt::WRITE | MemProt::EXECUTE,
         vm_pattern_byte,
     );
     let mut state = ProcessorState::initial();
 
-    assert_eq!(fixture.mmu.drain_dirty_icache_pages().count(), 0);
+    assert_eq!(drain_dirty_icache_pages(&mmu), 0);
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(
         state.x_registers[0],
         u64::from_le_bytes(vm_pattern_array::<8>(8)),
     );
     assert_eq!(
-        fixture.mmu.drain_dirty_icache_pages().count(),
+        drain_dirty_icache_pages(&mmu),
         0,
         "loads from executable pages must not dirty icache state",
     );
@@ -1238,15 +1188,17 @@ fn repeated_vm_stores_to_same_executable_page_report_one_dirty_page() {
     let value = builder.iconst(IConst::u64(0x5555_6666_7777_8888));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
+    let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
-    assert_eq!(fixture.mmu.load64_le(16).unwrap(), 0x1111_2222_3333_4444);
-    assert_eq!(fixture.mmu.load64_le(24).unwrap(), 0x5555_6666_7777_8888);
+    TLB.with_borrow_mut(|tlb| {
+        assert_eq!(mmu.load64_le(&mut *tlb, 16).unwrap(), 0x1111_2222_3333_4444);
+        assert_eq!(mmu.load64_le(&mut *tlb, 24).unwrap(), 0x5555_6666_7777_8888);
+    });
     assert_eq!(
-        fixture.mmu.drain_dirty_icache_pages().count(),
+        drain_dirty_icache_pages(&mmu),
         1,
         "multiple stores to one executable page should still report one dirty page",
     );
@@ -1264,20 +1216,18 @@ fn vm_store_to_executable_page1_dirties_only_one_page() {
         MemProt::READ | MemProt::WRITE | MemProt::EXECUTE,
         MemProt::READ | MemProt::WRITE | MemProt::EXECUTE,
     ];
-    let fixture = VmFixture::with_page_protections_and_bytes(&protections, |_| 0);
+    let mmu = iommu_with_page_protections_and_bytes(&protections, |_| 0);
     let mut state = ProcessorState::initial();
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(
-        fixture
-            .mmu
-            .load64_le(vm_page_addr(1).strict_add(32))
+        mmu.load64_le(NoCache, vm_page_addr(1).strict_add(32))
             .unwrap(),
         0xaabb_ccdd_eeff_0011,
     );
     assert_eq!(
-        fixture.mmu.drain_dirty_icache_pages().count(),
+        drain_dirty_icache_pages(&mmu),
         1,
         "a store to page 1 should not dirty every executable page",
     );
@@ -1292,21 +1242,21 @@ fn vm_unaligned_store64_fallback_dirties_executable_icache_page() {
     let value = builder.iconst(IConst::u64(0xfeed_face_cafe_beef));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
+    let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
     let mut state = ProcessorState::initial();
 
-    assert_eq!(fixture.mmu.drain_dirty_icache_pages().count(), 0);
+    assert_eq!(drain_dirty_icache_pages(&mmu), 0);
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
-    assert_eq!(fixture.mmu.load64_le(3).unwrap(), 0xfeed_face_cafe_beef);
+    assert_eq!(mmu.load64_le(NoCache, 3).unwrap(), 0xfeed_face_cafe_beef);
     assert_eq!(
-        fixture.mmu.drain_dirty_icache_pages().count(),
+        drain_dirty_icache_pages(&mmu),
         1,
         "unaligned fallback stores to executable pages must dirty icache state",
     );
     assert_eq!(
-        fixture.mmu.drain_dirty_icache_pages().count(),
+        drain_dirty_icache_pages(&mmu),
         0,
         "draining dirty icache pages must clear the dirty state",
     );
@@ -1321,27 +1271,25 @@ fn vm_cross_page_store16_fallback_dirties_both_executable_icache_pages() {
     let value = builder.iconst(IConst::u16(0xbeef));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::new(2, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
+    let mmu = new_iommu(2, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
     let mut state = ProcessorState::initial();
 
-    assert_eq!(fixture.mmu.drain_dirty_icache_pages().count(), 0);
+    assert_eq!(drain_dirty_icache_pages(&mmu), 0);
 
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+    run_success_with_mmu(builder, &mut state, &mmu);
 
     assert_eq!(
-        fixture
-            .mmu
-            .load16_le(u64::try_from(start).unwrap())
+        mmu.load16_le(NoCache, u64::try_from(start).unwrap())
             .unwrap(),
         0xbeef,
     );
     assert_eq!(
-        fixture.mmu.drain_dirty_icache_pages().count(),
+        drain_dirty_icache_pages(&mmu),
         2,
         "cross-page fallback stores touching two executable pages must dirty both pages",
     );
     assert_eq!(
-        fixture.mmu.drain_dirty_icache_pages().count(),
+        drain_dirty_icache_pages(&mmu),
         0,
         "draining dirty icache pages must clear both dirty states",
     );

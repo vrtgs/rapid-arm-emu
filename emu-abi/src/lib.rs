@@ -1,3 +1,4 @@
+pub mod abort;
 pub mod array_helper;
 pub mod convert;
 pub mod halt_reason;

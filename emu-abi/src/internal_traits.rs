@@ -1,44 +1,38 @@
-use crate::memory::{Page, PageNumber, TlbIdentifierToken};
-use std::num::NonZero;
+use crate::memory::PagePointer;
+use std::mem::MaybeUninit;
 
 /// This allows exposing things only inbetween the internal crates
 pub trait AsFFI {
-    type Inetrface<'a>
+    type Interface<'a>
     where
         Self: 'a;
 
-    fn as_ffi(&self) -> Self::Inetrface<'_>;
+    fn as_ffi<'a>(&'a self) -> Self::Interface<'a>
+    where
+        Self: 'a;
 }
 
-pub trait GetTlbIdentifier {
-    fn tlb_ident(&self) -> TlbIdentifierToken;
-}
-
-pub trait IoMMUByteRawAccess {
-    type Error;
-
-    fn load_byte_raw(&self, vaddr: u64) -> Result<(PageNumber, &Page, u8), Self::Error>;
-
-    fn store_byte_raw(&self, vaddr: u64, value: u8) -> Result<(PageNumber, &Page), Self::Error>;
-}
-
-pub trait IoMMURawIntAccess<T: bytemuck::Pod>: IoMMUByteRawAccess {
-    fn load_raw(&self, vaddr: u64) -> Result<(PageNumber, &Page, Option<&Page>, T), Self::Error>;
-
-    fn store_raw(
-        &self,
-        vaddr: u64,
-        value: T,
-    ) -> Result<(PageNumber, &Page, Option<&Page>), Self::Error>;
-}
-
-pub trait GetTlbGeneration {
-    fn get_generation(&self) -> NonZero<u64>;
-}
-
-pub trait ResetTlbGeneration {
-    /// # Safety
+/// # Safety
+///
+/// A type that can initialize itself directly inside caller-provided storage.
+///
+/// `InitInPlace::init` writes a valid `Self` into the provided `MaybeUninit<Self>`
+/// and returns a mutable reference to the initialized value.
+pub unsafe trait InitInPlace: Sized {
+    /// Initializes `this` in place and returns a mutable reference to the
+    /// initialized value.
     ///
-    /// must ensure that
-    unsafe fn reset_generation(&mut self);
+    /// After this function returns normally, the memory referenced by `this`
+    /// must contain a fully initialized, valid `Self`.
+    fn init(this: &mut MaybeUninit<Self>) -> &mut Self;
+}
+
+pub trait ICache {
+    fn invalidate(&self, page: PagePointer);
+}
+
+pub trait CpuFabricPrivate {
+    type ICache: ?Sized + ICache;
+
+    fn icache(&self) -> &Self::ICache;
 }

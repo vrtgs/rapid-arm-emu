@@ -1,3 +1,5 @@
+use std::mem::MaybeUninit;
+
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Copy, Clone)]
 #[repr(C, align(16))]
 pub struct Vector(pub u128);
@@ -36,7 +38,29 @@ pub struct ProcessorState {
 }
 
 impl ProcessorState {
+    #[inline(always)]
     pub const fn initial() -> Self {
         bytemuck::zeroed()
+    }
+}
+
+#[derive(bytemuck::Zeroable)]
+#[repr(C)]
+pub struct ExecState {
+    pub state: ProcessorState,
+    pub trap_paylod: MaybeUninit<u64>,
+}
+
+impl ExecState {
+    pub const fn initial() -> Self {
+        const { Self::from_processor_state(ProcessorState::initial()) }
+    }
+
+    #[inline(always)]
+    pub const fn from_processor_state(state: ProcessorState) -> Self {
+        Self {
+            state,
+            trap_paylod: MaybeUninit::uninit(),
+        }
     }
 }
