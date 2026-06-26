@@ -16,6 +16,9 @@
 use std::hint::cold_path;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
+// TODO use this when miri is on; whilst it masks the very real issue
+//      it means we can test io-mmu concurrency with miri
+//
 // example sound impl of memops
 // use crossbeam_utils::CachePadded;
 // // use a Mersenne prime so that collisions are more rare

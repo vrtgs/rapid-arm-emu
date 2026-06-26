@@ -61,8 +61,8 @@
 //!
 //! `HaltCheckInserter` owns IR mutation. When inserting a halt check splits a
 //! block, it updates safepoint locations and remaps pending edge states from
-//! the old block to the continuation block, keeping both forward and reverse
-//! edge maps consistent.
+//! the old block to the continuation block, keeping both forward and reverse-edge
+//! maps consistent.
 
 use crate::arena::{Arena, ArenaMap, ArenaSet, Storable, handle_impl_helper, make_handle};
 use crate::{Block, ExecIrBuilder, Stmt, StmtKind};
@@ -71,17 +71,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZero;
 use std::ops::DerefMut;
 
-/// represents the state at the end of one path into the merge.
+/// Represents the state at the end of one path into the merge.
 /// After seeing `r` more safepoints, the next safepoint forces a halt check.
 /// Equivalently, if:
 ///
 /// N = halt_check_every
 ///
-/// then this path has already seen:
+/// Then this path has already seen:
 ///
 /// N - r
 ///
-/// safepoints since the previous halt check.
+/// Safepoints since the previous halt check.
 #[derive(Clone)]
 struct HaltState {
     remaining: NonZero<usize>,
@@ -94,7 +94,7 @@ struct HaltStateMap {
 }
 
 impl HaltStateMap {
-    pub fn new(ir: &ExecIrBuilder) -> Self {
+    fn new(ir: &ExecIrBuilder) -> Self {
         let edge_capacity = ir.blocks.len().div_ceil(2).saturating_mul(3);
         let forward_edges = ArenaMap::with_capacity(edge_capacity);
         let backward_edges = ArenaMap::with_capacity(edge_capacity);
@@ -105,7 +105,7 @@ impl HaltStateMap {
         }
     }
 
-    pub fn add_edge(&mut self, from: Block, to: Block, state: HaltState) -> Option<HaltState> {
+    fn add_edge(&mut self, from: Block, to: Block, state: HaltState) -> Option<HaltState> {
         let edges = {
             self.outgoing_edges
                 .get_or_insert_with(from, || HashMap::with_capacity(1))
@@ -120,7 +120,7 @@ impl HaltStateMap {
         edges.insert(to, state)
     }
 
-    pub fn drain_incoming(
+    fn drain_incoming(
         &mut self,
         towards: Block,
     ) -> impl Iterator<Item = (Block, HaltState)> + use<'_> {
@@ -182,8 +182,8 @@ struct HaltCheckInserter<'a> {
     safepoint_stmt_to_block_and_index: HashMap<Stmt, (Block, usize)>,
     map: HaltStateMap,
 
-    // Safepoints after which this pass inserted a compensating halt check.
-    // note this is delibaretly a hashset because a small portion of statements are safepoints
+    // Safepoints, after which this pass, inserted a compensating halt check.
+    // note this is deliberately a hashset because a small portion of statements are safepoints
     // and an even smaller portion affects resets
     // this makes safepoint edits lazy,
     // and that means we can skip repeated expensive global scans to the HaltState
@@ -191,7 +191,7 @@ struct HaltCheckInserter<'a> {
 }
 
 impl<'a> HaltCheckInserter<'a> {
-    pub fn new(halt_check_every: NonZero<usize>, ir: &'a mut ExecIrBuilder) -> Self {
+    fn new(halt_check_every: NonZero<usize>, ir: &'a mut ExecIrBuilder) -> Self {
         let safepoint_stmt_est = ir.stmts.len().div_ceil(128);
         let mut safepoints = HashMap::with_capacity(safepoint_stmt_est);
 
@@ -216,11 +216,11 @@ impl<'a> HaltCheckInserter<'a> {
         }
     }
 
-    pub fn ir(&mut self) -> &mut ExecIrBuilder {
+    fn ir(&mut self) -> &mut ExecIrBuilder {
         self.ir
     }
 
-    pub fn insert_halt_check_after_safepoint_indexed(
+    fn insert_halt_check_after_safepoint_indexed(
         &mut self,
         block: Block,
         stmt_index: usize,
@@ -239,7 +239,7 @@ impl<'a> HaltCheckInserter<'a> {
             }
         }
 
-        // since the edges are (from -> to) where HaltState is the state of things after
+        // since the edges are (from->to) where HaltState is the state of things after
         // from runs to completion; when splitting a node, to is unaffected.
         // since it will always exist, and the edge from -> to always means
         // the end of `from` jumps towards `to`
@@ -267,7 +267,7 @@ impl<'a> HaltCheckInserter<'a> {
         continuation
     }
 
-    pub fn insert_compensating_halt_check_after_safepoint(&mut self, at: Stmt) -> Block {
+    fn insert_compensating_halt_check_after_safepoint(&mut self, at: Stmt) -> Block {
         let inserted = self.semantic_reset_after.insert(at);
 
         assert!(
@@ -325,7 +325,7 @@ struct CyclicBlockHalter {
 }
 
 impl CyclicBlockHalter {
-    pub fn new(state_in: HaltState) -> Self {
+    fn new(state_in: HaltState) -> Self {
         Self {
             halt_check_every: None,
             state_in_remaining: state_in.remaining,
@@ -369,7 +369,7 @@ impl BlockHalter for ACyclicBlockHalter {
 
         match should_insert_halt_check {
             // There is never a need to keep suffix history before this point,
-            // because after inserting a halt check the countdown resets to N.
+            // because after inserting a halt check, the countdown resets to N.
             true => state.suffix_safepoints = rpds::Queue::new(),
             false => {
                 state.suffix_safepoints.enqueue_mut(safepoint);
@@ -598,7 +598,7 @@ struct Tarjan<'a> {
 
     next_index: usize,
     index: ArenaMap<Block, usize>,
-    lowlink: ArenaMap<Block, usize>,
+    low_link: ArenaMap<Block, usize>,
 
     stack: Vec<Block>,
     on_stack: ArenaSet<Block>,
@@ -607,7 +607,7 @@ struct Tarjan<'a> {
 }
 
 impl<'a> Tarjan<'a> {
-    pub fn strong_connect(&mut self, block: Block) {
+    fn strong_connect(&mut self, block: Block) {
         stacker::maybe_grow(4 * 1024, 2 * 1024 * 1024, move || {
             self.strong_connect_inner(block)
         })
@@ -620,7 +620,7 @@ impl<'a> Tarjan<'a> {
 
     fn strong_connect_inner(&mut self, block: Block) {
         self.index.insert(block, self.next_index);
-        self.lowlink.insert(block, self.next_index);
+        self.low_link.insert(block, self.next_index);
         self.next_index = self.next_index.strict_add(1);
 
         self.stack.push(block);
@@ -634,19 +634,20 @@ impl<'a> Tarjan<'a> {
             if self.index.get(succ).is_none() {
                 self.strong_connect(succ);
 
-                let block_lowlink = self.lowlink[block];
-                let succ_lowlink = self.lowlink[succ];
+                let block_low_link = self.low_link[block];
+                let succ_low_link = self.low_link[succ];
 
-                self.lowlink.insert(block, block_lowlink.min(succ_lowlink));
+                self.low_link
+                    .insert(block, block_low_link.min(succ_low_link));
             } else if self.on_stack.contains(succ) {
-                let block_lowlink = self.lowlink[block];
+                let block_low_link = self.low_link[block];
                 let succ_index = self.index[succ];
 
-                self.lowlink.insert(block, block_lowlink.min(succ_index));
+                self.low_link.insert(block, block_low_link.min(succ_index));
             }
         }
 
-        if self.lowlink[block] == self.index[block] {
+        if self.low_link[block] == self.index[block] {
             let mut component = Vec::new();
 
             loop {
@@ -688,7 +689,7 @@ fn strongly_connected_components(
 
         next_index: 0,
         index: ArenaMap::new(),
-        lowlink: ArenaMap::new(),
+        low_link: ArenaMap::new(),
 
         stack: Vec::new(),
         on_stack: ArenaSet::new(),
@@ -757,7 +758,7 @@ struct SccGraph {
 }
 
 impl SccGraph {
-    pub fn new(ir: &ExecIrBuilder) -> Self {
+    fn new(ir: &ExecIrBuilder) -> Self {
         assert_cycles_have_safepoints(ir);
 
         let components = strongly_connected_components(ir, None);
@@ -825,12 +826,12 @@ impl SccGraph {
         }
     }
 
-    pub fn component_is_cyclic(&self, component: SccComponent) -> bool {
+    fn component_is_cyclic(&self, component: SccComponent) -> bool {
         self.is_cyclic.contains(component)
     }
 }
 
-pub fn insert_halt_checks(ir: &mut ExecIrBuilder) {
+pub(super) fn insert_halt_checks(ir: &mut ExecIrBuilder) {
     let halt_check_every: NonZero<u32> = ir.halt_check_every;
     let halt_check_every: NonZero<usize> =
         halt_check_every.try_into().unwrap_or(NonZero::<usize>::MAX);
@@ -848,7 +849,7 @@ pub fn insert_halt_checks(ir: &mut ExecIrBuilder) {
             let iter = inserter
                 .map
                 .drain_incoming(block)
-                .map(|(_precessor, state)| state);
+                .map(|(_predecessor, state)| state);
 
             incoming.extend(iter);
         }

@@ -45,12 +45,12 @@ fn is_signed_cmp(cmp: IntCmp) -> bool {
 /// Values of GCC's __ATOMIC_* memory model macros, as defined in <stdatomic.h>.
 /// These are stable ABI - GCC has never changed them.
 mod atomic_model {
-    pub const RELAXED: i32 = 0;
-    // pub const CONSUME: i32 = 1;
-    pub const ACQUIRE: i32 = 2;
-    pub const RELEASE: i32 = 3;
-    pub const ACQ_REL: i32 = 4;
-    pub const SEQ_CST: i32 = 5;
+    pub(super) const RELAXED: i32 = 0;
+    // pub(super) const CONSUME: i32 = 1;
+    pub(super) const ACQUIRE: i32 = 2;
+    pub(super) const RELEASE: i32 = 3;
+    pub(super) const ACQ_REL: i32 = 4;
+    pub(super) const SEQ_CST: i32 = 5;
 }
 
 struct TypeCache<'ctx> {
@@ -1169,16 +1169,16 @@ impl<'ctx> FunctionLowering<'ctx> {
     }
 }
 
-pub struct GccJit(());
+pub(crate) struct GccJit(());
 
 impl GccJit {
-    pub fn new() -> anyhow::Result<Self> {
+    pub(crate) fn new() -> anyhow::Result<Self> {
         // gccjit doesn't require any global initialization; contexts are
         // created per-compilation.  We keep the struct as a ZST for now.
         Ok(Self(()))
     }
 
-    pub fn try_compile(
+    pub(crate) fn try_compile(
         &self,
         options: CompileBlockOptions,
         exec_ir: &ExecIr,

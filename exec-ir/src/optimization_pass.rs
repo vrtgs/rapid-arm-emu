@@ -1,3 +1,3 @@
 use crate::ExecIrBuilder;
 
-pub fn optimize(_ir: &mut ExecIrBuilder) {}
+pub(super) fn optimize(_ir: &mut ExecIrBuilder) {}

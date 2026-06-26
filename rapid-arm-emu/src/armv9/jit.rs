@@ -31,17 +31,21 @@ pub(crate) struct CodeCache {
 }
 
 impl CodeCache {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cache: HashMap::new(),
         }
     }
 
-    pub fn run(&mut self, _state: &mut ExecState, _cpu: &Armv9CpuCore) -> Option<HaltReason> {
+    pub(crate) fn run(
+        &mut self,
+        _state: &mut ExecState,
+        _cpu: &Armv9CpuCore,
+    ) -> Option<HaltReason> {
         todo!()
     }
 
-    pub fn invalidate(&mut self) {
+    pub(crate) fn invalidate(&mut self) {
         self.cache.clear()
     }
 }

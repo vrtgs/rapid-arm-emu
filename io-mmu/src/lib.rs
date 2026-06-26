@@ -1,73 +1,29 @@
-// TODO: replace all of this documentation; as it is outdated
-
-//! Page-based virtual memory abstraction backed by host memory.
-//!
-//! This module implements a small MMU-like layer that maps Armv9 guest virtual
-//! pages onto host memory and enforces per-page access permissions.
-//!
-//! Core behavior:
-//! - Memory is mapped in page-sized chunks.
-//! - Each page may be readable, writable, and/or executable.
-//! - Unmapped access or permission violations return [`MemoryFault`].
-//! - Byte-range reads and writes may span multiple pages.
-//! - Scalar load/store helpers are provided for 8/16/32/64-bit little-endian
-//!   accesses.
-//! - Scalar accesses may cross page boundaries when both pages are mapped with
-//!   the required permissions.
-//!
-//! Concurrency model:
-//! - Backing memory may be accessed concurrently through multiple threads.
-//! - Concurrent loads and stores through the MMU are allowed.
-//! - Public safe APIs must not produce undefined behavior, even when accesses
-//!   race.
-//! - Atomicity follows the Armv9 memory model for the active [`CpuFabric`].
-//! - Naturally aligned scalar accesses use the single-copy atomicity guarantees
-//!   provided by that fabric.
-//! - Operations outside the fabric's single-copy atomic width, or operations
-//!   split across pages, may be observed as multiple smaller operations.
-//!
-//! Safety model:
-//! - All public safe functions are required to be UB-free.
-//! - Unsafe functions may rely on their documented caller obligations.
-//! - Mapping requires the caller to provide valid, page-aligned backing memory
-//!   for the lifetime of the MMU mapping.
-//! - Once memory is mapped into an MMU, the backing pointer must not be accessed
-//!   directly while the mapping is alive, except for use as backing memory for an
-//!   MMU mapping under the same aliasing/concurrency rules and the same
-//!   [`CpuFabric`] memory model.
-//!
-//! Typical usage:
-//! 1. Construct an [`IoMMU`].
-//! 2. Map one or more host memory regions with [`IoMMU::map`].
-//! 3. Access byte ranges through [`IoMMU::load_into_uninit`] / [`IoMMU::store`].
-//! 4. Access scalars through `load_byte/load16_le/load32_le/load64_le` and
-//!    `store_byte/store16_le/store32_le/store64_le`.
-
 use crate::cpu_fabric::CpuFabric;
-use crate::dma::DmaDevice;
 use crate::fault::{MemoryFault, ensure};
 use crate::icache::ICache;
+use crate::lookup_cache::{LookupCache, LookupCacheExt};
+use crate::memory_object::MemoryObject;
 use crate::page_table::{MapRegion, MemMapFlags, PageTable};
 use emu_abi::abort::AbortGuard;
 use emu_abi::convert::u64_to_usize;
 use emu_abi::memory::{
     IoMMUIdentifier, IoMMUIdentifierRef, MemFlags, MemProt, PAGE_OFFSET_MASK_U64, PAGE_SHIFT,
-    PAGE_SIZE, PAGE_SIZE_U64, Page, PageNumber, PagePointer, Tlb,
+    PAGE_SIZE, PAGE_SIZE_U64, Page, PageNumber, PagePointer,
 };
 use std::convert::Infallible;
 use std::hint::cold_path;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::num::NonZero;
-use std::process::abort;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 
 pub mod cpu_fabric;
-pub mod dma;
 pub mod fault;
 pub mod icache;
+pub mod lookup_cache;
 mod memops;
+pub mod memory_object;
 mod page_table;
 
 #[inline]
@@ -117,7 +73,7 @@ impl PageTableAccess {
         }
     }
 
-    pub fn iter(self) -> impl DoubleEndedIterator<Item = PageNumber> {
+    pub(crate) fn iter(self) -> impl DoubleEndedIterator<Item = PageNumber> {
         let start = self.start_page.get();
         let end = unsafe { start.unchecked_add(self.page_count.get()) };
         (start..end).map(|page| unsafe { PageNumber::from_page_number_unchecked(page) })
@@ -138,9 +94,6 @@ pub struct IoMMU<T: ?Sized + ICache> {
 }
 
 impl<T: ?Sized + ICache> IoMMU<T> {
-    /// Creates an empty MMU with no mapped pages.
-    ///
-    /// All accesses fault until memory is mapped with [`IoMMU::map`].
     pub fn new(fabric: CpuFabric<T>) -> Self {
         Self {
             identifier: IoMMUIdentifier::unique_token(),
@@ -297,13 +250,13 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         &mut self,
         base: u64,
         size: u64,
-        device: Arc<dyn DmaDevice>,
+        device: Arc<dyn MemoryObject>,
         shared: bool,
         protections: MemProt,
     ) -> Result<(), MemoryFault> {
-        let region = MapRegion::Dma {
+        let region = MapRegion::Object {
             shared,
-            dev: device,
+            object: device,
         };
 
         unsafe { self.map_region(base, size, protections, region) }
@@ -313,7 +266,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         &mut self,
         base: u64,
         size: u64,
-        device: impl DmaDevice,
+        device: impl MemoryObject,
         shared: bool,
         protections: MemProt,
     ) -> Result<(), MemoryFault> {
@@ -369,141 +322,6 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         }
     }
 }
-
-/// A cache layer that sits between the CPU and the page table, translating
-/// [`PageNumber`]s into live [`Page`] handles.
-///
-/// Implementors may satisfy lookups from a fast local structure (e.g. a TLB)
-/// or fall through to the page table on every call. Either way, the returned
-/// [`Page`] must be a valid view into the [`IoMMU`]'s backing memory for the
-/// requested page number.
-// Note: callers rely on this to uphold memory safety across
-//       the verify-then-access split in [`LookupCacheExt::access`]
-///
-/// # Safety
-///
-/// If `get_page` returns `Ok` for a given `page`, then every subsequent call
-/// with the same `page` and the same [`IoMMU`] - without any intervening
-/// mutation of that [`IoMMU`] - must also return `Ok`. Returning `Err` after
-/// a prior `Ok` is **undefined behaviour**: the cache's consistency guarantee
-/// is a precondition that callers are permitted to assume without checking.
-///
-// TODO seal trait
-pub unsafe trait LookupCache {
-    /// Resolves `page` to a [`Page`] handle valid for the lifetime of `io_mmu`.
-    ///
-    /// See the trait-level safety docs for the consistency requirement that
-    /// implementations must uphold.
-    fn get_page<'a, T: ?Sized + ICache>(
-        &mut self,
-        io_mmu: &'a IoMMU<T>,
-        page: PageNumber,
-    ) -> Result<Page<'a>, MemoryFault>;
-}
-
-pub struct NoCache;
-
-unsafe impl LookupCache for NoCache {
-    /// Bypasses any caching layer and faults directly to the page table.
-    /// Useful when the overhead of a TLB lookup outweighs its benefit -
-    /// e.g. single-access patterns where a cached entry would never be reused.
-    fn get_page<'a, T: ?Sized + ICache>(
-        &mut self,
-        io_mmu: &'a IoMMU<T>,
-        page: PageNumber,
-    ) -> Result<Page<'a>, MemoryFault> {
-        io_mmu.table.get_page(page, &io_mmu.fabric)
-    }
-}
-
-unsafe impl LookupCache for Tlb {
-    /// Attempts a TLB hit before falling back to the page table, amortising
-    /// translation cost across repeated accesses to the same page.
-    ///
-    /// The `get_ident` check ensures we don't serve a stale entry after an
-    /// address-space switch - the TLB is logically scoped to one MMU identity.
-    fn get_page<'a, T: ?Sized + ICache>(
-        &mut self,
-        io_mmu: &'a IoMMU<T>,
-        page_num: PageNumber,
-    ) -> Result<Page<'a>, MemoryFault> {
-        let page = unsafe {
-            self.lookup(page_num, io_mmu.get_ident(), |page_num| {
-                io_mmu.table.get_page(page_num, io_mmu.get_fabric()).ok()
-            })
-        };
-
-        page.ok_or_else(|| MemoryFault::general_protection(page_num.vaddr_base()))
-    }
-}
-
-unsafe impl<C: LookupCache> LookupCache for &mut C {
-    #[inline(always)]
-    fn get_page<'a, T: ?Sized + ICache>(
-        &mut self,
-        io_mmu: &'a IoMMU<T>,
-        page: PageNumber,
-    ) -> Result<Page<'a>, MemoryFault> {
-        <C as LookupCache>::get_page(*self, io_mmu, page)
-    }
-}
-
-pub(crate) trait LookupCacheExt: LookupCache {
-    /// Resolves a virtual address into its page number, in-page byte offset,
-    /// and a handle to the backing page - all in one step so callers don't
-    /// have to re-derive the page number from the address themselves.
-    #[inline(always)]
-    fn lookup_addr<'a, T: ?Sized + ICache>(
-        &mut self,
-        io_mmu: &'a IoMMU<T>,
-        vaddr: u64,
-    ) -> Result<(PageNumber, usize, Page<'a>), MemoryFault> {
-        let (page_num, offset) = div_rem_page_size(vaddr);
-        let page = self.get_page(io_mmu, page_num)?;
-        Ok((page_num, offset, page))
-    }
-
-    /// Verifies that every page in `pages` satisfies the caller's predicate,
-    /// then calls `access` on each one.
-    ///
-    /// The split into two phases is intentional: all-or-nothing semantics.
-    /// If any page fails verification the access closure is never invoked,
-    /// so callers don't need to reason about partially-applied side effects.
-    ///
-    /// No ordering guarantee is made on `access`; the iteration order is an
-    /// internal implementation detail and may change.
-    fn access<'a, T: ?Sized + ICache>(
-        &mut self,
-        io_mmu: &'a IoMMU<T>,
-        pages: PageTableAccess,
-        mut verify: impl FnMut(PageNumber, Page<'a>) -> bool,
-        mut access: impl FnMut(PageNumber, Page<'a>),
-    ) -> Result<(), MemoryFault> {
-        // Verify in reverse so the cache is hottest at the head of the range
-        // when access begins - the forward access pass then walks into warm
-        // entries rather than cold ones.
-        for page_num in pages.iter().rev() {
-            let page = self.get_page(io_mmu, page_num)?;
-            ensure!(vaddr: page_num.vaddr_base(), verify(page_num, page))
-        }
-
-        // Forward walk gives the hardware prefetcher a predictable ascending
-        // stride, which matters more on the access loop than verify because
-        // this is where real work happens.
-        //
-        // Unwrap is sound here: verify already confirmed every page is
-        // reachable, so a fault now would mean the page table was mutated
-        // underneath us - unrecoverable either way.
-        for page_num in pages.iter() {
-            let page = self.get_page(io_mmu, page_num).unwrap_or_else(|_| abort());
-            access(page_num, page)
-        }
-
-        Ok(())
-    }
-}
-
-impl<C: LookupCache> LookupCacheExt for C {}
 
 impl<T: ?Sized + ICache> IoMMU<T> {
     #[inline(always)]
@@ -578,7 +396,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
                 // use select unpredictable, as all loads and stores
                 // of all different sizes, reach this function
                 // the cpu can't predict the branches here reliably
-                // since one loop might, load big, then small, then big....
+                // since one loop might load big, then small, then big...
 
                 let page_start =
                     std::hint::select_unpredictable(page_num == start_page, start_offset, 0);
@@ -807,7 +625,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
 
 impl<T: ?Sized + ICache> IoMMU<T> {
     #[inline]
-    pub(crate) fn single_page_aligned_access<const ACCESS_SIZE: u8>(
+    fn single_page_aligned_access<const ACCESS_SIZE: u8>(
         &self,
         mut cache: impl LookupCache,
         vaddr: u64,
@@ -868,7 +686,8 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         Ok((page, offset))
     }
 
-    pub(crate) fn single_page_access(
+    #[inline(always)]
+    fn single_page_access(
         &self,
         cache: impl LookupCache,
         vaddr: u64,
@@ -1246,34 +1065,31 @@ emit_multi_word_load_store! { 64, 32, 16 }
 const AARCH64_WORD_ALIGN: u8 = 4;
 
 impl<T: ?Sized + ICache> IoMMU<T> {
-    pub fn fetch_aarch64_full(
+    #[inline]
+    pub fn fetch_aarch64_raw(
         &self,
-        mut cache: impl LookupCache,
+        cache: impl LookupCache,
         vaddr: u64,
-    ) -> Result<(PagePointer, u32), MemoryFault> {
-        ensure!(vaddr: vaddr, vaddr.is_multiple_of(AARCH64_WORD_ALIGN as u64));
-
-        // note since vaddr is aligned there is no need to check overflow or alignment;
-        // for more on why this is always true look at `single_page_aligned_access`
-        let (_page_number, offset, page) = cache.lookup_addr(self, vaddr)?;
+    ) -> Result<(PagePointer, usize), MemoryFault> {
+        let (page, offset) = self.single_page_aligned_access::<AARCH64_WORD_ALIGN>(cache, vaddr)?;
 
         ensure!(vaddr: vaddr, page.ptr.flags().contains_any(MemFlags::EXECUTE));
-        unsafe {
-            let page_ptr = page.ptr.page_ptr();
-            let word_ptr = page_ptr.byte_add(offset);
-            let word = memops::load32_le_aligned(word_ptr.as_ptr());
-            Ok((page_ptr, word))
-        }
+        let page_ptr = page.ptr.page_ptr();
+        Ok((page_ptr, offset))
     }
 
     pub fn fetch_aarch64(&self, cache: impl LookupCache, vaddr: u64) -> Result<u32, MemoryFault> {
-        self.fetch_aarch64_full(cache, vaddr).map(|(_, word)| word)
+        self.fetch_aarch64_raw(cache, vaddr)
+            .map(|(page_ptr, offset)| unsafe {
+                let word_ptr = page_ptr.byte_add(offset);
+                memops::load32_le_aligned(word_ptr.as_ptr())
+            })
     }
 
     // TODO mark slow
-    pub fn flush_async(&self) {
+    pub fn refresh(&self) {
         for (_page_num, page) in self.table.pages() {
-            page.flush_async(self.get_fabric());
+            page.refresh(self.get_fabric());
         }
     }
 
@@ -1282,14 +1098,31 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         let pending_jobs = self
             .table
             .pages()
-            .flat_map(|(_page_num, page)| page.bad_api_flush(self.get_fabric()))
+            .flat_map(|(_page_num, page)| page.flush_sync_inner(self.get_fabric()))
             .collect::<Vec<_>>();
 
         // there is a collect and try for each deliberately
         pending_jobs.into_iter().try_for_each(|pending_job| {
             pending_job
                 .recv()
-                .unwrap_or_else(|_| anyhow::bail!("dma flusher thread exited"))
+                .unwrap_or_else(|_| anyhow::bail!("memory_object flusher thread exited"))
+        })
+    }
+
+    // TODO mark slow
+    pub fn fault_in_all_memory_objects(&self) -> anyhow::Result<()> {
+        // TODO better api or at least just keep reusing ONE channel
+        let pending_jobs = self
+            .table
+            .pages()
+            .flat_map(|(_page_num, page)| page.load_obj_memory_sync_inner(self.get_fabric()))
+            .collect::<Vec<_>>();
+
+        // there is a collect and try for each deliberately
+        pending_jobs.into_iter().try_for_each(|pending_job| {
+            pending_job
+                .recv()
+                .unwrap_or_else(|_| anyhow::bail!("memory_object flusher thread exited"))
         })
     }
 

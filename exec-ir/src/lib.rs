@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::mem::{MaybeUninit, offset_of};
 use std::num::NonZero;
 
-mod arena;
+pub(crate) mod arena;
 pub mod compiler;
 mod ffi_support;
 mod halt_check_pass;
@@ -887,7 +887,7 @@ struct BlockData {
 }
 
 impl BlockData {
-    pub fn empty() -> Self {
+    fn empty() -> Self {
         Self {
             parameters: smallvec![],
             stmts: vec![],

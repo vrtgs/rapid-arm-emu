@@ -9,8 +9,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
+getrandom = "0.4.3"
 once_cell = "1.21.4"
-thin-vec = "0.2.18"
+smallvec = { workspace = true }
 emu-abi = { workspace = true }
 parking_lot = { workspace = true }
 crossbeam-utils = { workspace = true }

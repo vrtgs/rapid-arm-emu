@@ -4,17 +4,17 @@ use std::mem::MaybeUninit;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum IoMmuStatus {
+pub(super) enum IoMmuStatus {
     Ok = 0,
     Fault = 1,
 }
 
-pub(crate) type IoMMU<'a> = io_mmu::IoMMU<dyn ICache + 'a>;
+type IoMMU<'a> = io_mmu::IoMMU<dyn ICache + 'a>;
 
 macro_rules! impl_load_store {
     ($({ suffix: $suffix: tt, ty: $ty: ty $(,)? })*) => {
         pastey::paste! {$(
-            pub unsafe extern "C" fn [<io_mmu_load $suffix>](
+            pub(super) unsafe extern "C" fn [<io_mmu_load $suffix>](
                 io_mmu: &IoMMU<'_>,
                 tlb: &mut Tlb,
                 addr: u64,
@@ -29,7 +29,7 @@ macro_rules! impl_load_store {
                 }
             }
 
-            pub unsafe extern "C" fn [<io_mmu_store $suffix>](
+            pub(super) unsafe extern "C" fn [<io_mmu_store $suffix>](
                 io_mmu: &IoMMU<'_>,
                 tlb: &mut Tlb,
                 addr: u64,

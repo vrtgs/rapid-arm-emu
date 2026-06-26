@@ -792,13 +792,13 @@ fn exec_block_signature(module: &JITModule) -> clif_ir::Signature {
     sig
 }
 
-pub struct CraneliftCompiler {
+pub(crate) struct CraneliftCompiler {
     compile_fast_isa: OwnedTargetIsa,
     compile_optimized_isa: OwnedTargetIsa,
 }
 
 impl CraneliftCompiler {
-    pub fn new() -> anyhow::Result<Self> {
+    pub(crate) fn new() -> anyhow::Result<Self> {
         fn bool_to_str(bool: bool) -> &'static str {
             match bool {
                 true => "true",
@@ -891,7 +891,7 @@ impl CraneliftCompiler {
         })
     }
 
-    pub fn try_compile(
+    pub(crate) fn try_compile(
         &self,
         options: CompileBlockOptions,
         exec_ir: &ExecIr,

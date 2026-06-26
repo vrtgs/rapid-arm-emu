@@ -6,9 +6,9 @@ use emu_abi::halt_reason::HaltReason;
 use emu_abi::internal_traits::InitInPlace;
 use emu_abi::memory::{MemProt, PAGE_SIZE, PAGE_SIZE_U64, PagePointer, TLB_SIZE};
 use exec_ir::{ExecIrBuilder, IConst, IntCmp, IntWidth};
-use io_mmu::NoCache;
 use io_mmu::cpu_fabric::CpuFabric;
 use io_mmu::icache::ICache;
+use io_mmu::lookup_cache::NoCache;
 use std::collections::HashSet;
 use std::mem::MaybeUninit;
 use std::num::NonZero;
@@ -83,7 +83,7 @@ fn iommu_with_sparse_page_protections_and_bytes(
     }
 
     if needs_flush {
-        mmu.flush_async();
+        mmu.refresh();
         mmu.get_fabric().icache().0.lock().unwrap().clear();
     }
 
@@ -1090,7 +1090,7 @@ fn tlb_collision_array<const N: usize>(page: usize, start: usize, alias_page: us
 }
 
 fn drain_dirty_icache_pages(mmu: &IoMMU) -> usize {
-    mmu.flush_async();
+    mmu.refresh();
     let lock = &mut *mmu.get_fabric().icache().0.lock().unwrap();
     let count = lock.len();
     lock.clear();

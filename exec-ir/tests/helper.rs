@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::mem::MaybeUninit;
 use std::sync::LazyLock;
 
-pub struct ICacheSink(());
+pub(crate) struct ICacheSink(());
 
 impl ICache for ICacheSink {
     fn invalidate(&self, _: PagePointer) {}
@@ -31,20 +31,20 @@ thread_local! {
     pub static TLB: RefCell<Tlb> = const { RefCell::new(Tlb::new()) };
 }
 
-pub type IoMMU<T = ICacheSink> = io_mmu::IoMMU<T>;
+pub(crate) type IoMMU<T = ICacheSink> = io_mmu::IoMMU<T>;
 
-pub fn empty_io_mmu() -> IoMMU {
+pub(crate) fn empty_io_mmu() -> IoMMU {
     IoMMU::new(CpuFabric::new())
 }
 
 static COMPILER: LazyLock<ExecIrCompiler> =
     LazyLock::new(|| ExecIrCompiler::default().with_show_disassmbly());
 
-pub fn compile(builder: ExecIrBuilder) -> CompiledExecChunk {
+pub(crate) fn compile(builder: ExecIrBuilder) -> CompiledExecChunk {
     COMPILER.compile(&builder.build(), CompileTier::Tier1)
 }
 
-pub fn call_compiled_full<T: ICache>(
+pub(crate) fn call_compiled_full<T: ICache>(
     compiled: &CompiledExecChunk,
     exec_state: &mut ExecState,
     io_mmu: &IoMMU<T>,
@@ -62,7 +62,7 @@ pub fn call_compiled_full<T: ICache>(
     })
 }
 
-pub fn call_compiled(compiled: &CompiledExecChunk, processor_state: &mut ExecState) -> u32 {
+pub(crate) fn call_compiled(compiled: &CompiledExecChunk, processor_state: &mut ExecState) -> u32 {
     call_compiled_full(
         compiled,
         processor_state,
@@ -72,7 +72,7 @@ pub fn call_compiled(compiled: &CompiledExecChunk, processor_state: &mut ExecSta
     )
 }
 
-pub fn run_full<T: ICache>(
+pub(crate) fn run_full<T: ICache>(
     builder: ExecIrBuilder,
     processor_state: &mut ExecState,
     io_mmu: &IoMMU<T>,
@@ -83,7 +83,7 @@ pub fn run_full<T: ICache>(
     call_compiled_full(&compiled, processor_state, io_mmu, setup, post_process)
 }
 
-pub fn run_with_mmu<T: ICache>(
+pub(crate) fn run_with_mmu<T: ICache>(
     builder: ExecIrBuilder,
     processor_state: &mut ExecState,
     io_mmu: &IoMMU<T>,
@@ -91,25 +91,25 @@ pub fn run_with_mmu<T: ICache>(
     run_full(builder, processor_state, io_mmu, |_, _, _| {}, |_, _, _| {})
 }
 
-pub fn run(builder: ExecIrBuilder, processor_state: &mut ExecState) -> u32 {
+pub(crate) fn run(builder: ExecIrBuilder, processor_state: &mut ExecState) -> u32 {
     let compiled = compile(builder);
     call_compiled(&compiled, processor_state)
 }
 
-pub fn run_success(builder: ExecIrBuilder, processor_state: &mut ExecState) {
+pub(crate) fn run_success(builder: ExecIrBuilder, processor_state: &mut ExecState) {
     assert_eq!(run(builder, processor_state), 0);
 }
 
-pub fn u64_const(builder: &mut ExecIrBuilder, value: u64) -> SSAValue {
+pub(crate) fn u64_const(builder: &mut ExecIrBuilder, value: u64) -> SSAValue {
     builder.iconst(IConst::u64(value))
 }
 
-pub fn store_x_const<const REG_IDX: u8>(builder: &mut ExecIrBuilder, value: u64) {
+pub(crate) fn store_x_const<const REG_IDX: u8>(builder: &mut ExecIrBuilder, value: u64) {
     let value = u64_const(builder, value);
     builder.store_x_reg::<REG_IDX>(value);
 }
 
-pub fn branch_to_store_x1(
+pub(crate) fn branch_to_store_x1(
     cond: SSAValue,
     builder: &mut ExecIrBuilder,
     non_zero_value: u64,
@@ -127,14 +127,14 @@ pub fn branch_to_store_x1(
     store_x_const::<1>(builder, zero_value);
 }
 
-pub fn store_bool_as_x_reg<const REG_IDX: u8>(builder: &mut ExecIrBuilder, cond: SSAValue) {
+pub(crate) fn store_bool_as_x_reg<const REG_IDX: u8>(builder: &mut ExecIrBuilder, cond: SSAValue) {
     let one = builder.iconst(IConst::u64(1));
     let zero = builder.iconst(IConst::u64(0));
     let value = builder.select(cond, one, zero);
     builder.store_x_reg::<REG_IDX>(value);
 }
 
-pub fn store_int_equals_as_x_reg<const REG_IDX: u8>(
+pub(crate) fn store_int_equals_as_x_reg<const REG_IDX: u8>(
     builder: &mut ExecIrBuilder,
     value: SSAValue,
     expected: IConst,
@@ -143,12 +143,15 @@ pub fn store_int_equals_as_x_reg<const REG_IDX: u8>(
     store_bool_as_x_reg::<REG_IDX>(builder, ok);
 }
 
-pub fn clear_pstate(builder: &mut ExecIrBuilder) {
+pub(crate) fn clear_pstate(builder: &mut ExecIrBuilder) {
     let zero = builder.iconst(IConst::u32(0));
     builder.store_pstate(zero);
 }
 
-pub fn store_pstate_equals_as_x_reg<const REG_IDX: u8>(builder: &mut ExecIrBuilder, expected: u32) {
+pub(crate) fn store_pstate_equals_as_x_reg<const REG_IDX: u8>(
+    builder: &mut ExecIrBuilder,
+    expected: u32,
+) {
     let pstate = builder.load_pstate();
     let ok = builder.icmp_imm(IntCmp::Equal, pstate, IConst::u32(expected));
     store_bool_as_x_reg::<REG_IDX>(builder, ok);

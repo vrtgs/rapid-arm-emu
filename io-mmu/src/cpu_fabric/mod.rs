@@ -1,7 +1,5 @@
-//! TODO add documentation
-
-use crate::cpu_fabric::dma_async_flusher::DmaAsyncFlusher;
 use crate::cpu_fabric::exclusive_monitor::ExclusiveMonitor;
+use crate::cpu_fabric::object_manager::ObjectManager;
 use crate::icache::ICache;
 use crate::page_table::MemoryBackedPage;
 use emu_abi::abort::AbortGuard;
@@ -9,13 +7,13 @@ use emu_abi::internal_traits::InitInPlace;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::sync::{Arc, Weak};
 
-pub(crate) mod dma_async_flusher;
 pub mod exclusive_monitor;
+pub(crate) mod object_manager;
 
 // dirty page manager
 pub(crate) struct CpuFabricInner<T: ?Sized + ICache> {
     monitor: ExclusiveMonitor,
-    dma_async_flusher: DmaAsyncFlusher,
+    dma_async_flusher: ObjectManager,
     zero_page: std::sync::OnceLock<Arc<MemoryBackedPage>>,
     instruction_cache: T,
 }
@@ -26,7 +24,7 @@ pub struct CpuFabric<T: ?Sized + ICache>(Arc<CpuFabricInner<T>>);
 pub(crate) struct CpuFabricWeak<T: ?Sized + ICache>(Weak<CpuFabricInner<T>>);
 
 impl<T: Sized + ICache> CpuFabricWeak<T> {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         const { Self(Weak::new()) }
     }
 
@@ -39,7 +37,11 @@ impl<T: Sized + ICache> CpuFabricWeak<T> {
 }
 
 impl<T: ?Sized + ICache> CpuFabricWeak<T> {
-    pub fn upgrade(&self) -> Option<CpuFabric<T>> {
+    pub(crate) fn is(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(crate) fn upgrade(&self) -> Option<CpuFabric<T>> {
         Some(CpuFabric(self.0.upgrade()?))
     }
 }
@@ -126,6 +128,10 @@ impl<T: ?Sized + ICache> CpuFabric<T> {
         wrapper: Weak<_>,
         create_wrapper: |this| Arc::downgrade(&this.0),
     );
+
+    pub(crate) fn downgrade(&self) -> CpuFabricWeak<T> {
+        CpuFabricWeak(Arc::downgrade(&self.0))
+    }
 }
 
 impl<T: ?Sized + ICache> Clone for CpuFabric<T> {
@@ -190,7 +196,7 @@ impl<T: ICache> CpuFabric<T> {
 
         let inner = impl_init_in_place! {
             monitor: ExclusiveMonitor,
-            dma_async_flusher: DmaAsyncFlusher,
+            dma_async_flusher: ObjectManager,
             zero_page: std::sync::OnceLock<Arc<MemoryBackedPage>>,
             instruction_cache: T,
         };
@@ -226,7 +232,7 @@ impl<T: ?Sized + ICache> CpuFabric<T> {
         &self.0.zero_page
     }
 
-    pub(crate) fn flusher(&self) -> &DmaAsyncFlusher {
+    pub(crate) fn object_manager(&self) -> &ObjectManager {
         &self.0.dma_async_flusher
     }
 }

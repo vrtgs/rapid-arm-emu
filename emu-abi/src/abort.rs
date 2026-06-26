@@ -6,6 +6,10 @@ impl AbortGuard {
     pub fn disarm(self) {
         core::mem::forget(self)
     }
+
+    pub fn abort(self) -> ! {
+        abort()
+    }
 }
 
 impl Drop for AbortGuard {

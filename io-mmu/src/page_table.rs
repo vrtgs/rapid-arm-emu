@@ -1,8 +1,8 @@
-use crate::cpu_fabric::dma_async_flusher::{DmaFlusherCallbacks, DmaFnCallback};
+use crate::cpu_fabric::object_manager::{FnCallback, ObjectSyncCallbacks};
 use crate::cpu_fabric::{CpuFabric, CpuFabricWeak};
-use crate::dma::DmaDevice;
 use crate::fault::{MemoryFault, ensure};
 use crate::icache::ICache;
+use crate::memory_object::MemoryObject;
 use crate::{PageTableAccess, memops};
 use crossbeam_utils::CachePadded;
 use emu_abi::abort::{abort, panic_abort};
@@ -15,8 +15,8 @@ use std::collections::hash_map::Entry;
 use std::convert::Infallible;
 use std::hint::cold_path;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 
 const PAGE_LAYOUT: std::alloc::Layout = {
     match std::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE) {
@@ -130,15 +130,15 @@ impl MemoryBackedPage {
         }
     }
 
-    fn fault_dma(
-        dma: &dyn DmaDevice,
+    pub(crate) fn fault_object(
+        object: &dyn MemoryObject,
         page_offset: PageNumber,
         cpu_fabric: impl FnOnce() -> CpuFabricWeak<dyn ICache>,
     ) -> anyhow::Result<Self> {
         unsafe {
             Self::alloc_with_init(
                 |page| {
-                    dma.fault_in_exclusive(
+                    object.fault_in_exclusive(
                         page_offset,
                         page.page_pointer_mut().as_non_null_ptr().cast::<u8>(),
                     )
@@ -272,93 +272,75 @@ impl Clone for MemoryBackedPage {
     }
 }
 
-// FIXME(std::sync::OnceLock::get_or_try_init)
-pub(crate) type SharedDmaPage = Arc<once_cell::sync::OnceCell<MemoryBackedPage>>;
+pub(crate) struct ObjectSlot {
+    pub(crate) page: once_cell::sync::OnceCell<Arc<MemoryBackedPage>>,
+    pub(crate) object: Arc<dyn MemoryObject>,
+    pub(crate) page_offset: PageNumber,
+}
 
 enum PageSource {
     Shared(Arc<MemoryBackedPage>),
     Private {
         page: Arc<MemoryBackedPage>,
-        // `write_protected` can't simply be `Arc::strong_count > 1`
-        // because if 2 threads fault on CoW, they race and only ONE
-        // ends up cloning it, the second thread now thinks that
-        // this page didn't fault on CoW and thinks this was a real fault,
-        // and therefore it kills that process, now we could make it make sure
-        // it had propper permissions, and allow it through if that is the case,
-        // but that would be confusing to debug and so an explicit flag will do for now
         write_protected: bool,
     },
 
-    // this lazily faults in a page on first access
-    // but never flushes and just acts exactly like
-    // a private mapping except it's a lazy fault_in
-    // I repeat this should **never** flush back
-    // to the DMA device, it only ever loads
-    PrivateDma {
-        // FIXME(std::sync::OnceLock::get_or_try_init)
-
-        // note: this Arc<MemoryBackedPage> to not blow up the size of the PageSource enum
-        page: once_cell::sync::OnceCell<Arc<MemoryBackedPage>>,
-        // TODO: drop these whenever fault is completed
-        //       basically reimplement LazyLock
-        //       but without the poisoning and
-        //       with the ability to clone
-        device: Arc<dyn DmaDevice>,
-        page_offset: PageNumber,
-    },
-
-    SharedDma {
-        page: SharedDmaPage,
-        device: Arc<dyn DmaDevice>,
-        page_offset: PageNumber,
+    Object {
+        slot: Arc<ObjectSlot>,
+        shared: bool,
     },
 }
 
 impl PageSource {
-    pub fn new_anon(page: MemoryBackedPage) -> Self {
+    fn new_private(page: MemoryBackedPage) -> Self {
         Self::Private {
             page: Arc::new(page),
             write_protected: false,
         }
     }
 
-    pub fn new_anon_cow(page: Arc<MemoryBackedPage>) -> Self {
+    fn new_private_cow(page: Arc<MemoryBackedPage>) -> Self {
         Self::Private {
             page,
             write_protected: true,
         }
     }
 
-    pub fn zeroed_cow<T: ?Sized + ICache>(cpu_fabric: &CpuFabric<T>) -> Self {
-        Self::new_anon_cow(zero_page(cpu_fabric))
+    fn zeroed_cow<T: ?Sized + ICache>(cpu_fabric: &CpuFabric<T>) -> Self {
+        Self::new_private_cow(zero_page(cpu_fabric))
     }
 
-    pub fn zeroed(cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>) -> Self {
-        Self::new_anon(MemoryBackedPage::alloc_zeroed(cpu_fabric))
+    fn zeroed(cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>) -> Self {
+        Self::new_private(MemoryBackedPage::alloc_zeroed(cpu_fabric))
     }
 
-    pub fn zeroed_shared(cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>) -> Self {
+    fn zeroed_shared(cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>) -> Self {
         Self::Shared(Arc::new(MemoryBackedPage::alloc_zeroed(cpu_fabric)))
     }
 
-    pub fn new_dma(device: Arc<dyn DmaDevice>, page_offset: PageNumber, shared: bool) -> Self {
-        match shared {
-            true => Self::SharedDma {
-                page: Arc::new(once_cell::sync::OnceCell::new()),
-                device,
-                page_offset,
-            },
-            false => Self::PrivateDma {
+    fn new_obj(object: Arc<dyn MemoryObject>, page_offset: PageNumber, shared: bool) -> Self {
+        Self::Object {
+            slot: Arc::new(ObjectSlot {
                 page: once_cell::sync::OnceCell::new(),
-                device,
+                object,
                 page_offset,
-            },
+            }),
+            shared,
         }
     }
 
-    pub fn fork(&mut self) -> Self {
+    fn fork(&mut self) -> Self {
         match self {
             Self::Shared(page) => Self::Shared(Arc::clone(page)),
+
+            &mut Self::Object {
+                slot: ref page,
+                shared: shared @ true,
+            } => Self::Object {
+                slot: Arc::clone(page),
+                shared,
+            },
+
             Self::Private {
                 page,
                 write_protected,
@@ -369,42 +351,17 @@ impl PageSource {
                     write_protected: true,
                 }
             }
-            Self::PrivateDma {
-                page,
-                device,
-                page_offset,
-            } => match page.get_mut() {
-                Some(_) => {
-                    let page = page.take().unwrap_or_else(|| abort());
-                    *self = Self::Private {
-                        page,
-                        write_protected: true,
-                    };
 
-                    let Self::Private { ref page, .. } = *self else {
-                        unreachable!()
-                    };
-
-                    Self::Private {
-                        page: Arc::clone(page),
-                        write_protected: true,
-                    }
+            &mut Self::Object {
+                ref slot,
+                shared: shared @ false,
+            } => match slot.page.get().cloned() {
+                Some(page) => {
+                    let page2 = Arc::clone(&page);
+                    *self = Self::new_private_cow(page);
+                    Self::new_private_cow(page2)
                 }
-                None => PageSource::PrivateDma {
-                    page: once_cell::sync::OnceCell::new(),
-                    device: Arc::clone(device),
-                    page_offset: *page_offset,
-                },
-            },
-
-            Self::SharedDma {
-                page,
-                device,
-                page_offset,
-            } => Self::SharedDma {
-                page: Arc::clone(page),
-                device: Arc::clone(device),
-                page_offset: *page_offset,
+                None => Self::new_obj(Arc::clone(&slot.object), slot.page_offset, shared),
             },
         }
     }
@@ -423,48 +380,42 @@ impl PageEntry {
         }
     }
 
-    pub fn new_zeroed_cow<T: ?Sized + ICache>(
-        mem_prot: MemProt,
-        cpu_fabric: &CpuFabric<T>,
-    ) -> Self {
+    fn new_zeroed_cow<T: ?Sized + ICache>(mem_prot: MemProt, cpu_fabric: &CpuFabric<T>) -> Self {
         Self::new_inner(PageSource::zeroed_cow(cpu_fabric), mem_prot)
     }
 
-    pub fn new_zeroed(
-        mem_prot: MemProt,
-        cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>,
-    ) -> Self {
+    fn new_zeroed(mem_prot: MemProt, cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>) -> Self {
         Self::new_inner(PageSource::zeroed(cpu_fabric), mem_prot)
     }
 
-    pub fn new_zeroed_shared(
+    fn new_zeroed_shared(
         mem_prot: MemProt,
         cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>,
     ) -> Self {
         Self::new_inner(PageSource::zeroed_shared(cpu_fabric), mem_prot)
     }
 
-    pub unsafe fn new_extern(
+    unsafe fn new_extern(
         ptr: PagePointer,
         mem_prot: MemProt,
         cpu_fabric: impl FnOnce() -> CpuFabricWeak<dyn ICache>,
     ) -> Self {
         let extern_page = unsafe { MemoryBackedPage::new_extern(ptr, cpu_fabric) };
 
-        Self::new_inner(PageSource::new_anon(extern_page), mem_prot)
+        Self::new_inner(PageSource::new_private(extern_page), mem_prot)
     }
 
-    pub unsafe fn new_extern_cow(
+    unsafe fn new_extern_cow(
         ptr: PagePointer,
         mem_prot: MemProt,
         cpu_fabric: impl FnOnce() -> CpuFabricWeak<dyn ICache>,
     ) -> Self {
         let extern_page = unsafe { MemoryBackedPage::new_extern(ptr, cpu_fabric) };
 
-        Self::new_inner(PageSource::new_anon_cow(Arc::new(extern_page)), mem_prot)
+        Self::new_inner(PageSource::new_private_cow(Arc::new(extern_page)), mem_prot)
     }
 
-    pub unsafe fn new_extern_shared(
+    unsafe fn new_extern_shared(
         ptr: PagePointer,
         mem_prot: MemProt,
         cpu_fabric: impl FnOnce() -> CpuFabricWeak<dyn ICache>,
@@ -474,31 +425,29 @@ impl PageEntry {
         Self::new_inner(PageSource::Shared(Arc::new(extern_page)), mem_prot)
     }
 
-    pub fn new_dma(
-        dma: Arc<dyn DmaDevice>,
+    fn new_obj(
+        object: Arc<dyn MemoryObject>,
         page_offset: PageNumber,
         shared: bool,
         prot: MemProt,
     ) -> Self {
-        let page = PageSource::new_dma(dma, page_offset, shared);
+        let page = PageSource::new_obj(object, page_offset, shared);
 
         Self::new_inner(page, prot)
     }
 
-    pub fn memprot(&mut self, new_prot: MemProt) {
+    pub(super) fn memprot(&mut self, new_prot: MemProt) {
         self.protections = new_prot;
     }
 
-    pub fn prot(&self) -> MemProt {
+    pub(super) fn prot(&self) -> MemProt {
         self.protections
     }
 
-    fn as_page_with_fault_inner(
-        &self,
-        make_cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>,
-    ) -> anyhow::Result<Page<'_>> {
+    fn as_page(&self) -> Option<Page<'_>> {
         let (mem_page, flags): (&MemoryBackedPage, MemFlags) = match &self.source {
             PageSource::Shared(page) => (page, MemFlags::from_prot(self.protections)),
+
             PageSource::Private {
                 page,
                 write_protected,
@@ -510,60 +459,39 @@ impl PageEntry {
 
                 (page, flags)
             }
-            PageSource::PrivateDma {
-                page,
-                device,
-                page_offset,
-            } => {
-                // this is an Anon page that hasn't been cowed yet
-                let flags = MemFlags::from_prot(self.protections);
-                let page = page.get_or_try_init(|| {
-                    MemoryBackedPage::fault_dma(&**device, *page_offset, make_cpu_fabric)
-                        .map(Arc::new)
-                })?;
-                (page, flags)
-            }
-            PageSource::SharedDma {
-                page,
-                device,
-                page_offset,
-            } => {
-                let flags = MemFlags::DMA_DEV | self.protections;
-                let page = page.get_or_try_init(|| {
-                    MemoryBackedPage::fault_dma(&**device, *page_offset, make_cpu_fabric)
-                })?;
+
+            &PageSource::Object { ref slot, shared } => {
+                let page = slot.page.get()?;
+                let flags = match shared {
+                    true => MemFlags::DMA_DEV | self.protections,
+                    false => MemFlags::from_prot(self.protections),
+                };
+
                 (page, flags)
             }
         };
 
-        Ok(Page {
+        Some(Page {
             ptr: TaggedPagePtr::new(mem_page.allocated_page, flags | self.protections),
             dirty_flags: &mem_page.dirty_page_flags,
         })
     }
 
-    fn as_page_with_fault<T: ?Sized + ICache>(
-        &self,
-        cpu_fabric: &CpuFabric<T>,
-    ) -> anyhow::Result<Page<'_>> {
-        self.as_page_with_fault_inner(&move || cpu_fabric.downgrade_dyn())
-    }
-
     // TODO(low priority) make this type erased by getting a DynCpuFabricRef type
     //                    this avoids cloning the `Arc`;
-    //                    note this is helpful for non dma pages like `Shared` and `Private`
+    //                    note this is helpful for non memory_object pages like `Shared` and `Private`
     //                    since it turns to just a cheap check and return
     fn flush_dyn(
         &self,
-        cpu_fabric: &CpuFabric<dyn ICache>,
-        make_callback: &mut dyn FnMut() -> Option<Box<dyn DmaFlusherCallbacks>>,
+        make_cpu_fabric: &dyn Fn() -> CpuFabric<dyn ICache>,
+        make_callback: Option<&mut dyn FnMut() -> Box<dyn ObjectSyncCallbacks>>,
     ) {
-        let backing_page: Option<&MemoryBackedPage> = match &self.source {
-            PageSource::Shared(page) | PageSource::Private { page, .. } => Some(page),
+        let page: &MemoryBackedPage = match &self.source {
+            PageSource::Shared(page) | PageSource::Private { page, .. } => page,
 
-            PageSource::PrivateDma { page, .. } => page.get().map(|a| &**a),
+            PageSource::Object { slot, .. } if let Some(page) = slot.page.get() => page,
 
-            PageSource::SharedDma { page, .. } => page.get(),
+            PageSource::Object { .. } => return,
         };
 
         // `dirty_page_flags` is a 2-bit state machine, not a lock: 00 clean,
@@ -607,103 +535,124 @@ impl PageEntry {
         // where the store is still invisible when the flag read happens.
         // Acquire/Release do not provide StoreLoad and are not a safe
         // substitute on any of these ops - do not weaken any ordering here without re-confirming.
-        if let Some(page) = backing_page {
-            let res = page
-                .dirty_page_flags
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
-                    const DIRTY_AND_FLUSHING: u8 = {
-                        let bits = Page::DIRTY_FLAG_IS_DIRTY | Page::DIRTY_FLAG_FLUSHING;
-                        assert!(bits.count_ones() == 2);
-                        bits
-                    };
+        let res = page
+            .dirty_page_flags
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+                const DIRTY_AND_FLUSHING: u8 = {
+                    let bits = Page::DIRTY_FLAG_IS_DIRTY | Page::DIRTY_FLAG_FLUSHING;
+                    assert!(bits.count_ones() == 2);
+                    bits
+                };
 
-                    match x {
-                        0 => None,
-                        Page::DIRTY_FLAG_FLUSHING | DIRTY_AND_FLUSHING => {
-                            cold_path();
-                            None
-                        }
-                        Page::DIRTY_FLAG_IS_DIRTY => {
-                            cold_path();
-                            Some(Page::DIRTY_FLAG_FLUSHING)
-                        }
-                        _ => panic_abort!("invalid page dirty state {x:02b}"),
+                match x {
+                    0 => None,
+                    Page::DIRTY_FLAG_FLUSHING | DIRTY_AND_FLUSHING => {
+                        cold_path();
+                        None
                     }
-                });
-
-            if let Err(0) = res {
-                return;
-            }
-
-            cpu_fabric.icache().invalidate(page.allocated_page);
-
-            let prev = page
-                .dirty_page_flags
-                .fetch_and(!Page::DIRTY_FLAG_FLUSHING, Ordering::SeqCst);
-
-            // if we won the epoch flush the DMA device
-            // sinc the DMA flushing part of is just a hint
-            // it doesn't need to be up to date
-            if (prev & Page::DIRTY_FLAG_FLUSHING) != 0
-                && let PageSource::SharedDma {
-                    page,
-                    device,
-                    page_offset,
-                } = &self.source
-            {
-                let flusher = cpu_fabric.flusher();
-                match make_callback() {
-                    Some(cb) => flusher.enqueue_with_cb(page, device, *page_offset, cb),
-                    None => flusher.enqueue(page, device, *page_offset),
+                    Page::DIRTY_FLAG_IS_DIRTY => {
+                        cold_path();
+                        Some(Page::DIRTY_FLAG_FLUSHING)
+                    }
+                    _ => panic_abort!("invalid page dirty state {x:02b}"),
                 }
-            }
+            });
+
+        if let Err(0) = res {
+            return;
+        }
+
+        let cpu_fabric = make_cpu_fabric();
+        cpu_fabric.icache().invalidate(page.allocated_page);
+
+        let prev = page
+            .dirty_page_flags
+            .fetch_and(!Page::DIRTY_FLAG_FLUSHING, Ordering::SeqCst);
+
+        // if we won the epoch flush the DMA device
+        // sinc the DMA flushing part of is just a hint
+        // it doesn't need to be up to date
+        if (prev & Page::DIRTY_FLAG_FLUSHING) != 0
+            && let PageSource::Object { slot, shared: true } = &self.source
+        {
+            let cb = make_callback.map(|cb| cb());
+            cpu_fabric.object_manager().enqueue_flush(slot, cb)
         }
     }
 
-    pub fn flush_async<T: ?Sized + ICache>(&self, cpu_fabric: &CpuFabric<T>) {
-        self.flush_dyn(&cpu_fabric.clone().into_dyn(), &mut || None)
+    pub(super) fn refresh<T: ?Sized + ICache>(&self, cpu_fabric: &CpuFabric<T>) {
+        self.flush_dyn(&|| cpu_fabric.clone().into_dyn(), None)
     }
 
-    pub(super) fn bad_api_flush<T: ?Sized + ICache>(
+    fn make_sync_callback(
+        rx: &mut Option<mpsc::Receiver<anyhow::Result<()>>>,
+    ) -> Box<dyn ObjectSyncCallbacks> {
+        assert!(rx.is_none());
+
+        let (tx, new_rx) = mpsc::sync_channel(1);
+        let callback = FnCallback::new_flush(move |res| {
+            let _ = tx.send({ res.map_err(|err| anyhow::Error::msg(format!("{err:#}"))) });
+        });
+
+        *rx = Some(new_rx);
+
+        Box::new(callback) as Box<dyn ObjectSyncCallbacks>
+    }
+
+    pub(super) fn flush_sync_inner<T: ?Sized + ICache>(
         &self,
         cpu_fabric: &CpuFabric<T>,
-    ) -> Option<std::sync::mpsc::Receiver<anyhow::Result<()>>> {
+    ) -> Option<mpsc::Receiver<anyhow::Result<()>>> {
         let mut rx = None;
-
-        let mut make_callback = || {
-            assert!(rx.is_none());
-
-            let (tx, new_rx) = std::sync::mpsc::sync_channel(1);
-            let callback = DmaFnCallback::new(move |res| {
-                let _ = tx.send(res.map_err(|err| anyhow::Error::msg(format!("{err:#}"))));
-            });
-
-            rx = Some(new_rx);
-
-            Some(Box::new(callback) as Box<dyn DmaFlusherCallbacks>)
-        };
-
-        self.flush_dyn(&cpu_fabric.clone().into_dyn(), &mut make_callback);
-
+        let mut make_callback = || Self::make_sync_callback(&mut rx);
+        self.flush_dyn(&|| cpu_fabric.clone().into_dyn(), Some(&mut make_callback));
         rx
     }
 
-    // pub fn flush<T: ?Sized + ICache>(&self, cpu_fabric: &CpuFabric<T>) -> anyhow::Result<()> {
-    //     if let Some(rx) = self.bad_api_flush(cpu_fabric) {
-    //         return rx.recv().unwrap_or_else(|_| anyhow::bail!("dma flusher thread exited"))
-    //     }
-    //
-    //     Ok(())
-    // }
+    // TODO(low priority) make this type erased by getting a DynCpuFabricRef type
+    //                    this avoids cloning the `Arc`;
+    //                    note this is helpful for non memory_object pages like `Shared` and `Private`
+    //                    since it turns to just a cheap check and return
+    fn init_page_dyn(
+        &self,
+        make_cpu_fabric: &dyn Fn() -> CpuFabric<dyn ICache>,
+        make_callback: Option<&mut dyn FnMut() -> Box<dyn ObjectSyncCallbacks>>,
+    ) {
+        let PageSource::Object {
+            ref slot,
+            shared: _,
+        } = self.source
+        else {
+            return;
+        };
 
-    pub fn fork(&mut self) -> Self {
+        if slot.page.get().is_some() {
+            return;
+        }
+
+        let cpu = make_cpu_fabric();
+        let cb = make_callback.map(|cb| cb());
+        cpu.object_manager().enqueue_init(slot, cpu.downgrade(), cb);
+    }
+
+    pub(super) fn load_obj_memory_sync_inner<T: ?Sized + ICache>(
+        &self,
+        cpu_fabric: &CpuFabric<T>,
+    ) -> Option<mpsc::Receiver<anyhow::Result<()>>> {
+        let mut rx = None;
+        let mut make_callback = || Self::make_sync_callback(&mut rx);
+        self.init_page_dyn(&|| cpu_fabric.clone().into_dyn(), Some(&mut make_callback));
+        rx
+    }
+
+    pub(super) fn fork(&mut self) -> Self {
         Self {
             source: self.source.fork(),
             protections: self.protections,
         }
     }
 
-    pub fn un_cow(&mut self) -> bool {
+    pub(super) fn un_cow(&mut self) -> bool {
         match self.source {
             PageSource::Private {
                 ref mut page,
@@ -712,15 +661,12 @@ impl PageEntry {
                 let was_cow = *write_protected;
                 if was_cow {
                     let _: &mut MemoryBackedPage = Arc::make_mut(page);
-                    *write_protected = false;
+                    *write_protected = false
                 }
-
                 was_cow
             }
 
-            PageSource::Shared(_)
-            | PageSource::PrivateDma { .. }
-            | PageSource::SharedDma { .. } => false,
+            PageSource::Shared(_) | PageSource::Object { .. } => false,
         }
     }
 }
@@ -742,9 +688,9 @@ pub(super) enum MemMapFlags {
 }
 
 pub(super) enum MapRegion {
-    Dma {
+    Object {
         shared: bool,
-        dev: Arc<dyn DmaDevice>,
+        object: Arc<dyn MemoryObject>,
     },
     Extern {
         flags: MemMapFlags,
@@ -758,12 +704,14 @@ pub(super) struct PageTable {
 }
 
 impl PageTable {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             table: HashMap::new(),
         }
     }
 
+    // TODO(low priority) make this type erased by getting a DynCpuFabricRef type
+    //                    instead of strong_cpu_fabric and cpu_fabric closures
     unsafe fn map_inner(
         &mut self,
         cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>,
@@ -782,7 +730,10 @@ impl PageTable {
             let page_offset = || unsafe { page.get().unchecked_sub(start_page.get()) };
 
             let mapped = match region {
-                MapRegion::Dma { shared, ref dev } => PageEntry::new_dma(
+                MapRegion::Object {
+                    shared,
+                    object: ref dev,
+                } => PageEntry::new_obj(
                     Arc::clone(dev),
                     unsafe { PageNumber::from_page_number_unchecked(page_offset()) },
                     shared,
@@ -819,7 +770,7 @@ impl PageTable {
         Ok(())
     }
 
-    pub unsafe fn map<T: ?Sized + ICache>(
+    pub(super) unsafe fn map<T: ?Sized + ICache>(
         &mut self,
         cpu_fabric: &CpuFabric<T>,
         pages: PageTableAccess,
@@ -837,7 +788,7 @@ impl PageTable {
         }
     }
 
-    pub fn unmap(&mut self, pages: PageTableAccess, mut removed: impl FnMut(PageEntry)) {
+    pub(super) fn unmap(&mut self, pages: PageTableAccess, mut removed: impl FnMut(PageEntry)) {
         for page in pages.iter() {
             if let Entry::Occupied(page_entry) = self.table.entry(page) {
                 removed(page_entry.remove());
@@ -845,7 +796,7 @@ impl PageTable {
         }
     }
 
-    pub fn modify(
+    pub(super) fn modify(
         &mut self,
         pages: PageTableAccess,
         mut modify: impl FnMut(PageNumber, &mut PageEntry),
@@ -862,36 +813,29 @@ impl PageTable {
         Ok(())
     }
 
-    pub fn get_page<T: ?Sized + ICache>(
-        &self,
-        page_num: PageNumber,
-        cpu_fabric: &CpuFabric<T>,
-    ) -> Result<Page<'_>, MemoryFault> {
+    pub(super) fn get_page(&self, page_num: PageNumber) -> Result<Page<'_>, MemoryFault> {
         self.table
             .get(&page_num)
+            .and_then(|page| page.as_page())
             .ok_or_else(|| MemoryFault::general_protection(page_num.vaddr_base()))
-            .and_then(|page| {
-                page.as_page_with_fault(cpu_fabric)
-                    .map_err(|err| MemoryFault::memory_bus(page_num.vaddr_base(), err))
-            })
     }
 
-    // TODO(low priority) have a set tracking all executable pages / dma pages
+    // TODO(low priority) have a set tracking all executable pages / memory_object pages
     //      meaning cache invalidation can happen faster;
     //      its low priority because cache invalidation doesn't happen often
-    pub fn pages(&self) -> impl Iterator<Item = (PageNumber, &PageEntry)> {
+    pub(super) fn pages(&self) -> impl Iterator<Item = (PageNumber, &PageEntry)> {
         self.table
             .iter()
             .map(|(&page_num, entry)| (page_num, entry))
     }
 
-    pub fn pages_mut(&mut self) -> impl Iterator<Item = (PageNumber, &mut PageEntry)> {
+    pub(super) fn pages_mut(&mut self) -> impl Iterator<Item = (PageNumber, &mut PageEntry)> {
         self.table
             .iter_mut()
             .map(|(&page_num, entry)| (page_num, entry))
     }
 
-    pub fn fork(&mut self) -> Self {
+    pub(super) fn fork(&mut self) -> Self {
         let table = self
             .table
             .iter_mut()

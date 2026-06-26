@@ -22,13 +22,13 @@ use crate::ExecIr;
 use crate::compiler::{CompileBlockOptions, CompiledExecChunk};
 use anyhow::bail;
 
-pub struct LLVMJit {
+pub(crate) struct LLVMJit {
     // target_triple: TargetTriple,
     // jit: LLJit,
 }
 
 impl LLVMJit {
-    pub fn new() -> anyhow::Result<Self> {
+    pub(crate) fn new() -> anyhow::Result<Self> {
         // llvm_bindings::init_llvm().and_then(|()| {
         //     Ok(Self {
         //         jit: LLJit::new()?,
@@ -39,7 +39,7 @@ impl LLVMJit {
         bail!("llvm jit still unimplemented")
     }
 
-    pub fn try_compile(
+    pub(crate) fn try_compile(
         &self,
         options: CompileBlockOptions,
         exec_ir: &ExecIr,

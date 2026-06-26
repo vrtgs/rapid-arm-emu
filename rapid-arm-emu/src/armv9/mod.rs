@@ -61,7 +61,7 @@ impl Armv9CpuCore {
             if let Some(reason) = halt_reason {
                 if reason == HaltReason::FLUSH_INSN_CACHE {
                     state.code_cache.invalidate();
-                    self.mmu.flush_async();
+                    self.mmu.refresh();
                     continue;
                 }
 

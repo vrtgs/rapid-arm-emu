@@ -4,9 +4,9 @@ use std::collections::HashSet;
 use emu_abi::convert::usize_to_u64;
 use emu_abi::internal_traits::InitInPlace;
 use emu_abi::memory::{MemProt, PAGE_SIZE, PAGE_SIZE_U64, PageNumber, PagePointer, Tlb};
-use io_mmu::NoCache;
 use io_mmu::cpu_fabric::CpuFabric;
 use io_mmu::icache::ICache;
+use io_mmu::lookup_cache::NoCache;
 use parking_lot::Mutex;
 use std::mem::MaybeUninit;
 use std::num::NonZero;
@@ -127,7 +127,7 @@ fn read_array<const N: usize>(mmu: &IoMMU, vaddr: u64) -> [u8; N] {
 }
 
 fn is_dirty(mmu: &IoMMU, page: usize) -> bool {
-    mmu.flush_async();
+    mmu.refresh();
 
     const BASE_PAGE: u64 = {
         assert!(BASE.is_multiple_of(PAGE_SIZE_U64));
@@ -1370,6 +1370,8 @@ fn dma_file_faults_in_written_data() {
     mmu.map_device(BASE, PAGE_SIZE_U64, file, shared, MemProt::READ)
         .unwrap();
 
+    mmu.fault_in_all_memory_objects().unwrap();
+
     let got = read_array::<PAGE_SIZE>(&mmu, BASE);
     assert_eq!(got, expected);
 }
@@ -1391,6 +1393,8 @@ fn dma_file_faults_in_across_multiple_pages() {
     mmu.map_device(BASE, size, file, shared, MemProt::READ)
         .unwrap();
 
+    mmu.fault_in_all_memory_objects().unwrap();
+
     for p in 0..pages {
         let addr = page_addr(p);
         assert_eq!(
@@ -1410,9 +1414,7 @@ fn dma_file_faults_on_read_past_eof() {
     mmu.map_device(BASE, PAGE_SIZE_U64, file, shared, MemProt::READ)
         .unwrap();
 
-    TLB.with_borrow_mut(|tlb| {
-        assert!(mmu.load_byte(&mut *tlb, BASE).is_err());
-    });
+    assert!(mmu.fault_in_all_memory_objects().is_err());
 }
 
 #[test]
@@ -1427,6 +1429,8 @@ fn dma_file_partial_page_zero_fills_tail() {
     let shared = false;
     mmu.map_device(BASE, PAGE_SIZE_U64, file, shared, MemProt::READ)
         .unwrap();
+
+    mmu.fault_in_all_memory_objects().unwrap();
 
     let got = read_array::<PAGE_SIZE>(&mmu, BASE);
     assert_eq!(got[..WRITTEN], pattern_array::<WRITTEN>(BASE));
@@ -1450,6 +1454,8 @@ fn dma_file_store_then_load_roundtrips() {
         MemProt::READ | MemProt::WRITE,
     )
     .unwrap();
+
+    mmu.fault_in_all_memory_objects().unwrap();
 
     TLB.with_borrow_mut(|tlb| {
         mmu.store_byte(&mut *tlb, BASE, 0xab).unwrap();
@@ -1478,6 +1484,8 @@ fn dma_file_respects_protections() {
     mmu.map_device(BASE, PAGE_SIZE_U64, file, shared, MemProt::READ)
         .unwrap();
 
+    mmu.fault_in_all_memory_objects().unwrap();
+
     TLB.with_borrow_mut(|tlb| {
         assert!(mmu.load_byte(&mut *tlb, BASE).is_ok());
         assert!(mmu.store_byte(&mut *tlb, BASE, 0xaa).is_err());
@@ -1503,6 +1511,8 @@ fn dma_shared_flush_writes_dirty_pages_to_device() {
     )
     .unwrap();
 
+    mmu.fault_in_all_memory_objects().unwrap();
+
     let new_page = [0xab; PAGE_SIZE];
 
     TLB.with_borrow_mut(|tlb| mmu.store(&mut *tlb, BASE, &new_page).unwrap());
@@ -1519,9 +1529,9 @@ fn dma_shared_flush_writes_dirty_pages_to_device() {
 fn dma_exclusive_flush_does_not_write_to_device() {
     use std::io::{Read, Seek, Write};
 
-    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    let mut tmp = tempfile::tempfile().unwrap();
     tmp.write_all(&[0u8; PAGE_SIZE]).unwrap();
-    let device = tmp.reopen().unwrap();
+    let device = tmp.try_clone().unwrap();
 
     let mut mmu = IoMMU::new(CpuFabric::new());
     let shared = false;
@@ -1533,6 +1543,8 @@ fn dma_exclusive_flush_does_not_write_to_device() {
         MemProt::READ | MemProt::WRITE,
     )
     .unwrap();
+
+    mmu.fault_in_all_memory_objects().unwrap();
 
     TLB.with_borrow_mut(|tlb| mmu.store_byte(&mut *tlb, BASE, 0xab).unwrap());
 
@@ -1565,6 +1577,8 @@ fn dma_shared_fork_shares_pages_if_faulted_before() {
     )
     .unwrap();
 
+    mmu.fault_in_all_memory_objects().unwrap();
+
     // fault in before fork
     TLB.with_borrow_mut(|tlb| {
         assert_eq!(mmu.load_byte(&mut *tlb, BASE).unwrap(), 0);
@@ -1596,6 +1610,8 @@ fn dma_shared_fork_shares_pages_if_faulted_after() {
     )
     .unwrap();
 
+    mmu.fault_in_all_memory_objects().unwrap();
+
     let child = mmu.fork();
 
     TLB.with_borrow_mut(|tlb| {
@@ -1621,6 +1637,8 @@ fn dma_exclusive_fork_does_not_share_pages() {
         MemProt::READ | MemProt::WRITE,
     )
     .unwrap();
+
+    mmu.fault_in_all_memory_objects().unwrap();
 
     TLB.with_borrow_mut(|tlb| {
         mmu.store_byte(&mut *tlb, BASE, 0xaa).unwrap();

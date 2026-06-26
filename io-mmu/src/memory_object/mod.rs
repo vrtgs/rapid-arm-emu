@@ -4,14 +4,14 @@ use std::ptr::NonNull;
 use std::sync::atomic::AtomicU8;
 
 mod r#impl;
+pub mod objects;
 
-/// A backing device that services demand-paging faults for DMA-accessible memory.
+/// A memory object that services demand-paging faults.
 ///
-/// A `DmaDevice` is the source of truth for the contents of a range of pages
-/// identified by [`PageNumber`].
+/// A `MemoryObject` is the source of truth for the contents of a range of pages identified by [`PageNumber`].
 /// The paging layer calls into this trait for:
-///  - *fault in* a page (read the device's data for some [`PageNumber`] into a host page)
-///  - *fault out* a page (Write a host page's contents back to the device for some [`PageNumber`])
+///  - *fault in* a page (read the object's data for some [`PageNumber`] into a host page)
+///  - *fault out* a page (Write a host page's contents back to the object for some [`PageNumber`])
 ///
 /// Each operation comes in two flavors:
 ///
@@ -68,11 +68,11 @@ mod r#impl;
 /// Implementors may assume that callers uphold the per-method preconditions documented in
 /// each method's `# Safety` section (pointer validity, `PAGE_SIZE` alignment, exclusivity
 /// for the exclusive variants, and the atomic-access discipline for the shared variants).
-pub unsafe trait DmaDevice: 'static + Send + Sync {
+pub unsafe trait MemoryObject: 'static + Send + Sync {
     /// Faults in the page identified by `page_offset`, filling the exclusively owned host
     /// page at `page_ptr` with its contents.
     ///
-    /// On success the entire page is initialized with the device's data for `page_offset`
+    /// On success the entire page is initialized with the object's data for `page_offset`
     /// (see the trait-level `# Safety` contract). On failure the page may be left partially
     /// initialized, and an error describing the fault is returned.
     ///
@@ -86,7 +86,7 @@ pub unsafe trait DmaDevice: 'static + Send + Sync {
     /// * The caller has exclusive access to the page for the duration of the call: no other
     ///   thread or DMA agent may read or write it concurrently.
     ///
-    /// `page_offset` need not be serviceable by the device; an out-of-range or otherwise
+    /// `page_offset` need not be serviceable by the object; an out-of-range or otherwise
     /// unserviceable page must be reported as `Err` rather than causing undefined behavior.
     ///
     /// [valid]: core::ptr#safety
@@ -99,9 +99,9 @@ pub unsafe trait DmaDevice: 'static + Send + Sync {
     /// Faults out the exclusively owned host page at `page_ptr`, writing its contents back
     /// to the page identified by `page_offset`.
     ///
-    /// The full page is read and persisted to the device; the page itself is treated as
+    /// The full page is read and persisted to the object; the page itself is treated as
     /// read-only. On failure an error describing the fault is returned, and whether the
-    /// device-side state was partially updated is implementation-defined.
+    /// object-side state was partially updated is implementation-defined.
     ///
     /// # Safety
     ///
@@ -189,7 +189,7 @@ pub unsafe trait DmaDevice: 'static + Send + Sync {
     /// Unlike [`fault_out_exclusive`](Self::fault_out_exclusive), the source page may be
     /// concurrently accessed by other agents through single-byte atomic operations. The
     /// loads are not coordinated as a unit: if another agent mutates the page while it is
-    /// being read, the bytes persisted to the device are an arbitrary interleaving across
+    /// being read, the bytes persisted to the object are an arbitrary interleaving across
     /// time (each byte read atomically), the same tearing you would see from a concurrent
     /// `msync`. The page is only ever read, never written. The only promises are the
     /// trait-level ones: atomic access exclusively, and all access complete before the

@@ -217,7 +217,7 @@ mod tests {
         }
     }
 
-    pub fn new_arc_monitor() -> std::sync::Arc<ExclusiveMonitor> {
+    fn new_arc_monitor() -> std::sync::Arc<ExclusiveMonitor> {
         let mut uninit = std::sync::Arc::new_uninit();
         ExclusiveMonitor::init(std::sync::Arc::get_mut(&mut uninit).unwrap());
         unsafe { uninit.assume_init() }

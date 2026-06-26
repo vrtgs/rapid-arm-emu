@@ -1,8 +1,10 @@
-use crate::dma::r#impl::io_at::IoAt;
+use crate::memory_object::r#impl::io_at::IoAt;
+use crate::memory_object::objects;
 use anyhow::bail;
 use emu_abi::convert::usize_to_u64;
 use emu_abi::memory::{PAGE_SIZE, PageNumber};
 use std::io;
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
 mod io_at {
@@ -42,7 +44,7 @@ mod io_at {
     }
 }
 
-unsafe impl super::DmaDevice for std::fs::File {
+unsafe impl super::MemoryObject for std::fs::File {
     unsafe fn fault_in_exclusive(
         &self,
         page_offset: PageNumber,
@@ -124,6 +126,23 @@ unsafe impl super::DmaDevice for std::fs::File {
             }
         }
 
+        Ok(())
+    }
+}
+
+unsafe impl super::MemoryObject for objects::OsRng {
+    unsafe fn fault_in_exclusive(&self, _: PageNumber, page: NonNull<u8>) -> anyhow::Result<()> {
+        let page = unsafe { page.cast::<[MaybeUninit<u8>; PAGE_SIZE]>().as_mut() };
+        getrandom::fill_uninit(page)?;
+        Ok(())
+    }
+
+    unsafe fn fault_out_exclusive(
+        &self,
+        page_offset: PageNumber,
+        page_ptr: NonNull<u8>,
+    ) -> anyhow::Result<()> {
+        let _ = (page_offset, page_ptr);
         Ok(())
     }
 }

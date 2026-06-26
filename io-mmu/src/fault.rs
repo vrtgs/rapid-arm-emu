@@ -1,20 +1,18 @@
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryFaultReason {
-    #[error("invalid memory permisions")]
+    #[error("invalid memory permissions")]
     GeneralProtection,
     #[error("invalid memory access {0}")]
     MemoryBus(anyhow::Error),
 }
 
-/// Fault returned when a memory access is invalid.
-///
-/// This is returned when an access:
-/// - targets an unmapped page,
-/// - violates page permissions,
-/// - overflows the virtual address range,
-/// - fails an address-alignment check required by a specific operation,
-/// - crosses into an unmapped or insufficiently-permitted page,
-/// - or otherwise fails MMU validation.
+/// This is returned when a memory access:
+/// - Targets an unmapped page,
+/// - Violates page permissions,
+/// - Overflows the virtual address range,
+/// - Fails an address-alignment check required by a specific operation,
+/// - Crosses into an unmapped or insufficiently-permitted page,
+/// - Or otherwise fails MMU validation.
 #[derive(Debug, thiserror::Error)]
 #[error("memory fault at {vaddr}: {reason}")]
 pub struct MemoryFault {
@@ -23,18 +21,18 @@ pub struct MemoryFault {
 }
 
 impl MemoryFault {
-    #[inline(always)]
     #[cold]
+    #[inline(always)]
     pub const fn general_protection(vaddr: u64) -> Self {
-        std::hint::cold_path();
         Self {
             vaddr,
             reason: MemoryFaultReason::GeneralProtection,
         }
     }
 
+    #[cold]
+    #[inline(always)]
     pub const fn memory_bus(vaddr: u64, reason: anyhow::Error) -> Self {
-        std::hint::cold_path();
         Self {
             vaddr,
             reason: MemoryFaultReason::MemoryBus(reason),

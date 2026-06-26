@@ -42,8 +42,13 @@ features = [
     "extern_crate_alloc"
 ]
 
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "warn"
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "forbid"
+unreachable_pub = "warn"
+#missing_docs = "deny"
 
 [workspace.lints.clippy]
 # F32 -> F64, Int -> Float, etc.

@@ -625,12 +625,12 @@ impl Tlb {
     ///
     /// TODO
     #[inline(always)]
-    pub unsafe fn lookup<'a>(
+    pub unsafe fn lookup<'a, E>(
         &mut self,
         page_num: PageNumber,
         ident: IoMMUIdentifierRef,
-        fallback: impl FnOnce(PageNumber) -> Option<Page<'a>>,
-    ) -> Option<Page<'a>> {
+        fallback: impl FnOnce(PageNumber) -> Result<Page<'a>, E>,
+    ) -> Result<Page<'a>, E> {
         let entry = self.entry(page_num);
 
         if !std::ptr::addr_eq(entry.io_mmu_ident.as_ptr(), ident.ptr().as_ptr())
@@ -639,10 +639,10 @@ impl Tlb {
             cold_path();
             let page = fallback(page_num)?;
             entry.update_entry(ident, page_num, page);
-            return Some(page);
+            return Ok(page);
         }
 
-        Some(unsafe {
+        Ok(unsafe {
             Page {
                 ptr: entry.tagged_page_ptr.unwrap_unchecked(),
                 dirty_flags: entry.insn_dirty_ptr.unwrap_unchecked().as_ref(),
