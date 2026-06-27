@@ -591,7 +591,7 @@ impl PageEntry {
 
         let (tx, new_rx) = mpsc::sync_channel(1);
         let callback = FnCallback::new_flush(move |res| {
-            let _ = tx.send({ res.map_err(|err| anyhow::Error::msg(format!("{err:#}"))) });
+            let _ = tx.send(res.map_err(|err| anyhow::Error::msg(format!("{err:#}"))));
         });
 
         *rx = Some(new_rx);

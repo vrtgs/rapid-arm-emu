@@ -507,3 +507,24 @@ impl Default for ObjectManager {
         Self::new(queue_limit)
     }
 }
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+
+    #[test]
+    fn sanity_check() {
+        // note this is required for the correctness of the object manager,
+        // but the current documentation of
+        // [`Weak::as_ptr`](https://doc.rust-lang.org/std/sync/struct.Weak.html#method.as_ptr)
+        // explicitly states that this relation doesn't need to hold as of rust version 1.96.0
+        let strong = Arc::new("sanity check");
+        let weak = Arc::downgrade(&strong);
+        let strong_ptr = Arc::as_ptr(&strong);
+
+        drop(strong);
+
+        // Both point to the same object
+        assert!(std::ptr::eq(strong_ptr, weak.as_ptr()));
+    }
+}

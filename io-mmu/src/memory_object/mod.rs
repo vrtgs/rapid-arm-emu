@@ -51,14 +51,17 @@ pub mod objects;
 ///    reads the whole scratch page only after a successful return, so reporting `Ok` over
 ///    a partially initialized page is undefined behavior.
 ///
-/// 2. **Shared variants never deinitialize and touch bytes only atomically.** Any
-///    implementation of [`fault_in`](Self::fault_in) or [`fault_out`](Self::fault_out)
-///    (including overrides) may access the bytes of the shared page *only* through
-///    single-byte atomic operations, and must never cause any byte to become
-///    uninitialized. It must not perform non-atomic accesses, accesses wider than one
-///    byte, or any `write` that leaves a byte uninitialized. Other agents may be performing
-///    concurrent single-byte atomic accesses to the same page; anything else is a data
-///    race.
+/// 2. **Shared variants never deinitialize and touch bytes only through [`memops`].**
+///    Any implementation of [`fault_in`](Self::fault_in) or [`fault_out`](Self::fault_out)
+///    (including overrides) may access the bytes of the shared page *only* through the
+///    functions in [`memops`](crate::memops), and must never cause any byte to become
+///    uninitialized. It must not reach for `AtomicU8`'s inherent methods, hand-rolled
+///    atomic accesses, non-atomic accesses, accesses wider than one byte, or any `write`
+///    that leaves a byte uninitialized. `memops` is the single audited interface for this
+///    page representation: it is the only place the mixed-size-atomic access discipline is
+///    known to be upheld, so going around it forfeits that guarantee. Other agents may be
+///    performing concurrent accesses through `memops` to the same page; anything else is a
+///    data race.
 ///
 /// 3. **All access completes before returning.** Every access an implementation makes to
 ///    the page must finish before the method returns. The implementation must not retain
@@ -142,11 +145,11 @@ pub unsafe trait MemoryObject: 'static + Send + Sync {
     /// nevertheless remains initialized, so this is not undefined behavior.
     ///
     /// The default implementation faults into a private, exclusively owned scratch page via
-    /// [`fault_in_exclusive`](Self::fault_in_exclusive) and copies it over with per-byte
-    /// atomic stores; an override may instead transfer directly into the shared page. Either
-    ///  way, the trait-level shared-access guarantees must hold (single-byte atomics only,
-    /// never deinitialize).
-    ///
+    /// [`fault_in_exclusive`](Self::fault_in_exclusive) and copies it over using
+    /// [`memops`](crate::memops); an override may instead transfer directly into the shared
+    /// page, but every access it makes to the shared page must still go through
+    /// [`memops`](crate::memops). Either way, the trait-level shared-access guarantees must
+    /// hold (shared-page access through `memops` only, never deinitialize).    ///
     /// # Safety
     ///
     /// The caller must ensure that:
@@ -154,8 +157,6 @@ pub unsafe trait MemoryObject: 'static + Send + Sync {
     /// * `page_ptr` points to a single live allocation of `PAGE_SIZE` consecutive
     ///   [`AtomicU8`] that is [valid] for atomic reads and writes.
     /// * `page_ptr` is aligned to `PAGE_SIZE`.
-    // this next point may not be true because I am using mixed-sized atomics as acting
-    // as if they are just `N` uninterruptible atomic accesses
     /// * For the duration of the call, every access to the page from any agent (including
     ///   this call) must be single-byte atomic access; no party performs non-atomic access or
     ///   access wider than one byte.
@@ -196,10 +197,11 @@ pub unsafe trait MemoryObject: 'static + Send + Sync {
     /// method returns.
     ///
     /// The default implementation reads the shared page into a private, exclusively owned
-    /// scratch page with per-byte atomic loads and faults that out via
+    /// scratch page using [`memops`](crate::memops) and faults that out via
     /// [`fault_out_exclusive`](Self::fault_out_exclusive); an override may instead read
-    /// directly from the shared page. Either way, the trait-level shared-access guarantees
-    /// must hold (single-byte atomics only, never deinitialize).
+    /// directly from the shared page, but every access it makes to the shared page must still
+    /// go through [`memops`](crate::memops). Either way, the trait-level shared-access
+    /// guarantees must hold (shared-page access through `memops` only, never deinitialize).
     ///
     /// # Safety
     ///
@@ -208,8 +210,6 @@ pub unsafe trait MemoryObject: 'static + Send + Sync {
     /// * `page_ptr` points to a single live allocation of `PAGE_SIZE` consecutive
     ///   [`AtomicU8`] that is [valid] for atomic reads and writes.
     /// * `page_ptr` is aligned to `PAGE_SIZE`.
-    // this next point may not be true because I am using mixed-sized atomics as acting
-    // as if they are just `N` uninterruptible atomic accesses
     /// * For the duration of the call, every access to the page from any agent (including
     ///   this call) must be single-byte atomic access; no party performs non-atomic access or
     ///   access wider than one byte.

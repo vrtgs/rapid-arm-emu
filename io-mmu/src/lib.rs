@@ -22,7 +22,7 @@ pub mod cpu_fabric;
 pub mod fault;
 pub mod icache;
 pub mod lookup_cache;
-mod memops;
+pub mod memops;
 pub mod memory_object;
 mod page_table;
 
@@ -177,24 +177,24 @@ impl<T: ?Sized + ICache> IoMMU<T> {
     /// - `size` must be page-aligned,
     /// - `ptr` must be aligned to the page size,
     /// - `base + size` must not overflow.
-    /// - no mapping exists in the range `base..(base + size)`
+    /// - No mapping exists in the range `base..(base + size)`
     ///
     /// Permissions are applied to every mapped page in the region.
     ///
     /// # Safety
     ///
     /// The caller must ensure that:
-    /// - `ptr .. ptr + size` is valid for the lifetime of this MMU mapping,
+    /// - `ptr..(ptr + size)` is valid for the lifetime of this MMU mapping,
     ///
-    /// - the pointed-to memory is initialized
+    /// - The pointed-to memory is initialized
     ///
-    /// - the pointed-to memory is valid for both reads at the host-memory
+    /// - The pointed-to memory is valid for both reads at the host-memory
     ///   level, regardless of the guest permissions applied by `protections`
-    ///   and it also must have write permisions set if `readonly = false`
+    ///   and it also must have write permissions set if `readonly = false`
     ///
-    /// - if `readonly = false` the backing memory is not accessed directly
+    /// - If `readonly = false`, the backing memory is not accessed directly
     ///   while this mapping is alive, except by other MMUs that use the same `CpuFabric`
-    ///   and if `readonly = true` then the memory pointed to by pointer must not be read
+    ///   and if `readonly = true`, then the memory pointed to by pointer must not be read
     ///   while this mapping is alive
     pub unsafe fn map_extern(
         &mut self,
@@ -344,7 +344,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         required_prot: impl Into<Option<MemProt>> + Copy,
         no_cow: bool,
         mut per_page_commit: impl FnMut(PageNumber, Page<'_>),
-        mut step: impl FnMut(*const AtomicU8, *mut u8),
+        copy: impl Fn(*const AtomicU8, *mut u8, usize),
     ) -> Result<(), MemoryFault> {
         let len = u64::try_from(len).map_err(|_| {
             // len > u64::MAX
@@ -415,14 +415,10 @@ impl<T: ?Sized + ICache> IoMMU<T> {
                     .unchecked_add(page_start)
                     .unchecked_sub(start_offset);
 
-                let src = { page.ptr.page_ptr().byte_add(page_start).as_ptr() };
-
-                let dst = mem_ptr.add(dst_start).cast::<u8>();
-                for i in 0..page_end.unchecked_sub(page_start) {
-                    let vm_ptr = src.add(i);
-                    let mem_ptr = dst.add(i);
-                    step(vm_ptr, mem_ptr)
-                }
+                let vm_ptr = { page.ptr.page_ptr().byte_add(page_start).as_ptr() };
+                let host_ptr = mem_ptr.add(dst_start).cast::<u8>();
+                let count = page_end.unchecked_sub(page_start);
+                copy(vm_ptr, host_ptr, count);
 
                 // only run per page after running the access loop
                 // this is so that when storing; instructions dirty
@@ -458,9 +454,8 @@ impl<T: ?Sized + ICache> IoMMU<T> {
                 required_prot,
                 no_cow,
                 |_, _| {},
-                |vm_ptr, mem_ptr| {
-                    let byte = memops::load_byte(vm_ptr);
-                    std::ptr::write(mem_ptr, byte);
+                |vm_ptr, mem_ptr, count| {
+                    memops::copy_non_overlapping_vm_to_host(vm_ptr, mem_ptr, count);
                 },
             )?
         }
@@ -573,9 +568,8 @@ impl<T: ?Sized + ICache> IoMMU<T> {
                 required_prot,
                 no_cow,
                 |_page_num, page| page.set_dirty(),
-                |vm_ptr, mem_ptr| {
-                    let byte = std::ptr::read(mem_ptr);
-                    memops::store_byte(vm_ptr, byte)
+                |vm_ptr, mem_ptr, count| {
+                    memops::copy_non_overlapping_host_to_vm(mem_ptr, vm_ptr, count);
                 },
             )
         }
@@ -624,7 +618,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
 }
 
 impl<T: ?Sized + ICache> IoMMU<T> {
-    #[inline]
+    #[inline(always)]
     fn single_page_aligned_access<const ACCESS_SIZE: u8>(
         &self,
         mut cache: impl LookupCache,
@@ -668,15 +662,11 @@ impl<T: ?Sized + ICache> IoMMU<T> {
             //     PAGE_SIZE - ACCESS_SIZE
             //
             // Therefore:
-            //
-            //     offset <= PAGE_SIZE - ACCESS_SIZE
-            //
+            //      - `offset <= PAGE_SIZE - ACCESS_SIZE`
             // which is equivalent to:
-            //
-            //     offset < PAGE_SIZE - ACCESS_SIZE + 1
-            //
-            // Thus an ACCESS_SIZE-byte access starting at `offset` cannot cross the
-            // page boundary.
+            //      - `offset < PAGE_SIZE - ACCESS_SIZE + 1`
+            // Thus access of size `ACCESS_SIZE` starting at `offset`
+            // cannot cross the page boundary.
             let max_offset_exclusive =
                 const { PAGE_SIZE.strict_sub(ACCESS_SIZE as usize).strict_add(1) };
 
@@ -721,8 +711,6 @@ impl<T: ?Sized + ICache> IoMMU<T> {
     }
 }
 
-// TODO re implement scalar acess propperly
-//      and add a direct load_with_tlb, store_with_tlb
 #[derive(Copy, Clone)]
 struct SecondPage<'a> {
     page: Page<'a>,
@@ -737,7 +725,7 @@ struct SmallAccess<'a> {
 
 impl<T: ?Sized + ICache> IoMMU<T> {
     #[inline(always)]
-    fn static_small_multibyte_acces<const BYTES: usize>(
+    fn static_small_multibyte_access<const BYTES: usize>(
         &self,
         mut cache: impl LookupCache,
         vaddr: u64,
@@ -803,11 +791,11 @@ macro_rules! emit_multi_word_load_store {
             ///
             /// This safe function must not invoke undefined behavior.
             pub fn $load_name(&self, cache: impl LookupCache, vaddr: u64) -> Result<$ty, MemoryFault> {
-                let access = self.static_small_multibyte_acces::<{ size_of::<$ty>() }>(cache, vaddr)?;
+                let access = self.static_small_multibyte_access::<{ size_of::<$ty>() }>(cache, vaddr)?;
 
                 let value = match access.second_page {
                     // SAFETY:
-                    // `static_small_multibyte_acces` returned `None` for `second_page`, so
+                    // `static_small_multibyte_access` returned `None` for `second_page`, so
                     // this access is fully contained in `base_page`.
                     //
                     // Therefore:
@@ -903,12 +891,12 @@ macro_rules! emit_multi_word_load_store {
 
                         // SAFETY:
                         // `overflow_amount` is a `NonZero<u8>`, so it is at least `1`.
-                        // `static_small_multibyte_acces` also guarantees
+                        // `static_small_multibyte_access` also guarantees
                         // `overflow_amount < BYTES`.
                         //
                         // Therefore:
                         //
-                        //   0 < overflow_amount * 8 < $bits
+                        //   `0 < overflow_amount * 8 < $bits`
                         //
                         // So multiplying by 8 cannot overflow `u8` for the supported
                         // widths, and the resulting bit offset is strictly less than the
@@ -959,11 +947,11 @@ macro_rules! emit_multi_word_load_store {
             ///
             /// This safe function must not invoke undefined behavior.
             pub fn $store_name(&self, cache: impl LookupCache, vaddr: u64, value: $ty) -> Result<(), MemoryFault> {
-                let access = self.static_small_multibyte_acces::<{ size_of::<$ty>() }>(cache, vaddr)?;
+                let access = self.static_small_multibyte_access::<{ size_of::<$ty>() }>(cache, vaddr)?;
 
                 match access.second_page {
                     // SAFETY:
-                    // `static_small_multibyte_acces` returned `None` for `second_page`, so
+                    // `static_small_multibyte_access` returned `None` for `second_page`, so
                     // this access is fully contained in `base_page`.
                     //
                     // Therefore:
@@ -1062,7 +1050,7 @@ macro_rules! emit_multi_word_load_store {
 
 emit_multi_word_load_store! { 64, 32, 16 }
 
-const AARCH64_WORD_ALIGN: u8 = 4;
+const AARCH64_INSN_ALIGN: u8 = 4;
 
 impl<T: ?Sized + ICache> IoMMU<T> {
     #[inline]
@@ -1071,7 +1059,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         cache: impl LookupCache,
         vaddr: u64,
     ) -> Result<(PagePointer, usize), MemoryFault> {
-        let (page, offset) = self.single_page_aligned_access::<AARCH64_WORD_ALIGN>(cache, vaddr)?;
+        let (page, offset) = self.single_page_aligned_access::<AARCH64_INSN_ALIGN>(cache, vaddr)?;
 
         ensure!(vaddr: vaddr, page.ptr.flags().contains_any(MemFlags::EXECUTE));
         let page_ptr = page.ptr.page_ptr();
@@ -1144,7 +1132,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
 impl<T: ?Sized + ICache> IoMMU<T> {
     /// # Safety
     ///
-    /// `ManuallyDrop<IoMMU<dyn ICache>>` must only be used whilsy self is alive
+    /// `ManuallyDrop<IoMMU<dyn ICache>>` must only be used whilst self is alive
     pub unsafe fn as_ffi<'a>(
         &'a self,
     ) -> (IoMMUIdentifierRef<'a>, ManuallyDrop<IoMMU<dyn ICache>>) {

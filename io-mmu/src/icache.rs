@@ -5,15 +5,17 @@ mod sealed {
 
     /// # Safety
     ///
-    /// must provide a pointer with the metadata of self
+    /// must provide a pointer with the metadata of self without panicking
     pub unsafe trait DynUpgrade {
-        fn get_metadata_ptr<'a>(&self) -> *const (dyn ICache + 'a)
+        extern "C" fn get_metadata_ptr<'a>(&self) -> *const (dyn ICache + 'a)
         where
             Self: 'a;
     }
 
     unsafe impl<T: Sized + ICache> DynUpgrade for T {
-        fn get_metadata_ptr<'a>(&self) -> *const (dyn ICache + 'a)
+        // Note: we use `extern "C"` to mark the function no_unwind
+        #[allow(improper_ctypes_definitions)]
+        extern "C" fn get_metadata_ptr<'a>(&self) -> *const (dyn ICache + 'a)
         where
             T: 'a,
         {
