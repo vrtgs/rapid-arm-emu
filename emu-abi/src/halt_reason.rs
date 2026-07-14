@@ -3,10 +3,16 @@ use std::hash::{Hash, Hasher};
 use std::num::NonZero;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// The reason why an emulated CPU core stopped execution.
+///
+/// Encoded as a packed `(opcode, metadata)` pair that fits in a single `u32`.
+/// The `opcode` is always non-zero so that a zeroed word represents "no halt pending".
 #[derive(Copy, Clone)]
 #[repr(C, align(4))]
 pub struct HaltReason {
+    /// Identifies the kind of halt (see `OPCODE_*` constants).
     pub opcode: NonZero<u16>,
+    /// Additional data whose meaning depends on `opcode`.
     pub metadata: u16,
 }
 
@@ -36,10 +42,12 @@ const _: () = {
 };
 
 impl HaltReason {
+    /// Reinterprets this halt reason as a [`NonZero<u32>`] for atomic storage.
     pub const fn as_nz_u32(self) -> NonZero<u32> {
         unsafe { core::mem::transmute::<Self, NonZero<u32>>(self) }
     }
 
+    /// Reconstructs a [`HaltReason`] from its [`NonZero<u32>`] representation.
     pub const fn from_u32(bits: NonZero<u32>) -> Self {
         unsafe { core::mem::transmute::<NonZero<u32>, Self>(bits) }
     }
@@ -137,33 +145,46 @@ impl Hash for HaltReason {
 }
 
 impl HaltReason {
+    /// Constructs a [`HaltReason`] with the given opcode and metadata.
     #[inline(always)]
     pub const fn new(opcode: NonZero<u16>, metadata: u16) -> Self {
         Self { opcode, metadata }
     }
 
     // Associated constants instead of module-level private consts
+    /// Opcode for an invalid or undefined instruction trap.
     pub const OPCODE_INVALID_INSN: NonZero<u16> = NonZero::new(1).unwrap();
+    /// Opcode requesting an instruction cache flush.
     pub const OPCODE_FLUSH_INSN_CACHE: NonZero<u16> = NonZero::new(2).unwrap();
+    /// Opcode for an unaligned program counter fault.
     pub const OPCODE_UNALIGNED_PC: NonZero<u16> = NonZero::new(3).unwrap();
+    /// Opcode for a memory access fault; `metadata` carries the access size in bytes.
     pub const OPCODE_MEMORY_TRAP: NonZero<u16> = NonZero::new(4).unwrap();
+    /// Opcode for an inter-processor interrupt; `metadata` carries the IPI tag.
     pub const OPCODE_IPI: NonZero<u16> = NonZero::new(5).unwrap();
 
+    /// Metadata tag identifying a synchronous IPI.
     pub const IPI_SYNC_TAG: u16 = 1;
 
+    /// Halt reason requesting a full instruction cache flush.
     pub const FLUSH_INSN_CACHE: Self = Self::new(Self::OPCODE_FLUSH_INSN_CACHE, 0);
 
+    /// Halt reason for an invalid or undefined instruction.
     pub const INVALID_INSN: Self = Self::new(Self::OPCODE_INVALID_INSN, 0);
 
+    /// Halt reason for an unaligned program counter.
     pub const UNALIGNED_PC: Self = Self::new(Self::OPCODE_UNALIGNED_PC, 0);
 
+    /// Creates a memory trap halt reason for an access of `access_size_in_bytes` bytes.
     pub const fn memory_trap(access_size_in_bytes: u8) -> Self {
         Self::new(Self::OPCODE_MEMORY_TRAP, access_size_in_bytes as u16)
     }
 
+    /// Halt reason for a synchronous inter-processor interrupt.
     pub const IPI_SYNC: Self = Self::new(Self::OPCODE_IPI, Self::IPI_SYNC_TAG);
 }
 
+/// An atomically updated halt reason used to signal a CPU core from another thread.
 pub struct AtomicHaltReason(AtomicU32);
 
 impl Default for AtomicHaltReason {
@@ -173,14 +194,19 @@ impl Default for AtomicHaltReason {
 }
 
 impl AtomicHaltReason {
+    /// Creates a new [`AtomicHaltReason`] with no pending halt.
     pub const fn new() -> Self {
         Self(AtomicU32::new(0))
     }
 
+    /// Stores `reason` as the pending halt, signalling the CPU core to stop.
     pub fn halt(&self, reason: HaltReason) {
         self.0.store(reason.as_nz_u32().get(), Ordering::Release)
     }
 
+    /// Atomically takes and clears the pending halt reason.
+    ///
+    /// Returns `None` if no halt was pending.
     #[inline]
     pub fn take(&self) -> Option<HaltReason> {
         let bits = self.0.swap(0, Ordering::AcqRel);
@@ -199,6 +225,7 @@ impl AtomicHaltReason {
 }
 
 impl AtomicHaltReason {
+    /// Returns a reference to the underlying [`AtomicU32`] for FFI use.
     pub const fn as_ffi(&self) -> &AtomicU32 {
         &self.0
     }

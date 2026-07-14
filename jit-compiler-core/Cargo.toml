@@ -2,7 +2,7 @@
 workspace = true
 
 [package]
-name = "exec-ir"
+name = "jit-compiler-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -21,12 +21,12 @@ stacker = "0.1.24"
 [dependencies.gccjit]
 version = "3.3.0"
 
-[dependencies.llvm-sys-221]
-version = "221.0.0"
-package = "llvm-sys"
-features = ["force-static"]
+#[dependencies.llvm-sys-221]
+#version = "221.0.0"
+#package = "llvm-sys"
+#features = ["force-static"]
 
 [dependencies.cranelift]
-version = "0.133.0"
+version = "0.133.1"
 features = ["jit", "frontend", "native", "module"]
 

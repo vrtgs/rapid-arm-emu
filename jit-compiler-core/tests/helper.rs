@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 #![allow(
     dead_code,
     reason = "not all of this module is always used by the test modules"
@@ -7,10 +8,12 @@ use emu_abi::exec_state::ExecState;
 use emu_abi::halt_reason::AtomicHaltReason;
 use emu_abi::internal_traits::InitInPlace;
 use emu_abi::memory::{PagePointer, Tlb};
-use exec_ir::compiler::{CompileTier, CompiledExecChunk, ExecIrCompiler};
-use exec_ir::{ExecIrBuilder, ExecStateExtra, IConst, IntCmp, SSAValue, Terminator};
 use io_mmu::cpu_fabric::CpuFabric;
 use io_mmu::icache::ICache;
+use jit_compiler_core::chunk::CompiledExecChunk;
+use jit_compiler_core::compiler::{CompileTier, ExecIrCompiler};
+use jit_compiler_core::exec_context::ExecContext;
+use jit_compiler_core::ir::{ExecIrBuilder, IConst, IntCmp, SSAValue, Terminator};
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
 use std::sync::LazyLock;
@@ -38,7 +41,7 @@ pub(crate) fn empty_io_mmu() -> IoMMU {
 }
 
 static COMPILER: LazyLock<ExecIrCompiler> =
-    LazyLock::new(|| ExecIrCompiler::default().with_show_disassmbly());
+    LazyLock::new(|| ExecIrCompiler::default().with_show_disassembly());
 
 pub(crate) fn compile(builder: ExecIrBuilder) -> CompiledExecChunk {
     COMPILER.compile(&builder.build(), CompileTier::Tier1)
@@ -55,7 +58,7 @@ pub(crate) fn call_compiled_full<T: ICache>(
     setup(exec_state, io_mmu, &halt_reason);
 
     TLB.with_borrow_mut(|tlb| {
-        let mut extra = ExecStateExtra::initial();
+        let mut extra = ExecContext::initial();
         let trap = compiled.call::<T>(exec_state, &mut extra, tlb, &halt_reason, io_mmu);
         post_process(exec_state, io_mmu, &halt_reason);
         trap

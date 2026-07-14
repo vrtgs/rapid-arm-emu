@@ -1,7 +1,9 @@
+#![allow(missing_docs)]
+
 use crate::helper::{call_compiled, compile, empty_io_mmu, run_full, run_success, store_x_const};
 use emu_abi::exec_state::ExecState;
 use emu_abi::halt_reason::HaltReason;
-use exec_ir::{ExecIrBuilder, IConst, IntWidth, IrBuilderConfig, Terminator};
+use jit_compiler_core::ir::{ExecIrBuilder, IConst, IntWidth, IrBuilderConfig, Terminator};
 use std::num::NonZero;
 
 mod helper;

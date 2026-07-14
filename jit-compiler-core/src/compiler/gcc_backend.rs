@@ -1,11 +1,12 @@
 use crate::arena::{ArenaMap, to_raw};
-use crate::compiler::{CompileBlockOptions, CompiledExecChunk, ExecBlockFFI};
-use crate::{
+use crate::chunk::ExecChunkFFI;
+use crate::compiler::{CompileBlockOptions, CompiledExecChunk};
+use crate::ir::{
     Arg, ArithBinOp, BitwiseOp, CallbackSignature, ExecIr, IConst, IntCmp, IntWidth, LoadType,
     MAX_STMT_OUTPUTS, OverflowingBinOp, SSAValue, ShiftOp, StackSlot, StmtData, StmtKind,
     Terminator, TerminatorKind,
 };
-use crate::{Block as IrBlock, Jump as IrJump, Type as IrType};
+use crate::ir::{Block as IrBlock, Jump as IrJump, TypeFull as IrType};
 use anyhow::{Context, bail, ensure};
 use arrayvec::ArrayVec;
 use gccjit::{
@@ -304,8 +305,9 @@ impl<'ctx> FunctionLowering<'ctx> {
     }
 
     fn iconst_rvalue(&mut self, iconst: IConst) -> RValue<'ctx> {
-        let ty = self.type_cache.resolve_uint(self.ctx, iconst.width);
-        self.ctx.new_rvalue_from_long(ty, iconst.bits.cast_signed())
+        let ty = self.type_cache.resolve_uint(self.ctx, iconst.width());
+        self.ctx
+            .new_rvalue_from_long(ty, iconst.bits().cast_signed())
     }
 
     fn u32_const(&self, v: u32) -> RValue<'ctx> {
@@ -345,9 +347,10 @@ impl<'ctx> FunctionLowering<'ctx> {
         let u8_ty = self.type_cache.resolve_uint(self.ctx, IntWidth::W8);
         let element_struct_ty = match elem_size.get() {
             1 => u8_ty,
-            _ => self
-                .ctx
-                .new_array_type(None, u8_ty, elem_size.get().try_into()?),
+            size => {
+                let size = u64::try_from(size).context("element size too large")?;
+                self.ctx.new_array_type(None, u8_ty, size)
+            }
         };
 
         let element_ptr_ty = element_struct_ty.make_pointer();
@@ -486,12 +489,12 @@ impl<'ctx> FunctionLowering<'ctx> {
         self.cast(value, int_ty)
     }
 
-    fn lower_atomic_fence(&mut self, ordering: Ordering) {
-        let atomic_load_fn = self.ctx.get_builtin_function("__atomic_thread_fence");
-        let ordering = self.ordering_int(ordering);
-        let value = self.ctx.new_call(None, atomic_load_fn, &[ordering]);
-        self.current_block.unwrap().add_eval(None, value);
-    }
+    // fn lower_atomic_fence(&mut self, ordering: Ordering) {
+    //     let atomic_load_fn = self.ctx.get_builtin_function("__atomic_thread_fence");
+    //     let ordering = self.ordering_int(ordering);
+    //     let value = self.ctx.new_call(None, atomic_load_fn, &[ordering]);
+    //     self.current_block.unwrap().add_eval(None, value);
+    // }
 
     fn lower_atomic_store(
         &mut self,
@@ -598,16 +601,18 @@ impl<'ctx> FunctionLowering<'ctx> {
             ShiftOp::SignExtendShr => {
                 let signed_int_ty = self.type_cache.resolve_sint(self.ctx, width);
                 let signed_val = self.cast(val, signed_int_ty);
+                let signed_shift = self.cast(shift, signed_int_ty);
                 let result = self.ctx.new_binary_op(
                     None,
                     BinaryOp::RShift,
                     signed_int_ty,
                     signed_val,
-                    shift,
+                    signed_shift,
                 );
 
                 self.cast(result, ty)
             }
+
             ShiftOp::Shl => self
                 .ctx
                 .new_binary_op(None, BinaryOp::LShift, ty, val, shift),
@@ -648,7 +653,7 @@ impl<'ctx> FunctionLowering<'ctx> {
         rvalue: &StmtKind,
         outputs: &[SSAValue],
     ) -> anyhow::Result<Option<ArrayVec<RValue<'ctx>, MAX_STMT_OUTPUTS>>> {
-        use crate::array_helper::{empty, from_arr};
+        use emu_abi::array_helper::{empty, from_arr};
 
         Ok(Some(match *rvalue {
             StmtKind::IConst(iconst) => from_arr([self.iconst_rvalue(iconst)]),
@@ -691,13 +696,6 @@ impl<'ctx> FunctionLowering<'ctx> {
                 };
 
                 from_arr([res])
-            }
-
-            StmtKind::AddImm { value, imm64 } => {
-                let val = self.use_value(value)?;
-                let ty = val.get_type();
-                let imm = self.ctx.new_rvalue_from_long(ty, imm64.cast_signed());
-                from_arr([self.ctx.new_binary_op(None, BinaryOp::Plus, ty, val, imm)])
             }
 
             StmtKind::IntNeg(val) => {
@@ -772,6 +770,18 @@ impl<'ctx> FunctionLowering<'ctx> {
             }
 
             StmtKind::Shift { op, value, shift } => {
+                let IrType::Int(width) = self.exec_ir.ssa_values[value].ty else {
+                    bail!("can't shift non integer")
+                };
+
+                let val = self.use_value(value)?;
+                let shift = self.use_value(shift)?;
+                let result = self.lower_shift(op, width, val, shift)?;
+
+                from_arr([result])
+            }
+
+            StmtKind::ShiftUnbounded { op, value, shift } => {
                 let val = self.use_value(value)?;
                 let shift = self.use_value(shift)?;
                 let ty = val.get_type();
@@ -780,6 +790,8 @@ impl<'ctx> FunctionLowering<'ctx> {
                     bail!("can't shift non integer")
                 };
 
+                let width_bits = i32::try_from(width.bits()).context("int width too large")?;
+
                 // if shift >= bits, clamp result
                 // aka in range is !(shift >= bits)
                 // aka shift < bits
@@ -787,10 +799,7 @@ impl<'ctx> FunctionLowering<'ctx> {
                     None,
                     ComparisonOp::LessThan,
                     shift,
-                    self.ctx.new_rvalue_from_int(
-                        shift.get_type(),
-                        i32::try_from(width.bits()).context("int width too large")?,
-                    ),
+                    self.ctx.new_rvalue_from_int(shift.get_type(), width_bits),
                 );
 
                 let &[output] = outputs.as_array().unwrap();
@@ -807,7 +816,7 @@ impl<'ctx> FunctionLowering<'ctx> {
                     ShiftOp::SignExtendShr => {
                         let shift = self.ctx.new_rvalue_from_int(
                             ty,
-                            i32::try_from(width.bits().strict_sub(1)).context("shift too wide")?,
+                            width_bits.cast_unsigned().strict_sub(1).cast_signed(),
                         );
 
                         self.lower_shift(ShiftOp::SignExtendShr, width, val, shift)?
@@ -998,11 +1007,17 @@ impl<'ctx> FunctionLowering<'ctx> {
                 aligned_page_ptr,
                 page_offset,
                 width,
+                seq_cst,
             } => {
+                let ordering = if seq_cst {
+                    Ordering::SeqCst
+                } else {
+                    Ordering::Relaxed
+                };
                 let base = self.use_value(aligned_page_ptr)?;
                 let off = self.use_value(page_offset)?;
                 let ptr = self.ptr_byte_add(base, off)?;
-                let load_res = self.lower_atomic_load(width, ptr, Ordering::Relaxed);
+                let load_res = self.lower_atomic_load(width, ptr, ordering);
                 from_arr([self.lower_bswap_to_le(width, load_res)])
             }
 
@@ -1010,7 +1025,14 @@ impl<'ctx> FunctionLowering<'ctx> {
                 aligned_page_ptr,
                 page_offset,
                 value,
+                seq_cst,
             } => {
+                let ordering = if seq_cst {
+                    Ordering::SeqCst
+                } else {
+                    Ordering::Relaxed
+                };
+
                 let width = match self.exec_ir.ssa_values[value].ty {
                     IrType::Int(width) => width,
                     _ => unreachable!(),
@@ -1022,7 +1044,7 @@ impl<'ctx> FunctionLowering<'ctx> {
                 let ptr = self.ptr_byte_add(base, off)?;
                 let le_value = self.lower_bswap_to_le(width, val);
 
-                self.lower_atomic_store(width, ptr, le_value, Ordering::Relaxed);
+                self.lower_atomic_store(width, ptr, le_value, ordering);
 
                 empty()
             }
@@ -1041,18 +1063,12 @@ impl<'ctx> FunctionLowering<'ctx> {
                 from_arr([old_val])
             }
 
-            StmtKind::GetInstructionDirtyFlag(insn_dirty) => {
-                let ptr = self.use_value(insn_dirty)?;
-                self.lower_atomic_fence(Ordering::SeqCst);
-                let flag = self.lower_atomic_load(IntWidth::W8, ptr, Ordering::SeqCst);
-                from_arr([flag])
-            }
-
-            StmtKind::SetInstructionDirtyFlag(insn_dirty) => {
+            StmtKind::SetPageDirtyFlag(insn_dirty) => {
                 let ptr = self.use_value(insn_dirty)?;
                 let true_val = self.u8_const(1);
                 let rvalue =
-                    self.lower_atomic_fetch_or(IntWidth::W8, ptr, true_val, Ordering::SeqCst);
+                    self.lower_atomic_fetch_or(IntWidth::W8, ptr, true_val, Ordering::Release);
+
                 self.current_block.unwrap().add_eval(None, rvalue);
                 empty()
             }
@@ -1198,6 +1214,7 @@ impl GccJit {
                 ctx.set_debug_info(false);
                 ctx.set_dump_everything(false);
 
+
                 // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=66594
                 // ctx.add_command_line_option("-march=native");
                 ctx.add_command_line_option("-mtune=native");
@@ -1240,11 +1257,11 @@ impl GccJit {
                     )
                 })?;
 
-            let ffi: ExecBlockFFI = unsafe {
+            let ffi: ExecChunkFFI = unsafe {
                 // Safety:
-                // - The signature declared above must exactly match ExecBlockFFI.
-                // - `result` is kept alive inside the CompiledExecChunk resources.
-                std::mem::transmute::<*const (), ExecBlockFFI>(code_ptr.as_ptr())
+                // - The signature declared above must exactly match ExecChunkFFI.
+                // - `result` is kept alive inside the compiled chunk resources.
+                std::mem::transmute::<*const (), ExecChunkFFI>(code_ptr.as_ptr())
             };
 
             struct DropResult {
@@ -1252,12 +1269,13 @@ impl GccJit {
             }
 
             // Safety: gccjit documents that it is safe to transfer `gcc_jit_result`
-            //         between threads, and also use `gcc_jit_contexts` and share them between threads
+            //         between threads, and also use `gcc_jit_contexts`
+            //         and share them between threads
             // https://gcc.gnu.org/onlinedocs/jit/topics/contexts.html#thread-safety
             // TODO: open an issue in gccjit
             unsafe impl Send for DropResult {}
 
-            Ok(CompiledExecChunk::new_with_recources(
+            Ok(CompiledExecChunk::new_with_resources(
                 ffi,
                 DropResult {
                     _keep_alive: result,

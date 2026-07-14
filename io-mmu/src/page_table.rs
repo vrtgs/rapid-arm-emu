@@ -1,17 +1,16 @@
 use crate::cpu_fabric::object_manager::{FnCallback, ObjectSyncCallbacks};
-use crate::cpu_fabric::{CpuFabric, CpuFabricWeak};
+use crate::cpu_fabric::{CpuFabric, CpuFabricWeak, DynCpuFabricRef};
 use crate::fault::{MemoryFault, ensure};
 use crate::icache::ICache;
 use crate::memory_object::MemoryObject;
 use crate::{PageTableAccess, memops};
 use crossbeam_utils::CachePadded;
-use emu_abi::abort::{abort, panic_abort};
+use emu_abi::abort::{AbortGuard, abort, panic_abort};
 use emu_abi::convert::u64_to_usize;
 use emu_abi::memory::{
-    MemFlags, MemProt, PAGE_SIZE, Page, PageNumber, PagePointer, TaggedPagePtr, UninitPageMut,
+    MemFlags, MemProt, PAGE_SIZE, Page, PageNumber, PagePointer, TaggedPagePtr, UninitPage,
 };
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::convert::Infallible;
 use std::hint::cold_path;
 use std::ptr::NonNull;
@@ -56,46 +55,44 @@ unsafe fn dealloc_page(ptr: PagePointer) {
     unsafe { std::alloc::dealloc(ptr.as_non_null_ptr().cast().as_ptr(), PAGE_LAYOUT) }
 }
 
+struct MutablePageData {
+    flags: AtomicU8,
+    // this mutex exists purely to serialize icache flush.
+    flush_gate: parking_lot::Mutex<()>,
+}
+
 pub(crate) struct MemoryBackedPage {
     allocated_page: PagePointer,
-    cpu_fabric: CpuFabricWeak<dyn ICache>,
+    cpu_fabric: CpuFabricWeak,
     should_dealloc: bool,
-    dirty_page_flags: CachePadded<AtomicU8>,
+    mut_page_data: CachePadded<MutablePageData>,
 }
 
 impl MemoryBackedPage {
     unsafe fn try_make_new<E>(
         alloc: impl FnOnce() -> PagePointer,
-        should_dealloc: bool,
-        modify: impl FnOnce(&mut UninitPageMut) -> Result<(), E>,
-        cpu_fabric: impl FnOnce() -> CpuFabricWeak<dyn ICache>,
+        modify: impl FnOnce(&mut UninitPage) -> Result<(), E>,
+        cpu_fabric: impl FnOnce() -> CpuFabricWeak,
     ) -> Result<Self, E> {
-        enum VoidCache {}
-
-        impl ICache for VoidCache {
-            fn invalidate(&self, _: PagePointer) {
-                match *self {}
-            }
-        }
-
         let mut this = Self {
             allocated_page: alloc(),
-            should_dealloc,
-            dirty_page_flags: CachePadded::new(AtomicU8::new(0)),
-            cpu_fabric: (const { CpuFabricWeak::<VoidCache>::new() }).into_dyn(),
+            should_dealloc: true,
+            mut_page_data: CachePadded::new(MutablePageData {
+                flags: AtomicU8::new(0),
+                flush_gate: parking_lot::Mutex::new(()),
+            }),
+            cpu_fabric: CpuFabricWeak::invalid(),
         };
 
-        modify(unsafe { UninitPageMut::from_ptr(this.allocated_page) })?;
+        modify(unsafe { UninitPage::from_ptr(this.allocated_page) })?;
         this.cpu_fabric = cpu_fabric();
         Ok(this)
     }
 
-    fn alloc_zeroed(cpu_fabric: impl FnOnce() -> CpuFabricWeak<dyn ICache>) -> Self {
-        let should_dealloc = true;
+    fn alloc_zeroed(cpu_fabric: impl FnOnce() -> CpuFabricWeak) -> Self {
         let Ok(page) = unsafe {
             Self::try_make_new(
                 || alloc_page_zeroed(),
-                should_dealloc,
                 |_| Ok::<(), Infallible>(()),
                 cpu_fabric,
             )
@@ -107,16 +104,15 @@ impl MemoryBackedPage {
     /// # Safety
     /// must init the full page
     unsafe fn alloc_with_init<E>(
-        init: impl FnOnce(&mut UninitPageMut) -> Result<(), E>,
-        cpu_fabric: impl FnOnce() -> CpuFabricWeak<dyn ICache>,
+        init: impl FnOnce(&mut UninitPage) -> Result<(), E>,
+        cpu_fabric: impl FnOnce() -> CpuFabricWeak,
     ) -> Result<Self, E> {
-        let should_dealloc = true;
-        unsafe { Self::try_make_new(|| alloc_page_uninit(), should_dealloc, init, cpu_fabric) }
+        unsafe { Self::try_make_new(|| alloc_page_uninit(), init, cpu_fabric) }
     }
 
     unsafe fn new_extern(
         allocated_page: PagePointer,
-        cpu_fabric: impl FnOnce() -> CpuFabricWeak<dyn ICache>,
+        cpu_fabric: impl FnOnce() -> CpuFabricWeak,
     ) -> Self {
         // doing it this way because dropping this in the middle of
         // initializing the cpu_fabric does nothing, there is nothing to dealloc
@@ -125,7 +121,10 @@ impl MemoryBackedPage {
         Self {
             allocated_page,
             should_dealloc: false,
-            dirty_page_flags: CachePadded::new(AtomicU8::new(0)),
+            mut_page_data: CachePadded::new(MutablePageData {
+                flags: AtomicU8::new(0),
+                flush_gate: parking_lot::Mutex::new(()),
+            }),
             cpu_fabric,
         }
     }
@@ -133,7 +132,7 @@ impl MemoryBackedPage {
     pub(crate) fn fault_object(
         object: &dyn MemoryObject,
         page_offset: PageNumber,
-        cpu_fabric: impl FnOnce() -> CpuFabricWeak<dyn ICache>,
+        cpu_fabric: impl FnOnce() -> CpuFabricWeak,
     ) -> anyhow::Result<Self> {
         unsafe {
             Self::alloc_with_init(
@@ -195,7 +194,7 @@ const WORDS_IN_PAGE: usize = {
 #[inline]
 pub(crate) unsafe fn copy_page_shared_to_exclusive(
     shared: PagePointer,
-    exclusive: &mut UninitPageMut,
+    exclusive: &mut UninitPage,
 ) {
     let dst_ptr = exclusive
         .page_pointer_mut()
@@ -214,7 +213,7 @@ pub(crate) unsafe fn copy_page_shared_to_exclusive(
 }
 
 #[inline]
-pub(crate) unsafe fn copy_page_exclusive_to_shared(exclusive: &UninitPageMut, shared: PagePointer) {
+pub(crate) unsafe fn copy_page_exclusive_to_shared(exclusive: &UninitPage, shared: PagePointer) {
     let src_ptr = exclusive
         .page_pointer_ref()
         .as_non_null_ptr()
@@ -230,16 +229,16 @@ pub(crate) unsafe fn copy_page_exclusive_to_shared(exclusive: &UninitPageMut, sh
     }
 }
 
-fn zero_page<T: ?Sized + ICache>(cpu_fabric: &CpuFabric<T>) -> Arc<MemoryBackedPage> {
+fn zero_page(cpu_fabric: &DynCpuFabricRef) -> Arc<MemoryBackedPage> {
     #[cold]
     #[inline(never)]
-    fn init(cpu_fabric: CpuFabricWeak<dyn ICache>) -> Arc<MemoryBackedPage> {
+    fn init(cpu_fabric: CpuFabricWeak) -> Arc<MemoryBackedPage> {
         Arc::new(MemoryBackedPage::alloc_zeroed(move || cpu_fabric))
     }
 
     cpu_fabric
         .zero_page()
-        .get_or_init(move || init(cpu_fabric.downgrade_dyn()))
+        .get_or_init(move || init(cpu_fabric.downgrade()))
         .clone()
 }
 
@@ -306,16 +305,20 @@ impl PageSource {
         }
     }
 
-    fn zeroed_cow<T: ?Sized + ICache>(cpu_fabric: &CpuFabric<T>) -> Self {
+    fn zeroed_cow(cpu_fabric: &DynCpuFabricRef) -> Self {
         Self::new_private_cow(zero_page(cpu_fabric))
     }
 
-    fn zeroed(cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>) -> Self {
-        Self::new_private(MemoryBackedPage::alloc_zeroed(cpu_fabric))
+    fn zeroed(cpu_fabric: &DynCpuFabricRef) -> Self {
+        Self::new_private(MemoryBackedPage::alloc_zeroed(move || {
+            cpu_fabric.downgrade()
+        }))
     }
 
-    fn zeroed_shared(cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>) -> Self {
-        Self::Shared(Arc::new(MemoryBackedPage::alloc_zeroed(cpu_fabric)))
+    fn zeroed_shared(cpu_fabric: &DynCpuFabricRef) -> Self {
+        Self::Shared(Arc::new(MemoryBackedPage::alloc_zeroed(move || {
+            cpu_fabric.downgrade()
+        })))
     }
 
     fn new_obj(object: Arc<dyn MemoryObject>, page_offset: PageNumber, shared: bool) -> Self {
@@ -380,25 +383,22 @@ impl PageEntry {
         }
     }
 
-    fn new_zeroed_cow<T: ?Sized + ICache>(mem_prot: MemProt, cpu_fabric: &CpuFabric<T>) -> Self {
+    fn new_zeroed_cow(mem_prot: MemProt, cpu_fabric: &DynCpuFabricRef) -> Self {
         Self::new_inner(PageSource::zeroed_cow(cpu_fabric), mem_prot)
     }
 
-    fn new_zeroed(mem_prot: MemProt, cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>) -> Self {
+    fn new_zeroed(mem_prot: MemProt, cpu_fabric: &DynCpuFabricRef) -> Self {
         Self::new_inner(PageSource::zeroed(cpu_fabric), mem_prot)
     }
 
-    fn new_zeroed_shared(
-        mem_prot: MemProt,
-        cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>,
-    ) -> Self {
+    fn new_zeroed_shared(mem_prot: MemProt, cpu_fabric: &DynCpuFabricRef) -> Self {
         Self::new_inner(PageSource::zeroed_shared(cpu_fabric), mem_prot)
     }
 
     unsafe fn new_extern(
         ptr: PagePointer,
         mem_prot: MemProt,
-        cpu_fabric: impl FnOnce() -> CpuFabricWeak<dyn ICache>,
+        cpu_fabric: impl FnOnce() -> CpuFabricWeak,
     ) -> Self {
         let extern_page = unsafe { MemoryBackedPage::new_extern(ptr, cpu_fabric) };
 
@@ -408,7 +408,7 @@ impl PageEntry {
     unsafe fn new_extern_cow(
         ptr: PagePointer,
         mem_prot: MemProt,
-        cpu_fabric: impl FnOnce() -> CpuFabricWeak<dyn ICache>,
+        cpu_fabric: impl FnOnce() -> CpuFabricWeak,
     ) -> Self {
         let extern_page = unsafe { MemoryBackedPage::new_extern(ptr, cpu_fabric) };
 
@@ -418,7 +418,7 @@ impl PageEntry {
     unsafe fn new_extern_shared(
         ptr: PagePointer,
         mem_prot: MemProt,
-        cpu_fabric: impl FnOnce() -> CpuFabricWeak<dyn ICache>,
+        cpu_fabric: impl FnOnce() -> CpuFabricWeak,
     ) -> Self {
         let extern_page = unsafe { MemoryBackedPage::new_extern(ptr, cpu_fabric) };
 
@@ -436,7 +436,7 @@ impl PageEntry {
         Self::new_inner(page, prot)
     }
 
-    pub(super) fn memprot(&mut self, new_prot: MemProt) {
+    pub(super) fn protect(&mut self, new_prot: MemProt) {
         self.protections = new_prot;
     }
 
@@ -463,7 +463,7 @@ impl PageEntry {
             &PageSource::Object { ref slot, shared } => {
                 let page = slot.page.get()?;
                 let flags = match shared {
-                    true => MemFlags::DMA_DEV | self.protections,
+                    true => MemFlags::OBJ_BACKED | self.protections,
                     false => MemFlags::from_prot(self.protections),
                 };
 
@@ -473,17 +473,13 @@ impl PageEntry {
 
         Some(Page {
             ptr: TaggedPagePtr::new(mem_page.allocated_page, flags | self.protections),
-            dirty_flags: &mem_page.dirty_page_flags,
+            mutable_flags: &mem_page.mut_page_data.flags,
         })
     }
 
-    // TODO(low priority) make this type erased by getting a DynCpuFabricRef type
-    //                    this avoids cloning the `Arc`;
-    //                    note this is helpful for non memory_object pages like `Shared` and `Private`
-    //                    since it turns to just a cheap check and return
-    fn flush_dyn(
+    fn flush_dyn<'a>(
         &self,
-        make_cpu_fabric: &dyn Fn() -> CpuFabric<dyn ICache>,
+        make_cpu_fabric: &dyn Fn() -> DynCpuFabricRef<'a>,
         make_callback: Option<&mut dyn FnMut() -> Box<dyn ObjectSyncCallbacks>>,
     ) {
         let page: &MemoryBackedPage = match &self.source {
@@ -494,94 +490,93 @@ impl PageEntry {
             PageSource::Object { .. } => return,
         };
 
-        // `dirty_page_flags` is a 2-bit state machine, not a lock: 00 clean,
-        // 01 DIRTY (unflushed write), 10 FLUSHING (epoch in progress), 11
-        // DIRTY|FLUSHING (a `write` landed during an in-flight epoch).
-        //
-        // Writers only `fetch_or(DIRTY)` - they never touch FLUSHING, so a
-        // `write` can move 00->01 or 10->11 but can never erase a pending
-        // DIRTY or clobber an in-progress FLUSHING out from under a flusher.
-        //
-        // The CAS below is not a permission check - every thread that
-        // observes pending work (DIRTY and/or FLUSHING) falls through and
-        // runs `invalidate` + the trailing `fetch_and` regardless of whether
-        // its own CAS won. Redundant invalidates across racing threads are
-        // harmless (idempotent, and the DMA leg is just a hint anyway), so
-        // there's nothing to serialize there. The CAS exists only to pick
-        // exactly one thread to perform the 01->10 transition that opens a
-        // flush epoch; `None` on every other observed state means "leave
-        // the bits alone, I'm just going to help."
-        //
-        //   0           -> bail, nothing pending (the only `Err(0)` case)
-        //   FLUSHING/11 -> None: an epoch already exists and is visible;
-        //                  join it instead of re-claiming it
-        //   DIRTY       -> Some(FLUSHING): claim the epoch
-        //
-        // `fetch_and(!FLUSHING)` afterward only ever masks FLUSHING, so a
-        // DIRTY set mid-epoch (state 11) always survives to be picked up by
-        // a future call - a `write` can never be dropped, only deferred.
-        // `prev & FLUSHING` on that call doubles as a free, race-proof
-        // "last one out" check: exactly one racing thread observes the bit
-        // still set, so the DMA enqueue happens once per epoch, not once
-        // per racing thread.
-        //
-        // Ordering:
-        // Every operation on `dirty_page_flags` here is SeqCst,
-        // this is a hard requirement on *all* of them, not just the CAS.
-        // The flag is what's standing between a writer's plain store to the
-        // page and a flusher concluding "nothing more to invalidate"; that
-        // is a StoreLoad relationship (writer's own prior store vs. its own
-        // subsequent flag check), and only SeqCst forecloses the reordering
-        // where the store is still invisible when the flag read happens.
-        // Acquire/Release do not provide StoreLoad and are not a safe
-        // substitute on any of these ops - do not weaken any ordering here without re-confirming.
-        let res = page
-            .dirty_page_flags
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
-                const DIRTY_AND_FLUSHING: u8 = {
-                    let bits = Page::DIRTY_FLAG_IS_DIRTY | Page::DIRTY_FLAG_FLUSHING;
-                    assert!(bits.count_ones() == 2);
-                    bits
-                };
+        let flush_guard = page.mut_page_data.flush_gate.lock();
 
-                match x {
-                    0 => None,
-                    Page::DIRTY_FLAG_FLUSHING | DIRTY_AND_FLUSHING => {
-                        cold_path();
-                        None
-                    }
-                    Page::DIRTY_FLAG_IS_DIRTY => {
-                        cold_path();
-                        Some(Page::DIRTY_FLAG_FLUSHING)
-                    }
-                    _ => panic_abort!("invalid page dirty state {x:02b}"),
+        const BOTH_DIRTY_MASK: u8 = Page::IS_DIRTY_FLAG | Page::IS_FLUSHING_DIRTY_PAGE;
+
+        #[cold]
+        #[inline(never)]
+        #[track_caller]
+        fn exclusive_access_error() -> ! {
+            panic_abort!(
+                "another thread cleared the is_dirty flag or modified flush bit \
+                 without acquiring the flush guard"
+            )
+        }
+
+        // using a load serves 2 purposes
+        // 1. if the page wasn't dirty, it means we don't pay for an additional RMW
+        // 2. if `icache.invalidate` panics, it doesn't mark the page as clean
+        match page.mut_page_data.flags.load(Ordering::Acquire) & BOTH_DIRTY_MASK {
+            0 => return,
+            Page::IS_DIRTY_FLAG => {
+                cold_path();
+
+                // subtle note: this flips the `is_dirty` flag from 1 to 0
+                //              and at the same time flips the `is_flushing` flag from 0 to 1
+                let old = page
+                    .mut_page_data
+                    .flags
+                    .fetch_xor(BOTH_DIRTY_MASK, Ordering::Relaxed);
+
+                // gated behind debug assertions as using the old_flags forces a cmpxchg loop on x86
+                if cfg!(debug_assertions)
+                    && let new = old ^ BOTH_DIRTY_MASK
+                    && (new & BOTH_DIRTY_MASK) != Page::IS_FLUSHING_DIRTY_PAGE
+                {
+                    exclusive_access_error()
                 }
-            });
+            }
 
-        if let Err(0) = res {
-            return;
+            // there was a previous attempt to flush, and it failed,
+            // but there was another thread that dirtied the page in the meantime
+            // combine both runs into one flush
+            BOTH_DIRTY_MASK => {
+                cold_path();
+                let old = page
+                    .mut_page_data
+                    .flags
+                    .fetch_and(!Page::IS_DIRTY_FLAG, Ordering::Relaxed);
+
+                // gated behind debug assertions as using the old_flags forces a cmpxchg loop on x86
+                if cfg!(debug_assertions)
+                    && let new = old & !Page::IS_DIRTY_FLAG
+                    && (new & BOTH_DIRTY_MASK) != Page::IS_FLUSHING_DIRTY_PAGE
+                {
+                    exclusive_access_error()
+                }
+            }
+
+            // there was an attempt to flush but failed,
+            // try to pick up that state
+            Page::IS_FLUSHING_DIRTY_PAGE => cold_path(),
+
+            _ => unreachable!(),
         }
 
         let cpu_fabric = make_cpu_fabric();
         cpu_fabric.icache().invalidate(page.allocated_page);
 
-        let prev = page
-            .dirty_page_flags
-            .fetch_and(!Page::DIRTY_FLAG_FLUSHING, Ordering::SeqCst);
+        let old_flags = page
+            .mut_page_data
+            .flags
+            .fetch_and(!Page::IS_FLUSHING_DIRTY_PAGE, Ordering::Relaxed);
 
-        // if we won the epoch flush the DMA device
-        // sinc the DMA flushing part of is just a hint
-        // it doesn't need to be up to date
-        if (prev & Page::DIRTY_FLAG_FLUSHING) != 0
-            && let PageSource::Object { slot, shared: true } = &self.source
-        {
+        // gated behind debug assertions as using the old_flags forces a cmpxchg loop on x86
+        if cfg!(debug_assertions) && (old_flags & Page::IS_FLUSHING_DIRTY_PAGE) == 0 {
+            exclusive_access_error()
+        }
+
+        drop(flush_guard);
+
+        if let PageSource::Object { slot, shared: true } = &self.source {
             let cb = make_callback.map(|cb| cb());
             cpu_fabric.object_manager().enqueue_flush(slot, cb)
         }
     }
 
     pub(super) fn refresh<T: ?Sized + ICache>(&self, cpu_fabric: &CpuFabric<T>) {
-        self.flush_dyn(&|| cpu_fabric.clone().into_dyn(), None)
+        self.flush_dyn(&|| cpu_fabric.as_dyn_ref(), None)
     }
 
     fn make_sync_callback(
@@ -605,17 +600,13 @@ impl PageEntry {
     ) -> Option<mpsc::Receiver<anyhow::Result<()>>> {
         let mut rx = None;
         let mut make_callback = || Self::make_sync_callback(&mut rx);
-        self.flush_dyn(&|| cpu_fabric.clone().into_dyn(), Some(&mut make_callback));
+        self.flush_dyn(&|| cpu_fabric.as_dyn_ref(), Some(&mut make_callback));
         rx
     }
 
-    // TODO(low priority) make this type erased by getting a DynCpuFabricRef type
-    //                    this avoids cloning the `Arc`;
-    //                    note this is helpful for non memory_object pages like `Shared` and `Private`
-    //                    since it turns to just a cheap check and return
-    fn init_page_dyn(
+    fn init_page_dyn<'a>(
         &self,
-        make_cpu_fabric: &dyn Fn() -> CpuFabric<dyn ICache>,
+        make_cpu_fabric: &dyn Fn() -> DynCpuFabricRef<'a>,
         make_callback: Option<&mut dyn FnMut() -> Box<dyn ObjectSyncCallbacks>>,
     ) {
         let PageSource::Object {
@@ -640,8 +631,10 @@ impl PageEntry {
         cpu_fabric: &CpuFabric<T>,
     ) -> Option<mpsc::Receiver<anyhow::Result<()>>> {
         let mut rx = None;
-        let mut make_callback = || Self::make_sync_callback(&mut rx);
-        self.init_page_dyn(&|| cpu_fabric.clone().into_dyn(), Some(&mut make_callback));
+        self.init_page_dyn(
+            &|| cpu_fabric.as_dyn_ref(),
+            Some(&mut || Self::make_sync_callback(&mut rx)),
+        );
         rx
     }
 
@@ -710,12 +703,13 @@ impl PageTable {
         }
     }
 
-    // TODO(low priority) make this type erased by getting a DynCpuFabricRef type
-    //                    instead of strong_cpu_fabric and cpu_fabric closures
+    pub(super) fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
     unsafe fn map_inner(
         &mut self,
-        cpu_fabric: &dyn Fn() -> CpuFabricWeak<dyn ICache>,
-        strong_cpu_fabric: &dyn Fn() -> CpuFabric<dyn ICache>,
+        cpu_fabric: DynCpuFabricRef,
         pages: PageTableAccess,
         mem_prot: MemProt,
         region: MapRegion,
@@ -724,7 +718,6 @@ impl PageTable {
             ensure!(vaddr: page.vaddr_base(), !self.table.contains_key(&page))
         }
 
-        let strong_cpu_fabric = std::cell::LazyCell::new(strong_cpu_fabric);
         let start_page = pages.start_page;
         for page in pages.iter() {
             let page_offset = || unsafe { page.get().unchecked_sub(start_page.get()) };
@@ -742,22 +735,23 @@ impl PageTable {
                 MapRegion::Extern { flags, base_ptr } => unsafe {
                     let offset = u64_to_usize(page_offset()).unwrap_unchecked();
                     let page_ptr = base_ptr.add_pages(offset);
+                    let make_cpu_fabric = || cpu_fabric.downgrade();
                     match flags {
                         MemMapFlags::Private => {
-                            PageEntry::new_extern(page_ptr, mem_prot, cpu_fabric)
+                            PageEntry::new_extern(page_ptr, mem_prot, make_cpu_fabric)
                         }
                         MemMapFlags::Cow => {
-                            PageEntry::new_extern_cow(page_ptr, mem_prot, cpu_fabric)
+                            PageEntry::new_extern_cow(page_ptr, mem_prot, make_cpu_fabric)
                         }
                         MemMapFlags::Shared => {
-                            PageEntry::new_extern_shared(page_ptr, mem_prot, cpu_fabric)
+                            PageEntry::new_extern_shared(page_ptr, mem_prot, make_cpu_fabric)
                         }
                     }
                 },
                 MapRegion::Anon(flags) => match flags {
-                    MemMapFlags::Private => PageEntry::new_zeroed(mem_prot, cpu_fabric),
-                    MemMapFlags::Cow => PageEntry::new_zeroed_cow(mem_prot, &strong_cpu_fabric),
-                    MemMapFlags::Shared => PageEntry::new_zeroed_shared(mem_prot, cpu_fabric),
+                    MemMapFlags::Private => PageEntry::new_zeroed(mem_prot, &cpu_fabric),
+                    MemMapFlags::Cow => PageEntry::new_zeroed_cow(mem_prot, &cpu_fabric),
+                    MemMapFlags::Shared => PageEntry::new_zeroed_shared(mem_prot, &cpu_fabric),
                 },
             };
 
@@ -777,21 +771,13 @@ impl PageTable {
         mem_prot: MemProt,
         region: MapRegion,
     ) -> Result<(), MemoryFault> {
-        unsafe {
-            self.map_inner(
-                &move || cpu_fabric.downgrade_dyn(),
-                &move || cpu_fabric.clone().into_dyn(),
-                pages,
-                mem_prot,
-                region,
-            )
-        }
+        unsafe { self.map_inner(cpu_fabric.as_dyn_ref(), pages, mem_prot, region) }
     }
 
     pub(super) fn unmap(&mut self, pages: PageTableAccess, mut removed: impl FnMut(PageEntry)) {
         for page in pages.iter() {
-            if let Entry::Occupied(page_entry) = self.table.entry(page) {
-                removed(page_entry.remove());
+            if let Some(entry) = self.table.remove(&page) {
+                removed(entry);
             }
         }
     }
@@ -805,10 +791,14 @@ impl PageTable {
             ensure!(vaddr: page.vaddr_base(), self.table.contains_key(&page))
         }
 
+        let guard = AbortGuard(());
+
         for page in pages.iter() {
             let page_entry = self.table.get_mut(&page).unwrap_or_else(|| abort());
             modify(page, page_entry)
         }
+
+        guard.disarm();
 
         Ok(())
     }
@@ -821,7 +811,7 @@ impl PageTable {
     }
 
     // TODO(low priority) have a set tracking all executable pages / memory_object pages
-    //      meaning cache invalidation can happen faster;
+    //      meaning wholesale cache invalidation can happen faster;
     //      its low priority because cache invalidation doesn't happen often
     pub(super) fn pages(&self) -> impl Iterator<Item = (PageNumber, &PageEntry)> {
         self.table
@@ -844,4 +834,9 @@ impl PageTable {
 
         Self { table }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    // TODO write `loom` tests for `flush_dyn` icache flushing
 }

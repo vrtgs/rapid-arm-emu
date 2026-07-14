@@ -1,3 +1,10 @@
+//! Address-translation caching for [`IoMMU`] lookups.
+//!
+//! Every memory access on an [`IoMMU`] is parameterized by a [`LookupCache`],
+//! which resolves page numbers to live [`Page`] handles. Callers can pass
+//! [`NoCache`] to hit the page table directly on every access, or a
+//! [`Tlb`] to amortize translation cost across repeated accesses.
+
 use crate::fault::{MemoryFault, ensure};
 use crate::icache::ICache;
 use crate::{IoMMU, PageTableAccess, div_rem_page_size};
@@ -7,7 +14,7 @@ use std::process::abort;
 /// A cache layer that sits between the CPU and the page table, translating
 /// [`PageNumber`]s into live [`Page`] handles.
 ///
-/// Implementors may satisfy lookups from a fast local structure (e.g. a TLB)
+/// Implementors may satisfy lookups from a fast local structure (e.g., a TLB)
 /// or fall through to the page table on every call. Either way, the returned
 /// [`Page`] must be a valid view into the [`IoMMU`]'s backing memory for the
 /// requested page number.
@@ -19,7 +26,7 @@ use std::process::abort;
 /// If `get_page` returns `Ok` for a given `page`, then every subsequent call
 /// with the same `page` and the same [`IoMMU`] - without any intervening
 /// mutation of that [`IoMMU`] - must also return `Ok`. Returning `Err` after
-/// a prior `Ok` is **undefined behaviour**: the cache's consistency guarantee
+/// a prior `Ok` is **undefined behavior**: the cache's consistency guarantee
 /// is a precondition that callers are permitted to assume without checking.
 ///
 pub unsafe trait LookupCache {
@@ -34,12 +41,17 @@ pub unsafe trait LookupCache {
     ) -> Result<Page<'a>, MemoryFault>;
 }
 
+/// A [`LookupCache`] that performs no caching at all.
+///
+/// Every lookup goes straight to the page table. Useful when the overhead of
+/// maintaining a TLB outweighs its benefit — e.g., one-off accesses where a
+/// cached entry would never be reused.
 pub struct NoCache;
 
 unsafe impl LookupCache for NoCache {
     /// Bypasses any caching layer and faults directly to the page table.
-    /// Useful when the overhead of a TLB lookup outweighs its benefit -
-    /// e.g. single-access patterns where a cached entry would never be reused.
+    /// Useful when the overhead of a TLB lookup outweighs its benefit
+    /// e.g., single-access patterns where a cached entry would never be reused.
     fn get_page<'a, T: ?Sized + ICache>(
         &mut self,
         io_mmu: &'a IoMMU<T>,
@@ -98,8 +110,8 @@ pub(crate) trait LookupCacheExt: LookupCache {
     /// then calls `access` on each one.
     ///
     /// The split into two phases is intentional: all-or-nothing semantics.
-    /// If any page fails verification the access closure is never invoked,
-    /// so callers don't need to reason about partially-applied side effects.
+    /// If any page fails verification, the access closure is never invoked,
+    /// so callers don't need to reason about partially applied side effects.
     ///
     /// No ordering guarantee is made on `access`; the iteration order is an
     /// internal implementation detail and may change.

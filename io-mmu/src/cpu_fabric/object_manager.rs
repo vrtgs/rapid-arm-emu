@@ -1,8 +1,6 @@
 use crate::cpu_fabric::CpuFabricWeak;
-use crate::icache::ICache;
 use crate::memory_object::MemoryObject;
 use crate::page_table::{MemoryBackedPage, ObjectSlot};
-use anyhow::bail;
 use emu_abi::abort::AbortGuard;
 use emu_abi::abort::panic_abort;
 use emu_abi::convert::{u64_to_usize, usize_to_u64};
@@ -11,6 +9,7 @@ use parking_lot::{Condvar, Mutex};
 use smallvec::SmallVec;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
+use std::hint::cold_path;
 use std::mem::ManuallyDrop;
 use std::sync::{Arc, Weak};
 
@@ -88,7 +87,7 @@ fn catch_unwind<F: FnOnce() -> R, R>(f: F) -> std::thread::Result<R> {
 }
 
 enum OpType {
-    Init(CpuFabricWeak<dyn ICache>),
+    Init(CpuFabricWeak),
     Flush,
 }
 
@@ -385,7 +384,27 @@ fn handle_task(entry: QueueEntry) {
     // drop the slot before ever calling the callbacks
     drop(slot);
 
-    let res = res.unwrap_or_else(|_| bail!("memory object panicked whilst faulting page"));
+    let res = res.unwrap_or_else(|panic| {
+        cold_path();
+
+        let message = panic.downcast_ref::<&'static str>().map_or_else(
+            || panic.downcast_ref::<String>().map(String::as_str),
+            |&str| Some(str),
+        );
+
+        let (has_new_line, message) = message.map_or((false, "Box<dyn Any>"), |message| {
+            (message.contains('\n'), message)
+        });
+
+        let seperator = if has_new_line { '\n' } else { ' ' };
+
+        let error = anyhow::anyhow!(
+            "memory object panicked whilst faulting page with message:{seperator}{message}"
+        );
+
+        let _ = catch_unwind(move || drop(panic));
+        Err(error)
+    });
 
     // note leaking any callback handles can cause deadlocks in the program
     // if any callback is lost and forgotten during iteration bad things can happen
@@ -491,7 +510,7 @@ impl ObjectManager {
     pub(crate) fn enqueue_init(
         &self,
         page: &Arc<ObjectSlot>,
-        cpu_fabric_weak: CpuFabricWeak<dyn ICache>,
+        cpu_fabric_weak: CpuFabricWeak,
         callback: Option<Box<dyn ObjectSyncCallbacks>>,
     ) {
         self.inner

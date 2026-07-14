@@ -98,7 +98,7 @@ unsafe impl super::MemoryObject for std::fs::File {
     ) -> anyhow::Result<()> {
         let page = unsafe { page_ptr.cast::<[u8; PAGE_SIZE]>().as_ref() };
 
-        let mut page_left = &page[..];
+        let mut page_left = page.as_slice();
         let mut offset = page_offset.vaddr_base();
         while !page_left.is_empty() {
             match self.write_at(page_left, offset) {

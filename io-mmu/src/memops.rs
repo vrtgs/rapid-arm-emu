@@ -1,7 +1,30 @@
-//! FIXME/SOUNDNESS:
+//! Atomic-backed access to guest ("VM") memory from the host.
+//!
+//! Aligned accesses through this module provide single-copy atomicity, in
+//! the same sense as AArch64's memory model: a given aligned load or store
+//! is guaranteed to be observed by other accessors as a whole, never as a
+//! tear of some bytes from one access interleaved with bytes from another.
+//! This guarantee does not extend to unaligned accesses, which this module
+//! also supports but which decompose internally into multiple aligned
+//! sub-accesses -- another accessor can observe those sub-accesses
+//! individually. This module does not provide ordering guarantees beyond
+//! single-copy atomicity for aligned accesses; it only rules out torn
+//! reads/writes at that granularity.
+//!
+//! # Note
+//! Guest memory must be accessed **only** through this module. Reading or
+//! writing it by any other means -- casting the backing allocation to a
+//! plain `&[u8]`/`&mut [u8]`, or accessing it through any path other than
+//! the functions here -- is undefined behavior, full stop. It doesn't matter
+//! whether that other access is itself "safe" Rust in isolation, or whether
+//! it happens to use atomics of its own: this module makes no guarantee
+//! about how it accesses memory internally, so nothing outside it can be
+//! synchronized against.
+//!
+//! FIXME(SOUNDNESS):
 //! This memory backend relies on mixed-size atomic accesses that are currently
 //! UB under Rust's memory model, although current rustc/LLVM codegen preserves
-//! the intended hardware behavior on supported targets as of rust 1.95.0.
+//! the intended hardware behavior on supported targets as of rust 1.96.1.
 //!
 //! This is accepted for the initial 0.0.x emulator backend. The implementation
 //! is intentionally isolated in `memops` so it can be replaced by a sound
@@ -12,35 +35,60 @@
     reason = "all truncation here is actually handled,\
                   it used to split up one large integer to a bunch of smaller ones"
 )]
-#![allow(
-    clippy::missing_safety_doc,
-    reason = "this module is in progress, \
-              and if there will be documentation it would be oon the module not on the memops"
-)]
 
-use std::hint::cold_path;
 use std::sync::atomic::AtomicU8;
 
 cfg_select! {
-    any(miri, true) => {
+    // PERF NOTE: this backend intentionally locks coarser than production for the
+    // bulk-copy path (whole covering-shard-range for the duration of the copy,
+    // vs. production's per-chunk/per-byte atomicity). Locking per-byte here was
+    // measured at ~15000s for a single-byte-copy-loop test; range-locking brings
+    // that to ~90s.
+    //
+    // Consequence 1 (atomicity): under miri, a bulk copy *appears* single-copy
+    // atomic over the whole region, which production does NOT guarantee (see
+    // `copy_nonoverlapping_{vm_to_host,host_to_vm}` docs' Atomicity section).
+    // This is fine for miri's job -- catching UB/soundness bugs in this module's
+    // own accesses -- but it means miri is NOT where the byte-level-tearing
+    // contract itself gets validated; that's covered by the non-miri test run,
+    // which uses the real backend.
+    //
+    // Consequence 2 (ordering): parking_lot's RwLock::read()/write() (and their
+    // drop) carry acquire/release semantics, so under miri every load in this
+    // module acts like an `acquire` and every store acts like a `release` -- TSO,
+    // effectively. Production uses `Ordering::Relaxed` throughout, matching the
+    // module's stated contract (single-copy atomicity only, no ordering
+    // guarantee beyond that). So miri is also not where the *absence* of
+    // ordering guarantees gets validated -- code that accidentally relies on
+    // acquire/release visibility could pass under miri and still be broken
+    // against production.
+    //
+    // If this backend (locking + RwLock) is ever promoted to production, the
+    // locks should be switched to `Relaxed`-equivalent behavior -- e.g., by not
+    // relying on RwLock's built-in acquire/release and instead fencing
+    // explicitly only where the module's contract actually requires it.
+    // And that should give us a tangible speed improvement
+    // on weaker memory models.
+    miri => {
         use crossbeam_utils::CachePadded;
         use parking_lot::RwLock;
         use std::mem::MaybeUninit;
 
-        // use Mersenne prime so that collisions are rarer
+        // use a prime number so that collisions are rarer
         const SHARDED_LOCK_COUNT: usize = 127;
 
         static ADDRESS_LOCKS: [CachePadded<RwLock<()>>; SHARDED_LOCK_COUNT] = {
             [const { CachePadded::new(RwLock::new(())) }; SHARDED_LOCK_COUNT]
         };
 
-        const CACHE_LINE: usize = 64;
-        const _: () = assert!(CACHE_LINE.is_power_of_two());
-        const CACHE_LINE_SHIFT: u32 = CACHE_LINE.ilog2();
+        const CACHE_LINE_SIZE: usize = emu_abi::memory::CACHE_LINE_SIZE;
+        const CACHE_LINE_SHIFT: u8 = emu_abi::memory::CACHE_LINE_SHIFT;
+
+        const _: () = assert!(CACHE_LINE_SIZE == (1 << CACHE_LINE_SHIFT));
 
         #[track_caller]
         const fn assert_can_load_and_store<T: Sized>() {
-            let fits_in_cache = 1 <= size_of::<T>() && size_of::<T>() <= CACHE_LINE;
+            let fits_in_cache = 1 <= size_of::<T>() && size_of::<T>() < CACHE_LINE_SIZE;
             assert!(fits_in_cache && align_of::<T>() <= size_of::<T>())
         }
 
@@ -81,16 +129,20 @@ cfg_select! {
         // every site always acquires in increasing index order, that never happens, so
         // no cycle can form -- the standard global lock-ordering argument.
         //
-        // IMPORTANT: `bulk_mem_op`'s walk over `shards_start..=shards_end` visits
-        // cache *lines* in ascending order, which is ascending in *shard index* only
-        // while the walk doesn't cross the COUNT-1 -> 0 wraparound boundary. A walk
-        // that does cross it visits shard COUNT-1 before shard 0, which is descending
-        // in shard-index terms at that one boundary -- the same hazard this function
-        // has to handle below. `bulk_mem_op` must be fixed to lock by shard index
-        // (e.g., by walking the line range twice, or pre-sorting touched shards)
-        // rather than assuming line order implies shard-index order. This function's
-        // correctness depends on that fix landing too; one site obeying this comment
-        // and the other not is exactly how the deadlock reappears.
+        // `bulk_mem_op` upholds this same invariant: it locks shards in ascending
+        // index order too, explicitly handling the two cases where a naive walk over
+        // cache *lines* (in line order) would NOT correspond to ascending shard index:
+        //   - saturation, where the run covers >= SHARDED_LOCK_COUNT lines and every
+        //     shard is touched (it collapses to "lock all shards 0..COUNT" instead of
+        //     walking lines, which would double-lock a shard);
+        //   - wraparound, where the line range crosses a multiple of COUNT (so
+        //     `last_shard < first_shard` in line order); it locks the low group
+        //     {0..=last_shard} before the high group {first_shard..=COUNT-1}, which
+        //     stays globally ascending even though line order does not.
+        // See `bulk_mem_op`'s own doc comment for the full argument. Both sites must
+        // keep agreeing on "smaller shard index first, always" -- if one of them ever
+        // stops, the two are no longer jointly deadlock-free even though each remains
+        // deadlock-free considered alone.
         //
         // Why "cache-line order" (i.e., first cache line's shard, then second cache
         // line's shard, ignoring index value) is NOT safe on its own: shard_i and
@@ -115,15 +167,11 @@ cfg_select! {
         //   - Thread 0 waits on thread 1, thread 1 waits on thread 2, ..., thread
         //     COUNT-1 waits on thread 0. Every thread is blocked holding a resource
         //     another blocked thread needs. Nothing can ever release, because release
-        //     only happens after the second lock is acquired -- permanent deadlock,
+        //     only happens after the second lock is acquired -- a permanent deadlock,
         //     not a transient stall.
         //
-        // The fix costs one comparison, not a general sort: since the two shards
-        // always differ by exactly 1 mod COUNT, ascending order is just
-        // (shard_i, shard_j) directly, except at the single wraparound start line
-        // n = COUNT - 1, where the pair (COUNT - 1, 0) must be locked as
-        // (0, COUNT - 1) instead -- i.e., always lock shard 0 first there, not
-        // whichever of the pair came from the lower line number.
+        // This is exactly the failure mode `bulk_mem_op` avoids by locking on shard
+        // index rather than line order; see its comment for the mechanics.
         #[inline]
         unsafe fn get_cache_line_unaligned<T>(
             ptr: *const AtomicU8
@@ -136,28 +184,57 @@ cfg_select! {
                 return (unsafe { get_cache_line_aligned::<T>(ptr) }, None)
             };
 
-            let i = ptr.addr() >> CACHE_LINE_SHIFT;
-            let j = (unsafe { ptr.byte_add(end_offset.get()) }).addr() >> CACHE_LINE_SHIFT;
+            let i_addr = ptr.addr();
+            let j_addr = (unsafe { ptr.byte_add(end_offset.get()) }).addr();
+            let [i_line, j_line] = [i_addr, j_addr]
+                .map(|addr| addr >> CACHE_LINE_SHIFT);
+
+            if i_line == j_line {
+                let idx = i_line % SHARDED_LOCK_COUNT;
+                let lock = unsafe { ADDRESS_LOCKS.get_unchecked(idx) };
+                return (lock, None)
+            }
+
+            std::hint::cold_path();
+
+            unsafe { std::hint::assert_unchecked(j_line == i_line.unchecked_add(1)) }
+
+            // we do this to avoid computing the expensive modulo twice for the common case
+            let [i, j] = [i_line, j_line].map(|line| line % SHARDED_LOCK_COUNT);
+
             let sorted = match usize::cmp(&i, &j) {
-                std::cmp::Ordering::Equal => {
-                    let lock = unsafe {
-                        ADDRESS_LOCKS.get_unchecked(i % SHARDED_LOCK_COUNT)
-                    };
-                    return (lock, None)
-                },
+                // SAFETY: `Ordering::Equal` is unreachable here.
+                //
+                // Reached only when `i_line != j_line`
+                // (since the function would have already returned for the equal-line case).
+                // `j_line - i_line` is exactly 1 whenever it's nonzero:
+                // `assert_can_load_and_store::<T>()` bounds `size_of::<T>() <=
+                // CACHE_LINE_SIZE`, and a byte range that long can cross at most one line
+                // boundary -- this function's own return type (one lock, or optionally a
+                // second) already assumes no `T` spans more than two lines, so that bound
+                // isn't a new assumption introduced here.
+                //
+                // `i == j` would then require `COUNT | 1`, i.e. `COUNT == 1`, which
+                // `const { assert!(SHARDED_LOCK_COUNT > 1) }` rules out at compile time.
+                //
+                // Both premises are compile-time facts for the concrete `T` and
+                // `SHARDED_LOCK_COUNT` in use, and this module's miri suite exercises
+                // exactly this path -- a violation here surfaces as a miri UB report, not
+                // just a comment going stale silently.
+                std::cmp::Ordering::Equal => unsafe { core::hint::unreachable_unchecked() },
                 // lock the smaller shard index first, in both cases
                 std::cmp::Ordering::Less => [i, j],
                 std::cmp::Ordering::Greater => [j, i],
             };
 
-            cold_path();
 
-            let [first, second] = sorted.map(|idx| {
-                unsafe { ADDRESS_LOCKS.get_unchecked(idx % SHARDED_LOCK_COUNT) }
-            });
+
+            const { assert!(SHARDED_LOCK_COUNT > 1, "there is no lock sharding") }
+            let [first, second] = sorted
+                .map(|idx| unsafe { ADDRESS_LOCKS.get_unchecked(idx) });
 
             (first, Some(second))
-    }
+        }
 
         unsafe fn read_unaligned<T>(ptr: *const AtomicU8) -> T {
             let (a, b) = unsafe { get_cache_line_unaligned::<T>(ptr) };
@@ -181,24 +258,20 @@ cfg_select! {
         macro_rules! make_load_store_inner {
             ($($bits: tt)*) => {
                 pastey::paste! {$(
-                    #[inline]
                     unsafe fn [<load $bits _ne_aligned_inner>](ptr: *const AtomicU8) -> [<u $bits>] {
                         unsafe { read_aligned::<[<u $bits>]>(ptr) }
                     }
 
-                    #[inline]
                     unsafe fn [<store $bits _ne_aligned_inner>](ptr: *const AtomicU8, value: [<u $bits>]) {
                         unsafe { write_aligned::<[<u $bits>]>(ptr, value) }
                     }
 
-                    #[inline(always)]
-                    unsafe fn [<load $bits _le_inner>](ptr: *const AtomicU8) -> [<u $bits>] {
-                        (unsafe { read_unaligned::<[<u $bits>]>(ptr) }).to_le()
+                    unsafe fn [<load $bits _ne_inner>](ptr: *const AtomicU8) -> [<u $bits>] {
+                        unsafe { read_unaligned::<[<u $bits>]>(ptr) }
                     }
 
-                    #[inline(always)]
-                    unsafe fn [<store $bits _le_inner>](ptr: *const AtomicU8, value: [<u $bits>]) {
-                        unsafe { write_unaligned::<[<u $bits>]>(ptr, value.to_le()) }
+                    unsafe fn [<store $bits _ne_inner>](ptr: *const AtomicU8, value: [<u $bits>]) {
+                        unsafe { write_unaligned::<[<u $bits>]>(ptr, value) }
                     }
                 )*}
             };
@@ -345,7 +418,6 @@ cfg_select! {
             };
 
 
-
             // Guards are stored contiguously at indices 0..initialized, in acquisition
             // order. On `drop` (including unwind mid-acquisition) we release exactly the
             // prefix we managed to take; release order is irrelevant.
@@ -408,7 +480,7 @@ cfg_select! {
         }
 
         #[inline(never)]
-        pub(crate) unsafe fn copy_non_overlapping_vm_to_host_inner(
+        unsafe fn copy_nonoverlapping_vm_to_host_inner(
             src: *const AtomicU8,
             dst: *mut u8,
             count: usize,
@@ -417,7 +489,7 @@ cfg_select! {
         }
 
         #[inline(never)]
-        pub(crate) unsafe fn copy_non_overlapping_host_to_vm_inner(
+        unsafe fn copy_nonoverlapping_host_to_vm_inner(
             src: *const u8,
             dst: *const AtomicU8,
             count: usize,
@@ -429,6 +501,8 @@ cfg_select! {
     _ => {
         use std::sync::atomic::Ordering;
         use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
+        use std::hint::cold_path;
+        use std::num::NonZero;
 
         macro_rules! make_load_store_inner {
             ($($bits: tt)*) => {
@@ -446,323 +520,420 @@ cfg_select! {
             };
         }
 
-        // Unaligned 64-bit little-endian access patterns:
-        //
-        // addr % 8 == 4:
-        //   alignment:
-        //     addr % 4 == 0
-        //     addr + 4 is aligned to 8 and still aligned to 4
-        //   layout:
-        //     ptr: b0 b1 b2 b3 b4 b5 b6 b7
-        //          └───lo────┘ └────hi───┘
-        //     value = (hi << 32) | lo
-        //   accesses exactly:
-        //     [ptr + 0, ptr + 4)
-        //     [ptr + 4, ptr + 8)
-        //
-        // addr % 8 == 2 or 6:
-        //   alignment:
-        //     addr is aligned to 2
-        //     addr + 2 is aligned to 4
-        //     addr + 6 is aligned to 2
-        //   layout:
-        //     ptr: b0 b1 b2 b3 b4 b5 b6 b7
-        //          └w0─┘ └───mid───┘ └w3─┘
-        //     value = (hi << 48) | (mid << 16) | lo
-        //   accesses exactly:
-        //     [ptr + 0, ptr + 2)
-        //     [ptr + 2, ptr + 6)
-        //     [ptr + 6, ptr + 8)
-        //
-        // addr % 8 == 1 or 5:
-        //   alignment:
-        //     addr is not aligned to 2
-        //     addr + 1 is aligned to 2
-        //     addr + 3 is aligned to 4
-        //     addr + 7 is loaded/stored as one byte
-        //   layout:
-        //     ptr: b0 b1 b2 b3 b4 b5 b6 b7
-        //          │  └w1─┘ └───mid───┘  │
-        //          b0                    b7
-        //     value = (b7 << 56) | (mid << 24) | (w1 << 8) | b0
-        //   accesses exactly:
-        //     [ptr + 0, ptr + 1)
-        //     [ptr + 1, ptr + 3)
-        //     [ptr + 3, ptr + 7)
-        //     [ptr + 7, ptr + 8)
-        //
-        // addr % 8 == 3 or 7:
-        //   alignment:
-        //     addr is not aligned to 2
-        //     addr + 1 is aligned to 4
-        //     addr + 5 is aligned to 2
-        //     addr + 7 is loaded/stored as one byte
-        //   layout:
-        //     ptr: b0 b1 b2 b3 b4 b5 b6 b7
-        //          │  └───mid───┘ └w5─┘  │
-        //          b0                    b7
-        //     value = (b7 << 56) | (w5 << 40) | (mid << 8) | b0
-        //   accesses exactly:
-        //     [ptr + 0, ptr + 1)
-        //     [ptr + 1, ptr + 5)
-        //     [ptr + 5, ptr + 7)
-        //     [ptr + 7, ptr + 8)
-
-        #[inline(always)]
-        unsafe fn load64_le_inner(ptr: *const AtomicU8) -> u64 {
-            const { assert!(align_of::<AtomicU64>() == 8) }
-
-            match ptr.addr() % 8 {
-                0 => unsafe { load64_le_aligned(ptr) },
-
-                4 => unsafe {
-                    cold_path();
-
-                    let lo = load32_le_aligned(ptr) as u64;
-                    let hi = load32_le_aligned(ptr.byte_add(4)) as u64;
-
-                    (hi << 32) | lo
-                },
-
-                2 | 6 => unsafe {
-                    cold_path();
-
-                    let lo = load16_le_aligned(ptr) as u64;
-                    let mid = load32_le_aligned(ptr.byte_add(2)) as u64;
-                    let hi = load16_le_aligned(ptr.byte_add(6)) as u64;
-
-                    (hi << 48) | (mid << 16) | lo
-                },
-
-                1 | 5 => unsafe {
-                    cold_path();
-
-                    let b0 = load8(ptr) as u64;
-                    let w1 = load16_le_aligned(ptr.byte_add(1)) as u64;
-                    let mid = load32_le_aligned(ptr.byte_add(3)) as u64;
-                    let b7 = load8(ptr.byte_add(7)) as u64;
-
-                    (b7 << 56) | (mid << 24) | (w1 << 8) | b0
-                },
-
-                3 | 7 => unsafe {
-                    cold_path();
-
-                    let b0 = load8(ptr) as u64;
-                    let mid = load32_le_aligned(ptr.byte_add(1)) as u64;
-                    let w5 = load16_le_aligned(ptr.byte_add(5)) as u64;
-                    let b7 = load8(ptr.byte_add(7)) as u64;
-
-                    (b7 << 56) | (w5 << 40) | (mid << 8) | b0
-                },
-                _ => unsafe { core::hint::unreachable_unchecked() },
+        cfg_select! {
+            target_endian = "little" => {
+                const fn ne_part_shift_inner(offset: usize, _width: usize, _total: usize) -> usize {
+                    offset
+                }
+            }
+            target_endian = "big" => {
+                const fn ne_part_shift_inner(offset: usize, width: usize, total: usize) -> usize {
+                    total.strict_sub(offset).strict_sub(width)
+                }
             }
         }
 
-        #[inline(always)]
-        unsafe fn store64_le_inner(ptr: *const AtomicU8, value: u64) {
-            const { assert!(align_of::<AtomicU64>() == 8) }
 
-            match ptr.addr() % 8 {
-                0 => unsafe { store64_le_aligned(ptr, value) },
-
-                4 => unsafe {
-                    cold_path();
-
-                    let lo = value as u32;
-                    let hi = (value >> 32) as u32;
-
-                    store32_le_aligned(ptr, lo);
-                    store32_le_aligned(ptr.byte_add(4), hi);
-                },
-
-                2 | 6 => unsafe {
-                    cold_path();
-
-                    let lo = value as u16;
-                    let mid = (value >> 16) as u32;
-                    let hi = (value >> 48) as u16;
-
-                    store16_le_aligned(ptr, lo);
-                    store32_le_aligned(ptr.byte_add(2), mid);
-                    store16_le_aligned(ptr.byte_add(6), hi);
-                },
-
-                1 | 5 => unsafe {
-                    cold_path();
-
-                    let b0 = value as u8;
-                    let w1 = (value >> 8) as u16;
-                    let mid = (value >> 24) as u32;
-                    let b7 = (value >> 56) as u8;
-
-                    store8(ptr, b0);
-                    store16_le_aligned(ptr.byte_add(1), w1);
-                    store32_le_aligned(ptr.byte_add(3), mid);
-                    store8(ptr.byte_add(7), b7);
-                },
-
-                3 | 7 => unsafe {
-                    cold_path();
-
-                    let b0 = value as u8;
-                    let mid = (value >> 8) as u32;
-                    let w5 = (value >> 40) as u16;
-                    let b7 = (value >> 56) as u8;
-
-                    store8(ptr, b0);
-                    store32_le_aligned(ptr.byte_add(1), mid);
-                    store16_le_aligned(ptr.byte_add(5), w5);
-                    store8(ptr.byte_add(7), b7);
-                },
-
-                _ => unsafe { core::hint::unreachable_unchecked() },
-            }
+        const fn ne_part_shift<T>(offset: usize, width: usize) -> u32 {
+            let total = size_of::<T>();
+            let shift = ne_part_shift_inner(offset, width, total);
+            assert!(shift < total);
+            emu_abi::convert::usize_to_u32(shift.strict_mul(8)).unwrap()
         }
 
-        // Unaligned 32-bit little-endian access patterns:
+
+        const fn get_byte_count_from_load_fn<T>(_func: unsafe fn(*const AtomicU8) -> T) -> usize {
+            size_of::<T>()
+        }
+
+        const fn get_byte_count_from_store_fn<T>(_func: unsafe fn(*const AtomicU8, T)) -> usize {
+            size_of::<T>()
+        }
+
+        macro_rules! combine_ne_parts {
+            ($ptr:expr, $ty:ty, [ $($load_fn:path),+ $(,)? ]) => {
+                combine_ne_parts!(@fold $ptr, $ty, off: 0_usize, folded: [], todo: [ $($load_fn),+ ])
+            };
+
+            (
+                @fold $ptr:expr, $ty:ty,
+                off: $off:expr,
+                folded: [ $(($f_load:path, $f_width:expr, $f_off:expr)),* ],
+                todo: [ $load_fn:path $(, $rest:path)* $(,)? ]
+            ) => {
+                combine_ne_parts!(
+                    @fold $ptr, $ty,
+                    off: ($off.strict_add(get_byte_count_from_load_fn($load_fn))),
+                    folded: [
+                        $(($f_load, $f_width, $f_off),)*
+                        ($load_fn, get_byte_count_from_load_fn($load_fn), $off)
+                    ],
+                    todo: [ $($rest),* ]
+                )
+            };
+
+            (
+                @fold $ptr:expr, $ty:ty,
+                off: $off:expr,
+                folded: [ $(($f_load:path, $f_width:expr, $f_off:expr)),+ ],
+                todo: []
+            ) => {{ #[allow(unused_unsafe)] {
+                const TOTAL: usize = $off;
+                const _: () = assert!(
+                    TOTAL == size_of::<$ty>(),
+                    "combine_ne_parts!: part widths do not sum to size_of::<$ty>()"
+                );
+
+                let ptr: *const AtomicU8 = $ptr;
+                $(
+                    ({
+                        const OFFSET: usize = $f_off;
+
+                        let limb = $f_load(ptr.byte_add(OFFSET)) as $ty;
+                        unsafe {
+                            limb.unchecked_shl(const { ne_part_shift::<$ty>(OFFSET, $f_width) })
+                        }
+                    })
+                )|+
+            }}};
+        }
+
+        macro_rules! split_ne_parts {
+            ($ptr:expr, $value:expr, $ty:ty, [ $($store_fn:path),+ $(,)? ]) => {
+                split_ne_parts!(
+                    @fold $ptr, $value, $ty,
+                    off: 0_usize,
+                    folded: [],
+                    todo: [ $($store_fn),+ ]
+                )
+            };
+
+            (
+                @fold $ptr:expr, $value:expr, $ty:ty,
+                off: $off:expr,
+                folded: [ $(($f_store:path, $f_width:expr, $f_off:expr)),* ],
+                todo: [ $store_fn:path $(, $rest:path)* $(,)? ]
+            ) => {
+                split_ne_parts!(
+                    @fold $ptr, $value, $ty,
+                    off: ($off.strict_add(get_byte_count_from_store_fn($store_fn))),
+                    folded: [
+                        $(($f_store, $f_width, $f_off),)*
+                        ($store_fn, get_byte_count_from_store_fn($store_fn), $off)
+                    ],
+                    todo: [ $($rest),* ]
+                )
+            };
+
+            (
+                @fold $ptr:expr, $value:expr, $ty:ty,
+                off: $off:expr,
+                folded: [ $(($f_store:path, $f_width:expr, $f_off:expr)),+ ],
+                todo: []
+            ) => {{ #[allow(unused_unsafe)] {
+                const TOTAL: usize = $off;
+                const _: () = assert!(
+                    TOTAL == size_of::<$ty>(),
+                    "split_ne_parts!: part widths do not sum to size_of::<$ty>()"
+                );
+
+                let ptr: *const AtomicU8 = $ptr;
+                let value: $ty = $value;
+                $({
+                    const OFFSET: usize = $f_off;
+
+                    $f_store(
+                        ptr.byte_add(OFFSET),
+                        unsafe {
+                            let limb = value.unchecked_shr(const {
+                                ne_part_shift::<$ty>(OFFSET, $f_width)
+                            });
+
+                            limb as _
+                        },
+                    )
+                })+
+            }}};
+        }
+
+        /// Generates the unaligned native-endian `load`/`store` pair for each listed
+        /// type from ONE shared case table, so the two directions cannot drift apart.
+        ///
+        /// Per type, at compile time this checks:
+        ///   - the backing atomic has `size == align == size_of::<$ty>()`
+        ///   - every listed remainder is in `1..TOTAL`
+        ///   - the remainder count is exactly `TOTAL - 1`
+        ///   - (via `#[forbid(unreachable_patterns)]`) no remainder is duplicated
+        ///   - each `(load, store)` pair at the same position has the same width
+        ///
+        /// The second and third checks, plus forbidden duplicates, mean the listed
+        /// arms cover `1..TOTAL` exactly once (pigeonhole), `0` is the aligned arm,
+        /// and `ptr.addr() % TOTAL` can produce nothing else -- which is what makes
+        /// the trailing `unreachable_unchecked()` sound rather than merely
+        /// hoped-for. Part offsets and the sum-to-`TOTAL` width check are handled
+        /// inside `combine_ne_parts!` / `split_ne_parts!`.
+        macro_rules! make_unaligned_ne_access {
+            ($(
+                $ty:ty {
+                    atomic: $atomic:ty,
+                    aligned: ($load_aligned:path, $store_aligned:path),
+                    fns: ($load_name:ident, $store_name:ident),
+                    cases: {
+                        $(
+                            [ $($pat:literal)|+ ] => [
+                                $( ($load_part:path, $store_part:path) ),+ $(,)?
+                            ]
+                        ),+ $(,)?
+                    } $(,)?
+                }
+            )+) => {$(
+                const _: () = {
+                    const TOTAL: usize = size_of::<$ty>();
+
+                    assert!(align_of::<$atomic>() == TOTAL && size_of::<$atomic>() == TOTAL);
+
+                    // every remainder is a real unaligned remainder of `addr % TOTAL`
+                    let patterns: &[usize] = &[ $($($pat),+),+ ];
+
+                    let mut patterns_iter_slice = patterns;
+                    while let &[pattern, ref rest @ ..] = patterns_iter_slice {
+                        assert!(pattern != 0 && pattern < TOTAL);
+                        patterns_iter_slice = rest;
+                    }
+
+                    // ...and there are exactly TOTAL - 1 of them. Together with
+                    // forbid(unreachable_patterns) on the fns (no duplicates), the
+                    // arms are a bijection onto 1..TOTAL.
+                    assert!(patterns.len() == TOTAL.strict_sub(1));
+
+                    // load and store must decompose identically
+                    $($(
+                        assert!(
+                            get_byte_count_from_load_fn($load_part)
+                                == get_byte_count_from_store_fn($store_part)
+                        );
+                    )+)+
+                };
+
+                #[inline(always)]
+                #[forbid(unreachable_patterns)]
+                unsafe fn $load_name(ptr: *const AtomicU8) -> $ty {
+                    const TOTAL: usize = size_of::<$ty>();
+
+                    match ptr.addr() % TOTAL {
+                        0 => unsafe { $load_aligned(ptr) },
+                        $(
+                            $($pat)|+ => {
+                                cold_path();
+                                unsafe {
+                                    combine_ne_parts!(ptr, $ty, [ $($load_part),+ ])
+                                }
+                            }
+                        )+
+                        // sound: see the const block above
+                        _ => unsafe { core::hint::unreachable_unchecked() },
+                    }
+                }
+
+                #[inline(always)]
+                #[forbid(unreachable_patterns)]
+                unsafe fn $store_name(ptr: *const AtomicU8, value: $ty) {
+                    const TOTAL: usize = size_of::<$ty>();
+
+                    match ptr.addr() % TOTAL {
+                        0 => unsafe { $store_aligned(ptr, value) },
+                        $(
+                            $($pat)|+ => {
+                                cold_path();
+                                unsafe {
+                                    split_ne_parts!(ptr, value, $ty, [ $($store_part),+ ])
+                                }
+                            }
+                        )+
+                        // sound: see the const block above
+                        _ => unsafe { core::hint::unreachable_unchecked() },
+                    }
+                }
+            )+};
+        }
+
+        // Unaligned native-endian access patterns.
         //
-        // addr % 4 == 2:
-        //   alignment:
-        //     addr is aligned to 2
-        //     addr + 2 is aligned to 4 and still aligned to 2
-        //   layout:
-        //     ptr: b0 b1 b2 b3
-        //          └lo─┘ └─hi┘
-        //     value = (hi << 16) | lo
-        //   accesses exactly:
-        //     [ptr + 0, ptr + 2)
-        //     [ptr + 2, ptr + 4)
+        // Each case lists its parts in ADDRESS order (ascending offset); every part
+        // is one properly aligned atomic access. Where a part lands in the assembled
+        // value is decided by `ne_part_shift`, not by the table:
         //
-        // addr % 4 == 1 or 3:
-        //   alignment:
-        //     addr is not aligned to 2
-        //     addr + 1 is aligned to 2
-        //     addr + 3 is loaded/stored as one byte
-        //   layout:
-        //     ptr: b0 b1 b2 b3
-        //          │  └mid┘  │
-        //          b0        b3
-        //     value = (b3 << 24) | (mid << 8) | b0
-        //   accesses exactly:
-        //     [ptr + 0, ptr + 1)
-        //     [ptr + 1, ptr + 3)
-        //     [ptr + 3, ptr + 4)
-
-        #[inline(always)]
-        unsafe fn load32_le_inner(ptr: *const AtomicU8) -> u32 {
-            const { assert!(align_of::<AtomicU32>() == 4) }
-
-            match ptr.addr() % 4 {
-                0 => unsafe { load32_le_aligned(ptr) },
-
-                2 => unsafe {
-                    cold_path();
-
-                    let lo = load16_le_aligned(ptr) as u32;
-                    let hi = load16_le_aligned(ptr.byte_add(2)) as u32;
-
-                    (hi << 16) | lo
-                },
-
-                1 | 3 => unsafe {
-                    cold_path();
-
-                    let b0 = load8(ptr) as u32;
-                    let mid = load16_le_aligned(ptr.byte_add(1)) as u32;
-                    let b3 = load8(ptr.byte_add(3)) as u32;
-
-                    (b3 << 24) | (mid << 8) | b0
-                },
-
-                _ => unsafe { core::hint::unreachable_unchecked() },
-            }
-        }
-
-        #[inline(always)]
-        unsafe fn store32_le_inner(ptr: *const AtomicU8, value: u32) {
-            const { assert!(align_of::<AtomicU32>() == 4) }
-
-            match ptr.addr() % 4 {
-                0 => unsafe { store32_le_aligned(ptr, value) },
-
-                2 => unsafe {
-                    cold_path();
-
-                    let lo = value as u16;
-                    let hi = (value >> 16) as u16;
-
-                    store16_le_aligned(ptr, lo);
-                    store16_le_aligned(ptr.byte_add(2), hi);
-                },
-
-                1 | 3 => unsafe {
-                    cold_path();
-
-                    let b0 = value as u8;
-                    let mid = (value >> 8) as u16;
-                    let b3 = (value >> 24) as u8;
-
-                    store8(ptr, b0);
-                    store16_le_aligned(ptr.byte_add(1), mid);
-                    store8(ptr.byte_add(3), b3);
-                },
-
-                _ => unsafe { core::hint::unreachable_unchecked() },
-            }
-        }
-
-        // Unaligned 16-bit little-endian access pattern:
+        //   little-endian: part at offset o, width w -> bits [8*o, 8*(o+w))
+        //                  (lower address = less significant)
+        //   big-endian:    part at offset o, width w -> bits [8*(T-o-w), 8*(T-o))
+        //                  (lower address = more significant)
         //
-        // addr % 2 == 1:
-        //   alignment:
-        //     both bytes are loaded/stored as single bytes, so alignment is always ok
-        //   layout:
-        //     ptr: b0 b1
-        //          │  │
-        //          b0 b1
-        //     value = (b1 << 8) | b0
-        //   accesses exactly:
-        //     [ptr + 0, ptr + 1)
-        //     [ptr + 1, ptr + 2)
+        // The alignment facts and "accesses exactly" ranges below are
+        // endian-independent; only the `value` assembly differs, so both formulas
+        // are given. `pN` names the part starting at ptr + N.
+        make_unaligned_ne_access! {
+            // addr % 8 == 4:
+            //   alignment:
+            //     addr % 4 == 0
+            //     addr + 4 is aligned to 8 and still aligned to 4
+            //   layout:
+            //     ptr: b0 b1 b2 b3 b4 b5 b6 b7
+            //          └───p0────┘ └────p4───┘
+            //     value_le = (p4 << 32) | p0
+            //     value_be = (p0 << 32) | p4
+            //   accesses exactly:
+            //     [ptr + 0, ptr + 4)
+            //     [ptr + 4, ptr + 8)
+            //
+            // addr % 8 == 2 or 6:
+            //   alignment:
+            //     addr is aligned to 2
+            //     addr + 2 is aligned to 4
+            //     addr + 6 is aligned to 2
+            //   layout:
+            //     ptr: b0 b1 b2 b3 b4 b5 b6 b7
+            //          └p0─┘ └────p2───┘ └p6─┘
+            //     value_le = (p6 << 48) | (p2 << 16) | p0
+            //     value_be = (p0 << 48) | (p2 << 16) | p6
+            //   accesses exactly:
+            //     [ptr + 0, ptr + 2)
+            //     [ptr + 2, ptr + 6)
+            //     [ptr + 6, ptr + 8)
+            //
+            // addr % 8 == 1 or 5:
+            //   alignment:
+            //     addr is not aligned to 2
+            //     addr + 1 is aligned to 2
+            //     addr + 3 is aligned to 4
+            //     addr + 7 is loaded/stored as one byte
+            //   layout:
+            //     ptr: b0 b1 b2 b3 b4 b5 b6 b7
+            //          │  └p1─┘ └────p3───┘  │
+            //          p0                    p7
+            //     value_le = (p7 << 56) | (p3 << 24) | (p1 << 8) | p0
+            //     value_be = (p0 << 56) | (p1 << 40) | (p3 << 8) | p7
+            //   accesses exactly:
+            //     [ptr + 0, ptr + 1)
+            //     [ptr + 1, ptr + 3)
+            //     [ptr + 3, ptr + 7)
+            //     [ptr + 7, ptr + 8)
+            //
+            // addr % 8 == 3 or 7:
+            //   alignment:
+            //     addr is not aligned to 2
+            //     addr + 1 is aligned to 4
+            //     addr + 5 is aligned to 2
+            //     addr + 7 is loaded/stored as one byte
+            //   layout:
+            //     ptr: b0 b1 b2 b3 b4 b5 b6 b7
+            //          │  └────p1───┘ └p5─┘  │
+            //          p0                    p7
+            //     value_le = (p7 << 56) | (p5 << 40) | (p1 << 8) | p0
+            //     value_be = (p0 << 56) | (p1 << 24) | (p5 << 8) | p7
+            //   accesses exactly:
+            //     [ptr + 0, ptr + 1)
+            //     [ptr + 1, ptr + 5)
+            //     [ptr + 5, ptr + 7)
+            //     [ptr + 7, ptr + 8)
+            u64 {
+                atomic: AtomicU64,
+                aligned: (load64_ne_aligned_inner, store64_ne_aligned_inner),
+                fns: (load64_ne_inner, store64_ne_inner),
+                cases: {
+                    [4] => [
+                        (load32_ne_aligned_inner, store32_ne_aligned_inner),
+                        (load32_ne_aligned_inner, store32_ne_aligned_inner),
+                    ],
+                    [2 | 6] => [
+                        (load16_ne_aligned_inner, store16_ne_aligned_inner),
+                        (load32_ne_aligned_inner, store32_ne_aligned_inner),
+                        (load16_ne_aligned_inner, store16_ne_aligned_inner),
+                    ],
+                    [1 | 5] => [
+                        (load8, store8),
+                        (load16_ne_aligned_inner, store16_ne_aligned_inner),
+                        (load32_ne_aligned_inner, store32_ne_aligned_inner),
+                        (load8, store8),
+                    ],
+                    [3 | 7] => [
+                        (load8, store8),
+                        (load32_ne_aligned_inner, store32_ne_aligned_inner),
+                        (load16_ne_aligned_inner, store16_ne_aligned_inner),
+                        (load8, store8),
+                    ],
+                }
+            }
 
-        #[inline(always)]
-        unsafe fn load16_le_inner(ptr: *const AtomicU8) -> u16 {
-            const { assert!(align_of::<AtomicU16>() == 2) }
+            // addr % 4 == 2:
+            //   alignment:
+            //     addr is aligned to 2
+            //     addr + 2 is aligned to 4 and still aligned to 2
+            //   layout:
+            //     ptr: b0 b1 b2 b3
+            //          └p0─┘ └p2─┘
+            //     value_le = (p2 << 16) | p0
+            //     value_be = (p0 << 16) | p2
+            //   accesses exactly:
+            //     [ptr + 0, ptr + 2)
+            //     [ptr + 2, ptr + 4)
+            //
+            // addr % 4 == 1 or 3:
+            //   alignment:
+            //     addr is not aligned to 2
+            //     addr + 1 is aligned to 2
+            //     addr + 3 is loaded/stored as one byte
+            //   layout:
+            //     ptr: b0 b1 b2 b3
+            //          │  └p1─┘  │
+            //          p0        p3
+            //     value_le = (p3 << 24) | (p1 << 8) | p0
+            //     value_be = (p0 << 24) | (p1 << 8) | p3
+            //   accesses exactly:
+            //     [ptr + 0, ptr + 1)
+            //     [ptr + 1, ptr + 3)
+            //     [ptr + 3, ptr + 4)
+            u32 {
+                atomic: AtomicU32,
+                aligned: (load32_ne_aligned_inner, store32_ne_aligned_inner),
+                fns: (load32_ne_inner, store32_ne_inner),
+                cases: {
+                    [2] => [
+                        (load16_ne_aligned_inner, store16_ne_aligned_inner),
+                        (load16_ne_aligned_inner, store16_ne_aligned_inner),
+                    ],
+                    [1 | 3] => [
+                        (load8, store8),
+                        (load16_ne_aligned_inner, store16_ne_aligned_inner),
+                        (load8, store8),
+                    ],
+                }
+            }
 
-            match ptr.addr() % 2 {
-                0 => unsafe { load16_le_aligned(ptr) },
-
-                1 => unsafe {
-                    cold_path();
-
-                    let b0 = load8(ptr) as u16;
-                    let b1 = load8(ptr.byte_add(1)) as u16;
-
-                    (b1 << 8) | b0
-                },
-
-                _ => unsafe { core::hint::unreachable_unchecked() },
+            // addr % 2 == 1:
+            //   alignment:
+            //     both bytes are loaded/stored as single bytes, so alignment is always ok
+            //   layout:
+            //     ptr: b0 b1
+            //          │  │
+            //          p0 p1
+            //     value_le = (p1 << 8) | p0
+            //     value_be = (p0 << 8) | p1
+            //   accesses exactly:
+            //     [ptr + 0, ptr + 1)
+            //     [ptr + 1, ptr + 2)
+            u16 {
+                atomic: AtomicU16,
+                aligned: (load16_ne_aligned_inner, store16_ne_aligned_inner),
+                fns: (load16_ne_inner, store16_ne_inner),
+                cases: {
+                    [1] => [
+                        (load8, store8),
+                        (load8, store8),
+                    ],
+                }
             }
         }
 
-        #[inline(always)]
-        unsafe fn store16_le_inner(ptr: *const AtomicU8, value: u16) {
-            const { assert!(align_of::<AtomicU16>() == 2) }
-
-            match ptr.addr() % 2 {
-                0 => unsafe { store16_le_aligned(ptr, value) },
-
-                1 => unsafe {
-                    cold_path();
-
-                    store8(ptr, value as u8);
-                    store8(ptr.byte_add(1), (value >> 8) as u8);
-                },
-
-                _ => unsafe { core::hint::unreachable_unchecked() },
-            }
-        }
 
 
         #[inline(always)]
@@ -779,106 +950,320 @@ cfg_select! {
             unsafe { (*ptr).store(value, Ordering::Relaxed) }
         }
 
-        #[inline(always)]
-        pub(crate) unsafe fn copy_non_overlapping_vm_to_host_inner(
-            src: *const AtomicU8,
-            dst: *mut u8,
-            count: usize,
-        ) {
-            for i in 0..count {
+
+        type BulkMemChunk = u64;
+        type BulkMemChunkAtomic = AtomicU64;
+
+        const CHUNK_SIZE: NonZero<usize> = NonZero::new(size_of::<BulkMemChunk>()).unwrap();
+
+        // `align_offset(CHUNK_SIZE)` below must produce alignment sufficient for the
+        // atomic chunk access; assert the plain-int and atomic layouts agree so
+        // CHUNK_SIZE is valid for both roles (offset stride AND atomic alignment).
+        const _: () = assert!(
+            size_of::<BulkMemChunkAtomic>() == CHUNK_SIZE.get()
+                && align_of::<BulkMemChunkAtomic>() == CHUNK_SIZE.get()
+        );
+
+        /// # Safety
+        /// `copy_chunk` requires `vm_ptr.add(i)` to be `CHUNK_SIZE`-aligned; both
+        /// methods require `vm_ptr.add(i)` / `host_ptr.add(i)` valid for the width
+        /// they access, in their respective direction.
+        trait BulkByteChunkOp {
+            unsafe fn copy_byte(vm_ptr: *const AtomicU8, host_ptr: *mut u8, i: usize);
+            unsafe fn copy_chunk(vm_ptr: *const AtomicU8, host_ptr: *mut u8, i: usize);
+        }
+
+        enum VmToHost {}
+
+        impl BulkByteChunkOp for VmToHost {
+            #[inline(always)]
+            unsafe fn copy_byte(vm_ptr: *const AtomicU8, host_ptr: *mut u8, i: usize) {
+                unsafe { std::ptr::write::<u8>(host_ptr.add(i), load8(vm_ptr.add(i))) }
+            }
+
+            #[inline(always)]
+            unsafe fn copy_chunk(vm_ptr: *const AtomicU8, host_ptr: *mut u8, i: usize) {
                 unsafe {
-                    let src_ptr = src.add(i);
-                    let dst_ptr = dst.add(i);
-                    let byte = load8(src_ptr);
-                    std::ptr::write(dst_ptr, byte);
+                    let chunk: BulkMemChunk = load64_ne_aligned_inner(vm_ptr.add(i));
+                    std::ptr::write_unaligned(host_ptr.add(i).cast::<BulkMemChunk>(), chunk)
+                }
+            }
+        }
+
+        enum HostToVm {}
+
+        impl BulkByteChunkOp for HostToVm {
+            #[inline(always)]
+            unsafe fn copy_byte(vm_ptr: *const AtomicU8, host_ptr: *mut u8, i: usize) {
+                unsafe { store8(vm_ptr.add(i), std::ptr::read::<u8>(host_ptr.add(i))) }
+            }
+
+            #[inline(always)]
+            unsafe fn copy_chunk(vm_ptr: *const AtomicU8, host_ptr: *mut u8, i: usize) {
+                unsafe {
+                    let chunk = std::ptr::read_unaligned(host_ptr.add(i).cast::<BulkMemChunk>());
+                    store64_ne_aligned_inner(vm_ptr.add(i), chunk)
                 }
             }
         }
 
         #[inline(always)]
-        pub(crate) unsafe fn copy_non_overlapping_host_to_vm_inner(
+        unsafe fn bulk_byte_chunk_copy<Op: BulkByteChunkOp>(
+            vm_ptr: *const AtomicU8,
+            host_ptr: *mut u8,
+            count: usize,
+        ) {
+            unsafe {
+                let is_nonoverlapping = vm_ptr.addr().abs_diff(host_ptr.addr()) >= count;
+                std::hint::assert_unchecked(is_nonoverlapping);
+
+                let prefix = usize::min(vm_ptr.align_offset(CHUNK_SIZE.get()), count);
+
+                for i in 0..prefix {
+                    Op::copy_byte(vm_ptr, host_ptr, i);
+                }
+
+                // count >= prefix, so unchecked_sub never underflows;
+                // mid_end <= count <= isize::MAX, so the add/mul never overflow.
+                let mid_len = count.unchecked_sub(prefix) / CHUNK_SIZE;
+                let mid_end = prefix.unchecked_add(mid_len.unchecked_mul(CHUNK_SIZE.get()));
+
+                // mid_len * CHUNK_SIZE <= count - prefix
+                // mid_end = prefix + mid_len * CHUNK_SIZE <= count
+                std::hint::assert_unchecked(mid_end <= count);
+
+                let mut i = prefix;
+                while i < mid_end {
+                    Op::copy_chunk(vm_ptr, host_ptr, i);
+                    i = i.unchecked_add(CHUNK_SIZE.get());
+                }
+
+                for i in mid_end..count {
+                    Op::copy_byte(vm_ptr, host_ptr, i);
+                }
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn copy_nonoverlapping_vm_to_host_inner(
+            src: *const AtomicU8,
+            dst: *mut u8,
+            count: usize,
+        ) {
+            unsafe { bulk_byte_chunk_copy::<VmToHost>(src, dst, count) }
+        }
+
+        #[inline(always)]
+        unsafe fn copy_nonoverlapping_host_to_vm_inner(
             src: *const u8,
             dst: *const AtomicU8,
             count: usize,
         ) {
-            for i in 0..count {
-                unsafe {
-                    let src_ptr = src.add(i);
-                    let dst_ptr = dst.add(i);
-                    let byte = std::ptr::read(src_ptr);
-                    store8(dst_ptr, byte)
-                }
-            }
+            unsafe { bulk_byte_chunk_copy::<HostToVm>(dst, src.cast_mut(), count) }
         }
     }
 }
 
 macro_rules! make_load_store {
-    ($($bits: tt)*) => {
+    ($(($bits:tt, $bytes:tt)),* $(,)?) => {
         make_load_store_inner! { $($bits)* }
 
         pastey::paste! {$(
+            const _: () = assert!(
+                $bits == $bytes * 8,
+                concat!(
+                    "make_load_store!: bits/bytes mismatch for u", stringify!($bits),
+                    " (expected bytes == ", stringify!($bits), " / 8)"
+                ),
+            );
+
+            #[doc = concat!(
+                "Loads a `u", stringify!($bits), "` (", stringify!($bytes), " bytes) from `ptr` ",
+                "in native-endian order.\n\n",
+                "# Safety\n",
+                "- `ptr` must be valid for reads of ", stringify!($bytes), " bytes and must ",
+                "point into guest memory reachable only through this module (see the ",
+                "module docs).\n",
+                "- `ptr` must be aligned to `", stringify!($bytes), "` bytes. Use ",
+                "[`load", stringify!($bits), "_ne`] if `ptr` may be unaligned.",
+            )]
+            #[must_use]
             #[inline(always)]
             pub unsafe fn [<load $bits _ne_aligned>](ptr: *const AtomicU8) -> [<u $bits>] {
                 unsafe { [<load $bits _ne_aligned_inner>](ptr) }
             }
 
+            #[doc = concat!(
+                "Stores `value` to `ptr` (", stringify!($bytes), " bytes) in native-endian ",
+                "order.\n\n",
+                "# Safety\n",
+                "- `ptr` must be valid for writes of ", stringify!($bytes), " bytes and must ",
+                "point into guest memory reachable only through this module (see the ",
+                "module docs).\n",
+                "- `ptr` must be aligned to `", stringify!($bytes), "` bytes. Use ",
+                "[`store", stringify!($bits), "_ne`] if `ptr` may be unaligned.",
+            )]
             #[inline(always)]
             pub unsafe fn [<store $bits _ne_aligned>](ptr: *const AtomicU8, value: [<u $bits>]) {
                 unsafe { [<store $bits _ne_aligned_inner>](ptr, value) }
             }
 
+            #[doc = concat!(
+                "Loads a `u", stringify!($bits), "` (", stringify!($bytes), " bytes) from `ptr`, ",
+                "interpreting the in-memory bytes as little-endian.\n\n",
+                "# Safety\n",
+                "- `ptr` must be valid for reads of ", stringify!($bytes), " bytes and must ",
+                "point into guest memory reachable only through this module (see the ",
+                "module docs).\n",
+                "- `ptr` must be aligned to `", stringify!($bytes), "` bytes. Use ",
+                "[`load", stringify!($bits), "_le`] if `ptr` may be unaligned.",
+            )]
+            #[must_use]
             #[inline(always)]
             pub unsafe fn [<load $bits _le_aligned>](ptr: *const AtomicU8) -> [<u $bits>] {
-                (unsafe { [<load $bits _ne_aligned_inner>](ptr) }).to_le()
+                <[<u $bits>]>::from_le(unsafe { [<load $bits _ne_aligned_inner>](ptr) })
             }
 
+            #[doc = concat!(
+                "Stores `value` to `ptr` (", stringify!($bytes), " bytes) as little-endian ",
+                "bytes.\n\n",
+                "# Safety\n",
+                "- `ptr` must be valid for writes of ", stringify!($bytes), " bytes and must ",
+                "point into guest memory reachable only through this module (see the ",
+                "module docs).\n",
+                "- `ptr` must be aligned to `", stringify!($bytes), "` bytes. Use ",
+                "[`store", stringify!($bits), "_le`] if `ptr` may be unaligned.",
+            )]
             #[inline(always)]
             pub unsafe fn [<store $bits _le_aligned>](ptr: *const AtomicU8, value: [<u $bits>]) {
                 unsafe { [<store $bits _ne_aligned_inner>](ptr, value.to_le()) }
             }
 
+            #[doc = concat!(
+                "Loads a `u", stringify!($bits), "` (", stringify!($bytes), " bytes) from `ptr` ",
+                "in native-endian order. `ptr` need not be aligned.\n\n",
+                "# Safety\n",
+                "- `ptr` must be valid for reads of ", stringify!($bytes), " bytes and must ",
+                "point into guest memory reachable only through this module (see the ",
+                "module docs). No alignment requirement.",
+            )]
+            #[must_use]
             #[inline(always)]
             pub unsafe fn [<load $bits _ne>](ptr: *const AtomicU8) -> [<u $bits>] {
-                unsafe { [<load $bits _le_inner>](ptr) }
+                unsafe { [<load $bits _ne_inner>](ptr) }
             }
 
+            #[doc = concat!(
+                "Stores `value` to `ptr` (", stringify!($bytes), " bytes) in native-endian ",
+                "order. `ptr` need not be aligned.\n\n",
+                "# Safety\n",
+                "- `ptr` must be valid for writes of ", stringify!($bytes), " bytes and must ",
+                "point into guest memory reachable only through this module (see the ",
+                "module docs). No alignment requirement.",
+            )]
             #[inline(always)]
             pub unsafe fn [<store $bits _ne>](ptr: *const AtomicU8, value: [<u $bits>]) {
-                unsafe { [<store $bits _le_inner>](ptr, value) }
+                unsafe { [<store $bits _ne_inner>](ptr, value) }
             }
 
+            #[doc = concat!(
+                "Loads a `u", stringify!($bits), "` (", stringify!($bytes), " bytes) from `ptr`, ",
+                "interpreting the in-memory bytes as little-endian. `ptr` need not be ",
+                "aligned.\n\n",
+                "# Safety\n",
+                "- `ptr` must be valid for reads of ", stringify!($bytes), " bytes and must ",
+                "point into guest memory reachable only through this module (see the ",
+                "module docs). No alignment requirement.",
+            )]
+            #[must_use]
             #[inline(always)]
             pub unsafe fn [<load $bits _le>](ptr: *const AtomicU8) -> [<u $bits>] {
-                unsafe { [<load $bits _le_inner>](ptr) }
+                <[<u $bits>]>::from_le(unsafe { [<load $bits _ne_inner>](ptr) })
             }
 
+            #[doc = concat!(
+                "Stores `value` to `ptr` (", stringify!($bytes), " bytes) as little-endian ",
+                "bytes. `ptr` need not be aligned.\n\n",
+                "# Safety\n",
+                "- `ptr` must be valid for writes of ", stringify!($bytes), " bytes and must ",
+                "point into guest memory reachable only through this module (see the ",
+                "module docs). No alignment requirement.",
+            )]
             #[inline(always)]
             pub unsafe fn [<store $bits _le>](ptr: *const AtomicU8, value: [<u $bits>]) {
-                unsafe { [<store $bits _le_inner>](ptr, value) }
+                unsafe { [<store $bits _ne_inner>](ptr, value.to_le()) }
             }
         )*}
     };
 }
 
-make_load_store! { 64 32 16 }
+make_load_store! { (64, 8), (32, 4), (16, 2) }
 
+/// Loads a single byte from `ptr`.
+///
+/// # Safety
+/// `ptr` must be valid for reads and must point into guest memory reachable
+/// only through this module (see the module docs). Byte access has no
+/// alignment requirement.
 #[inline(always)]
 pub unsafe fn load_byte(ptr: *const AtomicU8) -> u8 {
     unsafe { load8(ptr) }
 }
 
+/// Stores a single byte to `ptr`.
+///
+/// # Safety
+/// `ptr` must be valid for writes and must point into guest memory reachable
+/// only through this module (see the module docs). Byte access has no
+/// alignment requirement.
 #[inline(always)]
 pub unsafe fn store_byte(ptr: *const AtomicU8, value: u8) {
     unsafe { store8(ptr, value) }
 }
 
+/// Copies `count` bytes from guest memory at `src` into host memory at `dst`.
+///
+/// # Atomicity
+/// This provides **byte-level atomicity only**: each byte is read
+/// exactly once via a single atomic access, and no byte is torn. It does
+/// **not** provide single-copy atomicity for the copy as a whole -- a
+/// concurrent writer to `src` can interleave with this copy at byte
+/// granularity, so the destination may end up holding a mix of bytes from
+/// before and after a concurrent write. Callers that need the whole region to
+/// appear as an atomic unit must arrange their own higher-level
+/// synchronization; this function does not provide it.
+///
+/// # Safety
+/// - `src` must be valid for atomic reads of `count` bytes and must point
+///   into guest memory reachable only through this module (see the module
+///   docs).
+/// - `dst` must be valid for writes of `count` bytes.
+/// - `src` and `dst` must denote non-overlapping regions, per
+///   [`std::ptr::copy_nonoverlapping`]'s contract.
 #[inline(always)]
-pub unsafe fn copy_non_overlapping_vm_to_host(src: *const AtomicU8, dst: *mut u8, count: usize) {
-    unsafe { copy_non_overlapping_vm_to_host_inner(src, dst, count) }
+pub unsafe fn copy_nonoverlapping_vm_to_host(src: *const AtomicU8, dst: *mut u8, count: usize) {
+    unsafe { copy_nonoverlapping_vm_to_host_inner(src, dst, count) }
 }
 
+/// Copies `count` bytes from host memory at `src` into guest memory at `dst`.
+///
+/// # Atomicity
+/// This provides **byte-level atomicity only**: each byte is
+/// written exactly once via a single atomic access, and no byte is torn. It
+/// does **not** provide single-copy atomicity for the copy as a whole -- a
+/// concurrent reader of `dst` can observe a partially written region, mixing
+/// bytes from before and after this call. Callers that need the whole region
+/// to appear as an atomic unit must arrange their own higher-level
+/// synchronization; this function does not provide it.
+///
+/// # Safety
+/// - `src` must be valid for reads of `count` bytes.
+/// - `dst` must be valid for atomic writes of `count` bytes and must point
+///   into guest memory reachable only through this module (see the module
+///   docs).
+/// - `src` and `dst` must denote non-overlapping regions, per
+///   [`std::ptr::copy_nonoverlapping`]'s contract.
 #[inline(always)]
-pub unsafe fn copy_non_overlapping_host_to_vm(src: *const u8, dst: *const AtomicU8, count: usize) {
-    unsafe { copy_non_overlapping_host_to_vm_inner(src, dst, count) }
+pub unsafe fn copy_nonoverlapping_host_to_vm(src: *const u8, dst: *const AtomicU8, count: usize) {
+    unsafe { copy_nonoverlapping_host_to_vm_inner(src, dst, count) }
 }

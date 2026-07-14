@@ -1,14 +1,17 @@
 use crate::arena::ArenaMap;
-use crate::array_helper;
-use crate::compiler::{CompileBlockOptions, CompiledExecChunk, ExecBlockFFI};
-use crate::{AliasRegion as IrAliasRegion, Block as IrBlock, Jump as IrJump, Type as IrType};
-use crate::{
+use crate::chunk::ExecChunkFFI;
+use crate::compiler::{CompileBlockOptions, CompiledExecChunk};
+use crate::ir::{
+    AliasRegion as IrAliasRegion, Block as IrBlock, Jump as IrJump, TypeFull as IrType,
+};
+use crate::ir::{
     Arg, ArithBinOp, BitwiseOp, CallbackSignature, ExecIr, HOST_CB_SMALL_ARGS, IConst, IntCmp,
     IntWidth, LoadType, MAX_STMT_OUTPUTS, OverflowingBinOp, SSAValue, ShiftOp, StackSlot, StmtData,
     StmtKind, Terminator, TerminatorKind,
 };
-use anyhow::{Context, anyhow, ensure};
+use anyhow::{Context as _, anyhow, ensure};
 use arrayvec::ArrayVec;
+use cranelift::codegen::Context;
 use cranelift::codegen::ir as clif_ir;
 use cranelift::codegen::ir::{AliasRegion, AliasRegionData};
 use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -19,7 +22,7 @@ use cranelift::prelude::{AbiParam, Configurable, InstBuilder, IntCC, MemFlagsDat
 use emu_abi::memory::Page;
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::mem::ManuallyDrop;
 use std::num::NonZero;
@@ -174,8 +177,8 @@ impl<'a> FunctionLowering<'a> {
     }
 
     fn iconst(&mut self, iconst: IConst) -> clif_ir::Value {
-        let bits = iconst.bits.cast_signed();
-        let ty = clif_int_ty(iconst.width);
+        let bits = iconst.bits().cast_signed();
+        let ty = clif_int_ty(iconst.width());
         self.builder.ins().iconst(ty, bits)
     }
 
@@ -375,7 +378,7 @@ impl<'a> FunctionLowering<'a> {
         &mut self,
         rvalue: &StmtKind,
     ) -> anyhow::Result<ArrayVec<clif_ir::Value, MAX_STMT_OUTPUTS>> {
-        use array_helper::{empty, from_arr};
+        use emu_abi::array_helper::{empty, from_arr};
 
         let value = match *rvalue {
             StmtKind::IConst(iconst) => from_arr([self.iconst(iconst)]),
@@ -392,12 +395,6 @@ impl<'a> FunctionLowering<'a> {
                 };
 
                 from_arr([value])
-            }
-
-            StmtKind::AddImm { value, imm64 } => {
-                let value = self.use_value(value)?;
-                let new_value = self.builder.ins().iadd_imm(value, imm64.cast_signed());
-                from_arr([new_value])
             }
 
             StmtKind::IntNeg(val) => {
@@ -468,11 +465,24 @@ impl<'a> FunctionLowering<'a> {
             StmtKind::Shift { op, value, shift } => {
                 let value = self.use_value(value)?;
                 let shift = self.use_value(shift)?;
+                let ins = self.builder.ins();
+                let output = match op {
+                    ShiftOp::SignExtendShr => ins.sshr(value, shift),
+                    ShiftOp::ZeroExtendShr => ins.ushr(value, shift),
+                    ShiftOp::Shl => ins.ishl(value, shift),
+                };
+
+                from_arr([output])
+            }
+
+            StmtKind::ShiftUnbounded { op, value, shift } => {
+                let value = self.use_value(value)?;
+                let shift = self.use_value(shift)?;
                 let ty = self.builder.func.dfg.value_type(value);
 
                 let bits = ty.bits();
 
-                // if shift >= bits, clamp result
+                // if shift < bits; no overflow
                 let in_range =
                     self.builder
                         .ins()
@@ -611,6 +621,9 @@ impl<'a> FunctionLowering<'a> {
                 aligned_page_ptr,
                 page_offset,
                 width,
+                // loads are always `SeqCst` in cranelift,
+                // which is stronger than relaxed or acquire
+                seq_cst: _,
             } => {
                 let int_ty = clif_int_ty(width);
                 let ptr = self.ptr_byte_add(aligned_page_ptr, page_offset)?;
@@ -623,6 +636,9 @@ impl<'a> FunctionLowering<'a> {
                 aligned_page_ptr,
                 page_offset,
                 value,
+                // stores are always `SeqCst` in cranelift,
+                // which is stronger than relaxed or release
+                seq_cst: _,
             } => {
                 let value = self.use_value(value)?;
                 let ptr = self.ptr_byte_add(aligned_page_ptr, page_offset)?;
@@ -631,6 +647,7 @@ impl<'a> FunctionLowering<'a> {
                 from_arr([])
             }
 
+            // `AqcRel` swap; but cranelift only has SeqCst operations
             StmtKind::LoadHaltReason => {
                 // although accessing the halt reason is **always** safe to do,
                 // having the load halt reason operation move is quite unexpected
@@ -647,6 +664,7 @@ impl<'a> FunctionLowering<'a> {
                 from_arr([value])
             }
 
+            // `AqcRel` swap; but cranelift only has SeqCst operations
             StmtKind::TakeHaltReason => {
                 // same reasons as `StmtKind::LoadHaltReason` stated above
                 let can_move = false;
@@ -664,32 +682,14 @@ impl<'a> FunctionLowering<'a> {
                 from_arr([value])
             }
 
-            // all loads and stores are already `SeqCst`,
-            // so there is no need for a memory fence
-            StmtKind::GetInstructionDirtyFlag(insn_dirty) => {
+            // `SetPageDirtyFlag` requires **Release** semantics
+            // cranelift uses seq_cst semantics, which is strictly stronger
+            StmtKind::SetPageDirtyFlag(insn_dirty) => {
                 // this can't move and MUST happen **after** writing the value into the page
                 // doing it before that may lead to never actually marking the page dirty
                 let can_move = false;
                 let ptr = self.use_value(insn_dirty)?;
-                let flags = self.host_memory_flags(can_move, IrAliasRegion::PageFlags);
-                let value = self
-                    .builder
-                    .ins()
-                    .atomic_load(clif_ir::types::I8, flags, ptr);
-
-                let bit = self
-                    .builder
-                    .ins()
-                    .band_imm(value, i64::from(Page::DIRTY_FLAG_IS_DIRTY));
-
-                from_arr([bit])
-            }
-
-            StmtKind::SetInstructionDirtyFlag(insn_dirty) => {
-                // same reasons as `GetInstructionDirtyFlag` stated above
-                let can_move = false;
-                let ptr = self.use_value(insn_dirty)?;
-                let flag_val = self.iconst(IConst::u8(Page::DIRTY_FLAG_IS_DIRTY));
+                let flag_val = self.iconst(IConst::u8(Page::IS_DIRTY_FLAG));
 
                 let flags = self.host_memory_flags(can_move, IrAliasRegion::PageFlags);
                 self.builder.ins().atomic_rmw(
@@ -792,9 +792,22 @@ fn exec_block_signature(module: &JITModule) -> clif_ir::Signature {
     sig
 }
 
+thread_local! {
+    static SCRATCH: Cell<Option<(Context, FunctionBuilderContext)>> = const {
+        Cell::new(None)
+    };
+}
+
 pub(crate) struct CraneliftCompiler {
     compile_fast_isa: OwnedTargetIsa,
     compile_optimized_isa: OwnedTargetIsa,
+}
+
+impl Drop for CraneliftCompiler {
+    fn drop(&mut self) {
+        // best effort cleanup
+        SCRATCH.take();
+    }
 }
 
 impl CraneliftCompiler {
@@ -812,17 +825,12 @@ impl CraneliftCompiler {
         let mut flag_builder = cranelift::codegen::settings::builder();
 
         // JIT code is in-process and not being linked as a PIC object.
-        flag_builder
-            .set("is_pic", "false")
-            .map_err(|err| anyhow!("Cranelift flag is_pic failed: {err}"))?;
-
-        // This mirrors the common Cranelift JIT setup.
-        flag_builder
-            .set("use_colocated_libcalls", "false")
-            .map_err(|err| anyhow!("Cranelift flag use_colocated_libcalls failed: {err}"))?;
-
-        // JIT code is in-process and not being linked as a PIC object.
         flag_builder.set("is_pic", "false")?;
+
+        // On at least AArch64, "colocated" calls use shorter-range relocations,
+        // which might not reach all definitions; we can't handle that here, so
+        // we require long-range relocation types.
+        flag_builder.set("use_colocated_libcalls", "false")?;
 
         // JIT frames are not intended to be stack-walked by profilers/debuggers.
         // Omitting frame pointers can reduce prologue/epilogue work and keep an
@@ -841,13 +849,6 @@ impl CraneliftCompiler {
         // block offsets or machine-code edges, so avoid generating that metadata.
         flag_builder.set("machine_code_cfg_info", "false")?;
 
-        // On at least AArch64, "colocated" calls use shorter-range relocations,
-        // which might not reach all definitions; we can't handle that here, so
-        // we require long-range relocation types.
-        flag_builder.set("use_colocated_libcalls", "false")?;
-
-        flag_builder.set("preserve_frame_pointers", "false")?;
-
         // logs are not wanted
         flag_builder.set("regalloc_verbose_logs", "false")?;
 
@@ -857,8 +858,7 @@ impl CraneliftCompiler {
         flag_builder.set("enable_verifier", check_flag)?;
         flag_builder.set("regalloc_checker", check_flag)?;
 
-        // we aren't compiling sandboxed code; the sandbox comes as a natural extension of
-        // the IR building process where VM access is lowered
+        // Take the hit on sandboxing in the name of speed
         flag_builder.set("enable_heap_access_spectre_mitigation", "false")?;
         flag_builder.set("enable_table_access_spectre_mitigation", "false")?;
 
@@ -897,103 +897,92 @@ impl CraneliftCompiler {
         exec_ir: &ExecIr,
         optimized: bool,
     ) -> anyhow::Result<CompiledExecChunk> {
-        use cranelift::codegen::Context;
+        let (mut ctx, mut builder_ctx) = SCRATCH
+            .take()
+            .unwrap_or_else(|| (Context::new(), FunctionBuilderContext::new()));
 
-        thread_local! {
-            static SCRATCH: RefCell<Option<(Context, FunctionBuilderContext)>> = const {
-                RefCell::new(None)
-            };
-        }
+        let isa = match optimized {
+            true => &self.compile_optimized_isa,
+            false => &self.compile_fast_isa,
+        };
 
-        SCRATCH.with_borrow_mut(|slot| {
-            let (mut ctx, mut builder_ctx) = slot
-                .take()
-                .unwrap_or_else(|| (Context::new(), FunctionBuilderContext::new()));
+        ctx.func.signature.call_conv = isa.default_call_conv();
 
-            let isa = match optimized {
-                true => &self.compile_optimized_isa,
-                false => &self.compile_fast_isa,
-            };
+        let builder = JITBuilder::with_isa(isa.clone(), cranelift::module::default_libcall_names());
+        let mut module = JITModule::new(builder);
 
-            ctx.func.signature.call_conv = isa.default_call_conv();
+        ctx.set_disasm(options.show_disasm);
 
-            let builder =
-                JITBuilder::with_isa(isa.clone(), cranelift::module::default_libcall_names());
-            let mut module = JITModule::new(builder);
+        ctx.func.signature = exec_block_signature(&module);
 
-            ctx.set_disasm(options.show_disasm);
+        let mut clif_disasm_output = String::new();
 
-            ctx.func.signature = exec_block_signature(&module);
+        {
+            let ptr_ty = module.target_config().pointer_type();
+            let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
 
-            let mut clif_disasm_output = String::new();
+            let mut lowering = FunctionLowering::new(builder, &module, exec_ir, ptr_ty)?;
 
-            {
-                let ptr_ty = module.target_config().pointer_type();
-                let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
-
-                let mut lowering = FunctionLowering::new(builder, &module, exec_ir, ptr_ty)?;
-
-                lowering.lower_blocks()?;
-                lowering.finish();
-
-                if options.show_disasm {
-                    // do it here because afterward the `clif` will get optimized
-                    clif_disasm_output = ctx.func.display().to_string()
-                }
-            }
-
-            let func_id = module
-                .declare_function(&options.function_name, Linkage::Export, &ctx.func.signature)
-                .map_err(|err| anyhow!("declare_function failed: {err}"))?;
-
-            module
-                .define_function(func_id, &mut ctx)
-                .map_err(|err| anyhow!("define_function failed: {err}"))?;
+            lowering.lower_blocks()?;
+            lowering.finish();
 
             if options.show_disasm {
-                let code = ctx
-                    .compiled_code()
-                    .expect("Cranelift did not leave compiled code in the context");
-
-                eprintln!(
-                    "{name}:\nclif:\n{clif_disasm_output}\nassembly:\n{disasm}",
-                    name = options.function_name,
-                    disasm = code
-                        .vcode
-                        .as_deref()
-                        .unwrap_or("no disassembly was produced")
-                );
+                // do it here because afterward the `clif` will get optimized
+                clif_disasm_output = ctx.func.display().to_string()
             }
+        }
 
-            module.clear_context(&mut ctx);
+        let func_id = module
+            .declare_function(&options.function_name, Linkage::Export, &ctx.func.signature)
+            .map_err(|err| anyhow!("declare_function failed: {err}"))?;
 
-            *slot = Some((ctx, builder_ctx));
+        module
+            .define_function(func_id, &mut ctx)
+            .map_err(|err| anyhow!("define_function failed: {err}"))?;
 
-            module
-                .finalize_definitions()
-                .map_err(|err| anyhow!("finalize_definitions failed: {err}"))?;
+        if options.show_disasm {
+            let code = ctx
+                .compiled_code()
+                .expect("Cranelift did not leave compiled code in the context");
 
-            let code_ptr = module.get_finalized_function(func_id);
+            eprintln!(
+                "{name}:\nclif:\n{clif_disasm_output}\nassembly:\n{disasm}",
+                name = options.function_name,
+                disasm = code
+                    .vcode
+                    .as_deref()
+                    .unwrap_or("no disassembly was produced")
+            );
+        }
 
-            let ffi: ExecBlockFFI = unsafe {
-                // Safety:
-                // - `exec_block_signature` must exactly match `ExecBlockFFI`.
-                // - `module` is moved into `resources`, keeping finalized code alive.
-                std::mem::transmute::<*const u8, ExecBlockFFI>(code_ptr)
-            };
+        module.clear_context(&mut ctx);
 
-            struct DropModule(ManuallyDrop<JITModule>);
+        SCRATCH.set(Some((ctx, builder_ctx)));
 
-            impl Drop for DropModule {
-                fn drop(&mut self) {
-                    unsafe { ManuallyDrop::take(&mut self.0).free_memory() };
-                }
+        module
+            .finalize_definitions()
+            .map_err(|err| anyhow!("finalize_definitions failed: {err}"))?;
+
+        let code_ptr = module.get_finalized_function(func_id);
+
+        let ffi: ExecChunkFFI = unsafe {
+            // Safety:
+            // - `exec_block_signature` must exactly match `ExecBlockFFI`.
+            // - `module` is moved into `resources`, keeping finalized code alive.
+            std::mem::transmute::<*const u8, ExecChunkFFI>(code_ptr)
+        };
+
+        struct DropModule(ManuallyDrop<JITModule>);
+
+        impl Drop for DropModule {
+            fn drop(&mut self) {
+                unsafe { ManuallyDrop::take(&mut self.0).free_memory() };
             }
+        }
 
-            Ok(CompiledExecChunk::new_with_recources(
-                ffi,
-                DropModule(ManuallyDrop::new(module)),
-            ))
-        })
+        Ok(CompiledExecChunk::new_with_resources(
+            ffi,
+            DropModule(ManuallyDrop::new(module)),
+        ))
     }
 }

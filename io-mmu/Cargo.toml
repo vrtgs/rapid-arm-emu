@@ -9,7 +9,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-getrandom = "0.4.3"
+getrandom = { version = "0.4.3", features = ["std"] }
 once_cell = "1.21.4"
 smallvec = { workspace = true }
 emu-abi = { workspace = true }

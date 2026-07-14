@@ -1,12 +1,31 @@
 pub use std::process::abort;
 
-pub struct AbortGuard(pub ());
+/// A guard that aborts the process when dropped unless explicitly disarmed.
+///
+/// Wrap a section that must not unwind with `AbortGuard` to convert any panic
+/// unwind into an unconditional process abort, preventing partially modified
+/// state from being observed by other threads.
+///
+/// # Constructing
+///
+/// `AbortGuard` has no `new()` function — construct it directly with the
+/// unit field:
+///
+/// ```
+/// use emu_abi::abort::AbortGuard;
+///
+/// let guard = AbortGuard(());
+/// guard.disarm(); // or guard.abort()
+/// ```
+pub struct AbortGuard(#[allow(missing_docs)] pub ());
 
 impl AbortGuard {
+    /// Consumes the guard without aborting, allowing the current scope to exit normally.
     pub fn disarm(self) {
         core::mem::forget(self)
     }
 
+    /// Aborts the process immediately.
     pub fn abort(self) -> ! {
         abort()
     }

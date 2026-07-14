@@ -11,8 +11,7 @@ mod interner;
 fn main() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let interner = Interner::new();
-    let InstructionSets { aarch64: _, .. } =
-        instruction_parser::load_instruction_sets(&temp_dir, &interner)?;
+    let InstructionSets { .. } = instruction_parser::load_instruction_sets(&temp_dir, &interner)?;
 
     Ok(())
 }

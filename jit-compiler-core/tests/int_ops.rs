@@ -1,8 +1,10 @@
+#![allow(missing_docs)]
+
 use crate::helper::{
     call_compiled, compile, run_success, store_bool_as_x_reg, store_int_equals_as_x_reg, u64_const,
 };
 use emu_abi::exec_state::ExecState;
-use exec_ir::{ExecIrBuilder, IConst, IntCmp, IntWidth};
+use jit_compiler_core::ir::{ExecIrBuilder, IConst, IntCmp, IntWidth};
 
 mod helper;
 

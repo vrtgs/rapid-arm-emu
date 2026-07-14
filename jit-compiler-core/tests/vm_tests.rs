@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 use crate::helper::{
     TLB, call_compiled_full, compile, run_with_mmu, store_int_equals_as_x_reg, u64_const,
 };
@@ -5,10 +7,10 @@ use emu_abi::exec_state::ExecState;
 use emu_abi::halt_reason::HaltReason;
 use emu_abi::internal_traits::InitInPlace;
 use emu_abi::memory::{MemProt, PAGE_SIZE, PAGE_SIZE_U64, PagePointer, TLB_SIZE};
-use exec_ir::{ExecIrBuilder, IConst, IntCmp, IntWidth};
 use io_mmu::cpu_fabric::CpuFabric;
 use io_mmu::icache::ICache;
 use io_mmu::lookup_cache::NoCache;
+use jit_compiler_core::ir::{ExecIrBuilder, IConst, IntCmp, IntWidth};
 use std::collections::HashSet;
 use std::mem::MaybeUninit;
 use std::num::NonZero;

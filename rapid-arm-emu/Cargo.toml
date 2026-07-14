@@ -7,9 +7,10 @@ name = "rapid-arm-emu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = true
 
 [dependencies]
 emu-abi = { workspace = true }
 io-mmu = { workspace = true }
-exec-ir = { workspace = true }
+jit-compiler-core = { workspace = true }
 parking_lot = { workspace = true }

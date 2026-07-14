@@ -1,7 +1,18 @@
+//! Memory fault types returned by failed MMU operations.
+//!
+//! Every fallible translation or access in this crate reports failure as a
+//! [`MemoryFault`], which pairs the faulting virtual address with a
+//! [`MemoryFaultReason`].
+
+/// The reason a [`MemoryFault`] was raised.
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryFaultReason {
+    /// The access violated MMU validation: an unmapped page, insufficient
+    /// page permissions, address overflow, or a failed alignment check.
     #[error("invalid memory permissions")]
     GeneralProtection,
+    /// The backing [`MemoryObject`](crate::memory_object::MemoryObject)
+    /// reported an error while faulting a page in or out.
     #[error("invalid memory access {0}")]
     MemoryBus(anyhow::Error),
 }
@@ -21,6 +32,7 @@ pub struct MemoryFault {
 }
 
 impl MemoryFault {
+    /// Creates a [`MemoryFaultReason::GeneralProtection`] fault at `vaddr`.
     #[cold]
     #[inline(always)]
     pub const fn general_protection(vaddr: u64) -> Self {
@@ -30,6 +42,8 @@ impl MemoryFault {
         }
     }
 
+    /// Creates a [`MemoryFaultReason::MemoryBus`] fault at `vaddr` carrying
+    /// the underlying backing-object error.
     #[cold]
     #[inline(always)]
     pub const fn memory_bus(vaddr: u64, reason: anyhow::Error) -> Self {
@@ -37,6 +51,18 @@ impl MemoryFault {
             vaddr,
             reason: MemoryFaultReason::MemoryBus(reason),
         }
+    }
+
+    /// Returns the virtual address at which the fault occurred.
+    #[inline(always)]
+    pub const fn vaddr(&self) -> u64 {
+        self.vaddr
+    }
+
+    /// Consumes the fault, returning the underlying reason for the memory fault.
+    #[inline(always)]
+    pub fn into_reason(self) -> MemoryFaultReason {
+        self.reason
     }
 }
 

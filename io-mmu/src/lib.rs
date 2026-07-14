@@ -1,3 +1,13 @@
+//! Software IO-MMU for the emulator: a page-granular virtual address space
+//! mapped onto host memory.
+//!
+//! The central type is [`IoMMU`], which owns a page table translating Armv9
+//! guest virtual addresses to host pages. Pages can be backed by anonymous
+//! memory, externally provided host memory, or demand-paged
+//! [`MemoryObject`](MemoryObject)s. All guest memory accesses
+//! go through the audited atomic primitives in [`memops`], and translation
+//! can be speeded up by a [`LookupCache`] such as a [`TLB`].
+
 use crate::cpu_fabric::CpuFabric;
 use crate::fault::{MemoryFault, ensure};
 use crate::icache::ICache;
@@ -5,7 +15,7 @@ use crate::lookup_cache::{LookupCache, LookupCacheExt};
 use crate::memory_object::MemoryObject;
 use crate::page_table::{MapRegion, MemMapFlags, PageTable};
 use emu_abi::abort::AbortGuard;
-use emu_abi::convert::u64_to_usize;
+use emu_abi::convert::{u64_to_usize, usize_to_u64};
 use emu_abi::memory::{
     IoMMUIdentifier, IoMMUIdentifierRef, MemFlags, MemProt, PAGE_OFFSET_MASK_U64, PAGE_SHIFT,
     PAGE_SIZE, PAGE_SIZE_U64, Page, PageNumber, PagePointer,
@@ -94,6 +104,11 @@ pub struct IoMMU<T: ?Sized + ICache> {
 }
 
 impl<T: ?Sized + ICache> IoMMU<T> {
+    /// Creates a new, empty `IoMMU` attached to `fabric`.
+    ///
+    /// The address space starts with no mappings; every access faults until
+    /// regions are mapped with [`map`](Self::map), [`map_extern`](Self::map_extern),
+    /// or [`map_device`](Self::map_device).
     pub fn new(fabric: CpuFabric<T>) -> Self {
         Self {
             identifier: IoMMUIdentifier::unique_token(),
@@ -102,6 +117,10 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         }
     }
 
+    /// Returns the current identity token of this address space.
+    ///
+    /// The identifier changes whenever the page table is mutated, so caches
+    /// such as a TLB can use it to detect that their entries are stale.
     #[inline]
     pub fn get_ident(&self) -> IoMMUIdentifierRef<'_> {
         self.identifier.get_ref()
@@ -111,14 +130,15 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         self.identifier = IoMMUIdentifier::unique_token();
     }
 
+    /// Returns the [`CpuFabric`] this MMU is attached to.
     pub fn get_fabric(&self) -> &CpuFabric<T> {
         &self.fabric
     }
 
-    unsafe fn modify_table<E>(
+    unsafe fn modify_table_full<U, E>(
         &mut self,
-        transform: impl FnOnce(&mut PageTable, &CpuFabric<T>) -> Result<bool, E>,
-    ) -> Result<(), E> {
+        transform: impl FnOnce(&mut PageTable, &CpuFabric<T>) -> Result<(bool, U), E>,
+    ) -> Result<U, E> {
         struct ChangeIdentifier<'a, T: ?Sized + ICache>(&'a mut IoMMU<T>);
 
         impl<T: ?Sized + ICache> Drop for ChangeIdentifier<'_, T> {
@@ -129,13 +149,13 @@ impl<T: ?Sized + ICache> IoMMU<T> {
 
         let identifier_change = ChangeIdentifier(self);
         match transform(&mut identifier_change.0.table, &identifier_change.0.fabric) {
-            Ok(true) => {
+            Ok((true, res)) => {
                 drop(identifier_change);
-                Ok(())
+                Ok(res)
             }
-            Ok(false) => {
+            Ok((false, res)) => {
                 std::mem::forget(identifier_change);
-                Ok(())
+                Ok(res)
             }
             Err(err) => {
                 std::mem::forget(identifier_change);
@@ -144,9 +164,19 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         }
     }
 
+    unsafe fn modify_table<E>(
+        &mut self,
+        transform: impl FnOnce(&mut PageTable, &CpuFabric<T>) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        unsafe {
+            self.modify_table_full(move |table, fabric| {
+                let bool = transform(table, fabric)?;
+                Ok((bool, ()))
+            })
+        }
+    }
+
     // TODO(low priority) add the ability to map and unmap in a single operation
-    //      by simply using inclusive map ranges, OR by making you
-    //      make size == page count directly
     unsafe fn map_region(
         &mut self,
         base: u64,
@@ -192,10 +222,11 @@ impl<T: ?Sized + ICache> IoMMU<T> {
     ///   level, regardless of the guest permissions applied by `protections`
     ///   and it also must have write permissions set if `readonly = false`
     ///
-    /// - If `readonly = false`, the backing memory is not accessed directly
-    ///   while this mapping is alive, except by other MMUs that use the same `CpuFabric`
-    ///   and if `readonly = true`, then the memory pointed to by pointer must not be read
-    ///   while this mapping is alive
+    /// - If `readonly = false`, the backing memory must not be accessed directly
+    ///   while this mapping is alive, except by other MMUs that use the same `CpuFabric`.
+    ///
+    /// - If `readonly = true`, then the memory pointed to by the pointer may be read from
+    ///   while this mapping is alive, but it must not be written to.
     pub unsafe fn map_extern(
         &mut self,
         base: u64,
@@ -229,6 +260,20 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         unsafe { self.map_region(base, size, protections, region) }
     }
 
+    /// Maps anonymous zero-initialized memory into the MMU page table.
+    ///
+    /// `base` is the starting virtual address and `size` is the mapping size
+    /// in bytes; both must be page-aligned and `base + size` must not
+    /// overflow. No mapping may exist in `base..(base + size)`.
+    /// `protections` is applied to every mapped page.
+    ///
+    /// If `shared` is `true`, the pages are shared with forked address
+    /// spaces. If `lazy` is `true` (and `shared` is `false`), pages start as
+    /// copy-on-write views of the zero page and only get their own backing
+    /// storage when first written.
+    ///
+    /// Returns [`MemoryFault`] on misalignment, overflow, or an already
+    /// mapped page in the range.
     pub fn map(
         &mut self,
         base: u64,
@@ -246,6 +291,19 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         unsafe { self.map_region(base, size, protections, region) }
     }
 
+    /// Maps a demand-paged [`MemoryObject`] into the MMU page table.
+    ///
+    /// Same as [`map_device`](Self::map_device), but takes an already
+    /// type-erased `Arc<dyn MemoryObject>`.
+    ///
+    /// `base` and `size` must be page-aligned, `base + size` must not
+    /// overflow, and no mapping may already exist in the range. Page contents
+    /// are faulted in from `device` on first access and dirty pages are
+    /// written back to it. If `shared` is `true`, the object's pages are
+    /// shared with forked address spaces.
+    ///
+    /// Returns [`MemoryFault`] on misalignment, overflow, or an already
+    /// mapped page in the range.
     pub fn map_device_dyn(
         &mut self,
         base: u64,
@@ -262,6 +320,11 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         unsafe { self.map_region(base, size, protections, region) }
     }
 
+    /// Maps a demand-paged [`MemoryObject`] into the MMU page table.
+    ///
+    /// Convenience wrapper around [`map_device_dyn`](Self::map_device_dyn)
+    /// that wraps `device` in an [`Arc`]; see that method for the mapping
+    /// requirements and semantics.
     pub fn map_device(
         &mut self,
         base: u64,
@@ -273,6 +336,14 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         self.map_device_dyn(base, size, Arc::new(device), shared, protections)
     }
 
+    /// Unmaps every mapped page in `start..(start + size)`.
+    ///
+    /// `start` and `size` must be page-aligned and `start + size` must not
+    /// overflow. Pages in the range that are not mapped are skipped; dirty
+    /// pages are dropped without being flushed back to their backing
+    /// [`MemoryObject`] (use [`flush`](Self::flush) first if that matters).
+    ///
+    /// Returns [`MemoryFault`] on misalignment or overflow.
     pub fn unmap(&mut self, start: u64, size: u64) -> Result<(), MemoryFault> {
         let Some(access) = PageTableAccess::get_pages(start, size)? else {
             return Ok(());
@@ -290,6 +361,15 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         }
     }
 
+    /// Sets the guest protection of every page in `start..(start + size)` to
+    /// `protections`.
+    ///
+    /// `start` and `size` must be page-aligned and `start + size` must not
+    /// overflow. Every page in the range must currently be mapped; if any
+    /// page is unmapped, no page is modified.
+    ///
+    /// Returns [`MemoryFault`] on misalignment, overflow, or an unmapped page
+    /// in the range.
     pub fn protect(
         &mut self,
         start: u64,
@@ -305,7 +385,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
                 let mut modified = false;
                 table.modify(access, |_, entry| {
                     modified |= entry.prot() != protections;
-                    entry.memprot(protections);
+                    entry.protect(protections);
                 })?;
 
                 Ok(modified)
@@ -313,10 +393,23 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         }
     }
 
+    /// Forks this address space, returning a new `IoMMU` with a copy of the
+    /// current page table.
+    ///
+    /// Shared mappings keep referring to the same backing pages in both
+    /// address spaces. Private mappings become copy-on-write: both sides see
+    /// the same contents until one of them writes, at which point the writer
+    /// gets its own copy. The new MMU is attached to the same [`CpuFabric`] as `self`.
     pub fn fork(&mut self) -> Self {
-        self.change_ident();
+        let Ok(table) = unsafe {
+            self.modify_table_full(|table, _| {
+                let new_table = table.fork();
+                Ok::<_, Infallible>((new_table.is_empty(), new_table))
+            })
+        };
+
         Self {
-            table: self.table.fork(),
+            table,
             identifier: self.identifier.clone(),
             fabric: self.fabric.clone(),
         }
@@ -324,6 +417,10 @@ impl<T: ?Sized + ICache> IoMMU<T> {
 }
 
 impl<T: ?Sized + ICache> IoMMU<T> {
+    /// Resolves `page` to a live [`Page`] handle through the given
+    /// [`LookupCache`].
+    ///
+    /// Returns [`MemoryFault`] if the page is not mapped.
     #[inline(always)]
     pub fn get_page(
         &self,
@@ -455,7 +552,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
                 no_cow,
                 |_, _| {},
                 |vm_ptr, mem_ptr, count| {
-                    memops::copy_non_overlapping_vm_to_host(vm_ptr, mem_ptr, count);
+                    memops::copy_nonoverlapping_vm_to_host(vm_ptr, mem_ptr, count);
                 },
             )?
         }
@@ -569,7 +666,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
                 no_cow,
                 |_page_num, page| page.set_dirty(),
                 |vm_ptr, mem_ptr, count| {
-                    memops::copy_non_overlapping_host_to_vm(mem_ptr, vm_ptr, count);
+                    memops::copy_nonoverlapping_host_to_vm(mem_ptr, vm_ptr, count);
                 },
             )
         }
@@ -618,19 +715,59 @@ impl<T: ?Sized + ICache> IoMMU<T> {
 }
 
 impl<T: ?Sized + ICache> IoMMU<T> {
+    /// Resolves `vaddr` to the page that contains it, together with the
+    /// in-page byte offset, for a naturally aligned scalar access of
+    /// `ACCESS_SIZE` bytes.
+    ///
+    /// `ACCESS_SIZE` is the width of the access in bytes (e.g. `4` for a
+    /// 32-bit load/store) and must be a power of two smaller than
+    /// `PAGE_SIZE`, with `PAGE_SIZE` an exact multiple of it; these are
+    /// compile-time invariants of the type system, not runtime conditions.
+    ///
+    /// `vaddr` must be aligned to `ACCESS_SIZE`; misalignment is reported
+    /// as a [`MemoryFault`], not a panic.
+    ///
+    /// # Guarantee
+    ///
+    /// Because `vaddr` is `ACCESS_SIZE`-aligned, the returned offset can
+    /// never be closer than `ACCESS_SIZE` bytes to the end of the page.
+    /// Callers may therefore read or write `ACCESS_SIZE` bytes starting at
+    /// the returned offset without any page-boundary check — the access is
+    /// statically guaranteed to stay within the single returned page.
+    ///
+    /// This function does **not** check `MemProt`/`MemFlags` permissions
+    /// (`READ`/`WRITE`/`EXECUTE`); callers must check the flags on the
+    /// returned [`Page`] themselves before accessing it.
+    ///
+    /// Returns [`MemoryFault`] if `vaddr` is misaligned or the containing
+    /// page is unmapped.
     #[inline(always)]
-    fn single_page_aligned_access<const ACCESS_SIZE: u8>(
+    pub fn resolve_aligned_scalar_access<const ACCESS_SIZE: usize>(
         &self,
         mut cache: impl LookupCache,
         vaddr: u64,
     ) -> Result<(Page<'_>, usize), MemoryFault> {
         const {
-            assert!(ACCESS_SIZE.is_power_of_two());
+            assert!(
+                ACCESS_SIZE.is_power_of_two(),
+                "ACCESS_SIZE must be a power of two"
+            );
+            assert!(
+                ACCESS_SIZE < PAGE_SIZE,
+                "ACCESS_SIZE must be smaller than PAGE_SIZE this function only \
+                 handles accesses that fit within a single page"
+            );
+
+            // given that ACCESS_SIZE is a power of 2, and PAGE_SIZE is also a power of 2
+            // then this is more or less a sanity check
             assert!(PAGE_SIZE.is_power_of_two());
-            assert!(PAGE_SIZE.is_multiple_of(ACCESS_SIZE as usize));
+            assert!(PAGE_SIZE.is_multiple_of(ACCESS_SIZE));
         }
 
-        ensure!(vaddr: vaddr, vaddr.is_multiple_of(ACCESS_SIZE as u64));
+        ensure!(
+            vaddr: vaddr,
+            vaddr.is_multiple_of(const { usize_to_u64(ACCESS_SIZE).unwrap() })
+        );
 
         let (_page_num, offset, page) = cache.lookup_addr(self, vaddr)?;
         unsafe {
@@ -667,8 +804,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
             //      - `offset < PAGE_SIZE - ACCESS_SIZE + 1`
             // Thus access of size `ACCESS_SIZE` starting at `offset`
             // cannot cross the page boundary.
-            let max_offset_exclusive =
-                const { PAGE_SIZE.strict_sub(ACCESS_SIZE as usize).strict_add(1) };
+            let max_offset_exclusive = const { PAGE_SIZE.strict_sub(ACCESS_SIZE).strict_add(1) };
 
             std::hint::assert_unchecked(offset < max_offset_exclusive)
         };
@@ -676,26 +812,53 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         Ok((page, offset))
     }
 
+    /// Resolves `vaddr` to the page that contains it, together with the
+    /// in-page byte offset, for a single-byte access.
+    ///
+    /// Equivalent to
+    /// [`resolve_aligned_scalar_access::<1>`](Self::resolve_aligned_scalar_access),
+    /// specialized for byte accesses. A width-1 access has no alignment
+    /// requirement (every offset is trivially "1-byte aligned"), so unlike
+    /// the general form this never faults on alignment grounds - only on an
+    /// unmapped page.
+    ///
+    /// As with the general form, this does not check `MemProt`/`MemFlags`
+    /// permissions; callers must check the returned [`Page`]'s flags
+    /// themselves.
     #[inline(always)]
-    fn single_page_access(
+    pub fn resolve_byte_access(
         &self,
         cache: impl LookupCache,
         vaddr: u64,
     ) -> Result<(Page<'_>, usize), MemoryFault> {
-        const ALIGN: u8 = 1;
-        self.single_page_aligned_access::<ALIGN>(cache, vaddr)
+        const ALIGN: usize = 1;
+        self.resolve_aligned_scalar_access::<ALIGN>(cache, vaddr)
     }
 }
 
 impl<T: ?Sized + ICache> IoMMU<T> {
+    /// Loads a single byte from virtual memory.
+    ///
+    /// The page containing `vaddr` must be mapped with `READ` permission.
+    /// The load is a single-byte atomic access, so it is always
+    /// single-copy atomic with respect to concurrent stores.
+    ///
+    /// Returns [`MemoryFault`] on unmapped access or permission failure.
     #[inline(always)]
     pub fn load_byte(&self, cache: impl LookupCache, vaddr: u64) -> Result<u8, MemoryFault> {
-        let (page, offset) = self.single_page_access(cache, vaddr)?;
+        let (page, offset) = self.resolve_byte_access(cache, vaddr)?;
         ensure!(vaddr: vaddr, page.ptr.flags().contains_any(MemFlags::READ));
         let byte = unsafe { memops::load_byte(page.ptr.page_ptr().byte_add(offset).as_ptr()) };
         Ok(byte)
     }
 
+    /// Stores a single byte into virtual memory.
+    ///
+    /// The page containing `vaddr` must be mapped with `WRITE` permission.
+    /// The store is a single-byte atomic access, so it is always
+    /// single-copy atomic with respect to concurrent loads and stores.
+    ///
+    /// Returns [`MemoryFault`] on unmapped access or permission failure.
     #[inline(always)]
     pub fn store_byte(
         &self,
@@ -703,7 +866,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         vaddr: u64,
         value: u8,
     ) -> Result<(), MemoryFault> {
-        let (page, offset) = self.single_page_access(cache, vaddr)?;
+        let (page, offset) = self.resolve_byte_access(cache, vaddr)?;
         ensure!(vaddr: vaddr, page.ptr.flags().contains_any(MemFlags::WRITE));
         unsafe { memops::store_byte(page.ptr.page_ptr().byte_add(offset).as_ptr(), value) }
         page.set_dirty();
@@ -1050,37 +1213,57 @@ macro_rules! emit_multi_word_load_store {
 
 emit_multi_word_load_store! { 64, 32, 16 }
 
-const AARCH64_INSN_ALIGN: u8 = 4;
-
 impl<T: ?Sized + ICache> IoMMU<T> {
-    #[inline]
-    pub fn fetch_aarch64_raw(
-        &self,
-        cache: impl LookupCache,
-        vaddr: u64,
-    ) -> Result<(PagePointer, usize), MemoryFault> {
-        let (page, offset) = self.single_page_aligned_access::<AARCH64_INSN_ALIGN>(cache, vaddr)?;
+    /// Fetches the 32-bit little-endian AArch64 instruction word at `vaddr`.
+    ///
+    /// `vaddr` must be 4-byte aligned, and the containing page must be mapped
+    /// with `EXECUTE` permission. The fetch is a naturally aligned 32-bit
+    /// access and is therefore single-copy atomic.
+    ///
+    /// Returns [`MemoryFault`] on unmapped access, permission failure, or
+    /// misaligned `vaddr`.
+    ///
+    /// # Note
+    ///
+    /// This method isn't a very fast way to fetch instructions,
+    /// and is better handled by doing bulk compilation per page.
+    pub fn fetch_aarch64(&self, cache: impl LookupCache, vaddr: u64) -> Result<u32, MemoryFault> {
+        const AARCH64_INSN_ALIGN: usize = size_of::<u32>();
+
+        let (page, offset) =
+            self.resolve_aligned_scalar_access::<AARCH64_INSN_ALIGN>(cache, vaddr)?;
 
         ensure!(vaddr: vaddr, page.ptr.flags().contains_any(MemFlags::EXECUTE));
         let page_ptr = page.ptr.page_ptr();
-        Ok((page_ptr, offset))
+        let word = unsafe {
+            let word_ptr = page_ptr.byte_add(offset);
+            memops::load32_le_aligned(word_ptr.as_ptr())
+        };
+        Ok(word)
     }
 
-    pub fn fetch_aarch64(&self, cache: impl LookupCache, vaddr: u64) -> Result<u32, MemoryFault> {
-        self.fetch_aarch64_raw(cache, vaddr)
-            .map(|(page_ptr, offset)| unsafe {
-                let word_ptr = page_ptr.byte_add(offset);
-                memops::load32_le_aligned(word_ptr.as_ptr())
-            })
-    }
-
-    // TODO mark slow
+    /// Kicks off the asynchronous write-back of every dirty shared
+    /// [`MemoryObject`] page in this address space.
+    ///
+    /// Unlike [`flush`](Self::flush), this does not wait for the write-back
+    /// to complete. This walks the whole page table, so it is slow and not
+    /// intended for hot paths.
     pub fn refresh(&self) {
         for (_page_num, page) in self.table.pages() {
             page.refresh(self.get_fabric());
         }
     }
 
+    /// Writes every dirty shared [`MemoryObject`] page in this address space
+    /// back to its backing object, waiting for all write-back to complete.
+    ///
+    /// This walks the whole page table and blocks on I/O, so it is slow and
+    /// not intended for hot paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a backing object reports a write failure or if
+    /// the flusher thread exited.
     pub fn flush(&self) -> anyhow::Result<()> {
         // TODO better api or at least just keep reusing ONE channel
         let pending_jobs = self
@@ -1097,7 +1280,17 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         })
     }
 
-    // TODO mark slow
+    /// Faults in every not-yet-loaded [`MemoryObject`] page in this address
+    /// space, waiting until all of them are resident.
+    ///
+    /// After this returns successfully, no access in the mapped ranges will
+    /// need to demand-page from a backing object. This walks the whole page
+    /// table and blocks on I/O, so it is slow and not intended for hot paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a backing object reports a read failure or if the
+    /// flusher thread exited.
     pub fn fault_in_all_memory_objects(&self) -> anyhow::Result<()> {
         // TODO better api or at least just keep reusing ONE channel
         let pending_jobs = self
@@ -1114,7 +1307,11 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         })
     }
 
-    // TODO mark slow
+    /// Eagerly resolves every copy-on-write page in this address space,
+    /// giving each private page its own backing storage now.
+    ///
+    /// This walks the whole page table and may copy a lot of memory, so it
+    /// is slow and not intended for hot paths.
     pub fn copy_all_cow_pages(&mut self) {
         let Ok(()) = unsafe {
             self.modify_table(|table, _| {

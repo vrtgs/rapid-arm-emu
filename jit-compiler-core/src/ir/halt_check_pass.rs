@@ -65,7 +65,7 @@
 //! maps consistent.
 
 use crate::arena::{Arena, ArenaMap, ArenaSet, Storable, handle_impl_helper, make_handle};
-use crate::{Block, ExecIrBuilder, Stmt, StmtKind};
+use crate::ir::{Block, ExecIrBuilder, Stmt, StmtKind};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZero;

@@ -1,9 +1,18 @@
+//! Demand-paged backing stores for MMU mappings.
+//!
+//! A [`MemoryObject`] is the source of truth behind an
+//! [`IoMMU::map_device`](crate::IoMMU::map_device) mapping: pages are read
+//! from it on first access ("fault in") and dirty pages are written back to
+//! it ("fault out"). This module defines the trait and its safety contract;
+//! ready-made implementations live in [`objects`] and on [`std::fs::File`].
+
 use crate::page_table::{copy_page_exclusive_to_shared, copy_page_shared_to_exclusive};
-use emu_abi::memory::{PageNumber, PagePointer, UninitPageMut};
+use emu_abi::memory::{PageNumber, PagePointer, UninitPage};
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicU8;
 
 mod r#impl;
+/// Ready-made [`MemoryObject`] implementations provided by this crate.
 pub mod objects;
 
 /// A memory object that services demand-paging faults.
@@ -51,7 +60,7 @@ pub mod objects;
 ///    reads the whole scratch page only after a successful return, so reporting `Ok` over
 ///    a partially initialized page is undefined behavior.
 ///
-/// 2. **Shared variants never deinitialize and touch bytes only through [`memops`].**
+/// 2. **Shared variants never deinitialize and touch bytes only through [`memops`](crate::memops).**
 ///    Any implementation of [`fault_in`](Self::fault_in) or [`fault_out`](Self::fault_out)
 ///    (including overrides) may access the bytes of the shared page *only* through the
 ///    functions in [`memops`](crate::memops), and must never cause any byte to become
@@ -115,8 +124,9 @@ pub unsafe trait MemoryObject: 'static + Send + Sync {
     /// * Every one of the `PAGE_SIZE` bytes of the page is initialized. This method reads
     ///   the entire page, so any uninitialized byte is undefined behavior.
     /// * `page_ptr` is aligned to `PAGE_SIZE`.
-    /// * The caller has exclusive access to the page for the duration of the call: no other
-    ///   thread or DMA agent may read or write it concurrently.
+    /// * The caller has full read access to the page for the duration of the call: no other
+    ///   thread or DMA agent may write it concurrently,
+    ///   and that means normal non-atomic operations are allowed.
     ///
     /// As with [`fault_in_exclusive`](Self::fault_in_exclusive), an unserviceable
     /// `page_offset` must be reported as `Err`.
@@ -169,7 +179,7 @@ pub unsafe trait MemoryObject: 'static + Send + Sync {
         page_offset: PageNumber,
         page_ptr: NonNull<AtomicU8>,
     ) -> anyhow::Result<()> {
-        let mut page = UninitPageMut::new();
+        let mut page = UninitPage::new();
         let shared = unsafe { PagePointer::new(page_ptr) };
 
         unsafe {
@@ -222,14 +232,14 @@ pub unsafe trait MemoryObject: 'static + Send + Sync {
         page_offset: PageNumber,
         page_ptr: NonNull<AtomicU8>,
     ) -> anyhow::Result<()> {
-        let mut page = UninitPageMut::new();
+        let mut page = UninitPage::new();
         let shared = unsafe { PagePointer::new(page_ptr) };
         unsafe { copy_page_shared_to_exclusive(shared, &mut page) }
 
         unsafe {
             self.fault_out_exclusive(
                 page_offset,
-                page.page_pointer_mut().as_non_null_ptr().cast::<u8>(),
+                page.page_pointer_ref().as_non_null_ptr().cast::<u8>(),
             )
         }
     }

@@ -1,6 +1,8 @@
+#![allow(missing_docs)]
+
 use crate::helper::{clear_pstate, run_success, store_pstate_equals_as_x_reg};
 use emu_abi::exec_state::{ExecState, PState};
-use exec_ir::{ExecIrBuilder, IConst, IntCmp, IntWidth};
+use jit_compiler_core::ir::{ExecIrBuilder, IConst, IntCmp, IntWidth};
 
 mod helper;
 

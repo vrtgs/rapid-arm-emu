@@ -18,8 +18,8 @@
 //     stack_slots: ArenaMap<StackSlot, PointerValue<'ctx>>,
 // }
 
-use crate::ExecIr;
 use crate::compiler::{CompileBlockOptions, CompiledExecChunk};
+use crate::ir::ExecIr;
 use anyhow::bail;
 
 pub(crate) struct LLVMJit {

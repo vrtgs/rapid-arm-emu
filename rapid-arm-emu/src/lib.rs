@@ -1,3 +1,5 @@
+#![allow(missing_docs, reason = "API still in progress; FIXME")]
+
 mod a64;
 pub mod armv9;
 pub mod halt_reason {

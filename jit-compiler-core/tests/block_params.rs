@@ -1,6 +1,8 @@
+#![allow(missing_docs)]
+
 use crate::helper::{call_compiled, compile, run_success, u64_const};
 use emu_abi::exec_state::ExecState;
-use exec_ir::{ExecIrBuilder, IntWidth, Terminator, Type};
+use jit_compiler_core::ir::{ExecIrBuilder, IntWidth, Terminator, Type};
 
 mod helper;
 

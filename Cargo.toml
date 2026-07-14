@@ -1,6 +1,13 @@
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+
 [workspace]
 resolver = "3"
-members = ["code-generator", "emu-abi", "exec-ir", "io-mmu", "rapid-arm-emu"]
+members = ["code-generator", "emu-abi", "jit-compiler-core", "io-mmu", "rapid-arm-emu"]
 
 [workspace.package]
 version = "0.0.0"
@@ -10,17 +17,17 @@ license = "GPL-3"
 [workspace.dependencies]
 parking_lot = { version = "0.12.5", features = ["hardware-lock-elision"] }
 crossbeam-utils = "0.8.21"
-arrayvec = "0.7.7"
+arrayvec = "0.7.8"
 smallvec = "2.0.0-alpha.12"
 thiserror = "2.0.18"
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 pastey = "0.2.3"
 rpds = "1.2.1"
 
 # internal crates
 emu-abi = { path = "./emu-abi" }
 io-mmu = { path = "./io-mmu" }
-exec-ir = { path = "./exec-ir" }
+jit-compiler-core = { path = "jit-compiler-core" }
 
 [workspace.dependencies.bytemuck]
 version = "1.25.0"
@@ -39,7 +46,7 @@ features = [
     "zeroable_atomics",
     "zeroable_maybe_uninit",
     "zeroable_unwind_fn",
-    "extern_crate_alloc"
+    "extern_crate_alloc",
 ]
 
 [workspace.lints.rustdoc]
@@ -48,9 +55,11 @@ broken_intra_doc_links = "warn"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "forbid"
 unreachable_pub = "warn"
-#missing_docs = "deny"
+missing_docs = "deny"
 
 [workspace.lints.clippy]
+# emulator-specific lints these exist because in an emulator correctness is everything
+
 # F32 -> F64, Int -> Float, etc.
 cast_precision_loss = "deny"
 # U32 -> U8, etc.
@@ -59,4 +68,9 @@ cast_possible_truncation = "deny"
 cast_possible_wrap = "deny"
 # Signed -> Unsigned
 cast_sign_loss = "deny"
+# bare +, -, *, /
+# either use `strict_*` methods or `checked` or `unchecked` methods because incorrect can become UB
 arithmetic_side_effects = "deny"
+
+
+missing_safety_doc = "deny"

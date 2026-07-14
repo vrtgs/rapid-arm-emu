@@ -26,22 +26,37 @@ const fn compute_mask(size: u64) -> u64 {
     size.strict_sub(1)
 }
 
+/// Size of a single memory page, in bytes, as a `u64`.
 pub const PAGE_SIZE_U64: u64 = 4096;
+/// Size of a single memory page, in bytes, as a `usize`.
 pub const PAGE_SIZE: usize = u64_to_usize(PAGE_SIZE_U64).unwrap();
+/// Number of bits to shift a virtual address right by to get a page number.
+pub const PAGE_SHIFT: u8 = compute_shift(PAGE_SIZE_U64);
+/// Bitmask that extracts the in-page offset from a virtual address, as a `u64`.
+pub const PAGE_OFFSET_MASK_U64: u64 = compute_mask(PAGE_SIZE_U64);
+/// Bitmask that extracts the in-page offset from a virtual address, as a `usize`.
+pub const PAGE_OFFSET_MASK: usize = u64_to_usize(PAGE_OFFSET_MASK_U64).unwrap();
 
+/// An uninitialized, page-sized and page-aligned block of memory.
 #[repr(C, align(4096))]
-pub struct UninitPageMut([MaybeUninit<u8>; PAGE_SIZE]);
+pub struct UninitPage([MaybeUninit<u8>; PAGE_SIZE]);
 
-impl UninitPageMut {
+const _: () =
+    assert!(align_of::<UninitPage>() == PAGE_SIZE && size_of::<UninitPage>() == PAGE_SIZE);
+
+impl UninitPage {
+    /// Creates a new, uninitialized page.
     #[inline(always)]
     pub const fn new() -> Self {
         const { Self([MaybeUninit::uninit(); PAGE_SIZE]) }
     }
 
+    /// Returns a [`PagePointer`] to this page, usable for mutable access.
     pub fn page_pointer_mut(&mut self) -> PagePointer {
         unsafe { PagePointer::new(NonNull::new_unchecked(self.0.as_mut_ptr()).cast()) }
     }
 
+    /// Returns a [`PagePointer`] to this page, usable for shared access.
     pub fn page_pointer_ref(&self) -> PagePointer {
         unsafe { PagePointer::new(NonNull::new_unchecked(self.0.as_ptr().cast_mut()).cast()) }
     }
@@ -54,59 +69,58 @@ impl UninitPageMut {
     }
 }
 
-impl Default for UninitPageMut {
+impl Default for UninitPage {
     #[inline(always)]
     fn default() -> Self {
         Self::new()
     }
 }
 
-const _: () = {
-    assert!(align_of::<UninitPageMut>() == PAGE_SIZE && size_of::<UninitPageMut>() == PAGE_SIZE)
-};
-
+/// Size of a CPU cache line, in bytes, as a `u64`.
 pub const CACHE_LINE_SIZE_U64: u64 = 64;
+/// Size of a CPU cache line, in bytes, as a `usize`.
 pub const CACHE_LINE_SIZE: usize = u64_to_usize(CACHE_LINE_SIZE_U64).unwrap();
-
-pub const PAGE_SHIFT: u8 = compute_shift(PAGE_SIZE_U64);
+/// Number of bits to shift an address right by to get a cache-line number.
 pub const CACHE_LINE_SHIFT: u8 = compute_shift(CACHE_LINE_SIZE_U64);
 
-pub const PAGE_OFFSET_MASK_U64: u64 = compute_mask(PAGE_SIZE_U64);
-pub const PAGE_OFFSET_MASK: usize = u64_to_usize(PAGE_OFFSET_MASK_U64).unwrap();
-
-// important note
-// do **not** use bitflags
-// MemProt is used for bit tagging pointers
-// and must therefore only have the bits explicitly
-// allowed here set
+/// Memory protection bits (read/write/execute).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct MemProt(u8);
 
 impl MemProt {
+    /// No permissions.
     pub const NONE: Self = Self(0);
 
+    /// Read permission.
     pub const READ: Self = Self(0b001);
+    /// Write permission.
     pub const WRITE: Self = Self(0b010);
+    /// Execute permission.
     pub const EXECUTE: Self = Self(0b100);
 
-    pub const ALL: Self = Self::READ.union(Self::WRITE).union(Self::EXECUTE);
+    /// All permissions (read, write, and execute).
+    const ALL: Self = Self::READ.union(Self::WRITE).union(Self::EXECUTE);
 
+    /// Returns the raw bits backing this value.
     #[inline(always)]
     pub const fn bits(self) -> u8 {
         self.0
     }
 
+    /// Returns the union of `self` and `other`.
     #[inline(always)]
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
+    /// Returns the bits of `self` that are also set in `other`.
     #[inline(always)]
     pub const fn retain(self, other: Self) -> Self {
         Self(self.0 & other.0)
     }
 
+    /// Returns `true` if `self` and `other` share any set bits.
     #[inline(always)]
     pub const fn contains_any(self, other: Self) -> bool {
         (self.0 & other.0) != 0
@@ -137,6 +151,8 @@ impl std::ops::Not for MemProt {
     }
 }
 
+/// Memory flags: [`MemProt`] permission bits plus additional metadata bits
+/// (such as [`MemFlags::COW`] and [`MemFlags::OBJ_BACKED`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct MemFlags(u8);
@@ -148,41 +164,55 @@ impl MemFlags {
         Self(bit)
     }
 
+    /// Creates a [`MemFlags`] from a [`MemProt`], carrying over just the
+    /// protection bits.
     #[inline(always)]
     pub const fn from_prot(prot: MemProt) -> Self {
         Self(prot.0)
     }
 
+    /// No flags set.
     pub const NONE: Self = Self(0);
 
+    /// Read permission.
     pub const READ: Self = Self::from_prot(MemProt::READ);
+    /// Write permission.
     pub const WRITE: Self = Self::from_prot(MemProt::WRITE);
+    /// Execute permission.
     pub const EXECUTE: Self = Self::from_prot(MemProt::EXECUTE);
 
-    pub const DMA_DEV: Self = Self::new_flag(0b001_000);
+    /// Marks a page as backed by an object.
+    pub const OBJ_BACKED: Self = Self::new_flag(0b001_000);
+    /// Marks a page as copy-on-write.
     pub const COW: Self = Self::new_flag(0b010_000);
 
-    pub const MUST_DIRTY: Self = Self::EXECUTE.union(Self::DMA_DEV);
+    /// Flags for which writes must always be tracked as dirty.
+    pub const MUST_DIRTY: Self = Self::EXECUTE.union(Self::OBJ_BACKED);
 
+    /// All valid flag bits.
     pub const ALL: Self = Self::from_prot(MemProt::ALL)
         .union(Self::COW)
-        .union(Self::DMA_DEV);
+        .union(Self::OBJ_BACKED);
 
+    /// Returns the raw bits backing this value.
     #[inline(always)]
     pub const fn bits(self) -> u8 {
         self.0
     }
 
+    /// Returns the union of `self` and `other`.
     #[inline(always)]
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
+    /// Returns the bits of `self` that are also set in `other`.
     #[inline(always)]
     pub const fn retain(self, other: Self) -> Self {
         Self(self.0 & other.0)
     }
 
+    /// Returns `true` if `self` and `other` share any set bits.
     #[inline(always)]
     pub const fn contains_any(self, other: Self) -> bool {
         (self.0 & other.0) != 0
@@ -204,11 +234,13 @@ impl<T: Into<MemFlags>> BitOr<T> for MemFlags {
     }
 }
 
+/// A raw, non-null pointer into host memory.
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct HostPointer(pub NonNull<AtomicU8>);
 
 impl HostPointer {
+    /// Wraps a raw pointer as a [`HostPointer`].
     pub const fn new(ptr: NonNull<AtomicU8>) -> Self {
         Self(ptr)
     }
@@ -217,11 +249,14 @@ impl HostPointer {
 unsafe impl Send for HostPointer {}
 unsafe impl Sync for HostPointer {}
 
+/// A pointer to the start of a page-aligned, page-sized region of host memory.
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct PagePointer(HostPointer);
 
 impl PagePointer {
+    /// A sentinel, dangling page pointer.
+    ///
     /// # Note:
     ///
     /// you can never know if a page is truly `Self::DANGLING`
@@ -247,6 +282,7 @@ impl PagePointer {
         Self(HostPointer(page))
     }
 
+    /// Returns the underlying non-null pointer to the start of the page.
     #[inline(always)]
     pub fn as_non_null_ptr(self) -> NonNull<AtomicU8> {
         let ptr = self.0.0;
@@ -264,7 +300,7 @@ impl PagePointer {
         unsafe {
             Self::new(
                 self.as_non_null_ptr()
-                    .cast::<UninitPageMut>()
+                    .cast::<UninitPage>()
                     .add(count)
                     .cast::<AtomicU8>(),
             )
@@ -280,63 +316,29 @@ impl PagePointer {
     }
 }
 
+/// A resolved, tagged page pointer paired with the atomic dirty-flags byte
+/// that tracks its dirty state.
 #[derive(Copy, Clone)]
 pub struct Page<'a> {
+    /// The tagged pointer to the backing page, including its [`MemFlags`].
     pub ptr: TaggedPagePtr,
-    pub dirty_flags: &'a AtomicU8,
+    /// The atomic byte tracking this page's dirty/flushing state.
+    pub mutable_flags: &'a AtomicU8,
 }
 
 impl Page<'_> {
-    pub const DIRTY_FLAG_FLUSHING: u8 = 0b10;
-    pub const DIRTY_FLAG_IS_DIRTY: u8 = 0b01;
+    /// Flag bit indicating a currently outbound flush.
+    pub const IS_FLUSHING_DIRTY_PAGE: u8 = 0b10;
+    /// Flag bit indicating the page has been written to since it was last clean.
+    pub const IS_DIRTY_FLAG: u8 = 0b01;
 
+    /// Marks this page as dirty if it is a page that requires dirty tracking.
     #[inline(always)]
     pub fn set_dirty(&self) {
         if self.ptr.flags().contains_any(MemFlags::MUST_DIRTY) {
             cold_path();
-
-            std::sync::atomic::fence(Ordering::SeqCst);
-
-            // knowing that `set_insn_dirty` always executes AFTER the pages have been modified,
-            // skipping the `fetch_or` when the dirty bit is already set is only safe `iff`
-            // OUR modifications to the page are guaranteed to be globally visible before some
-            // future flusher decides "nothing more to do" and clears the flag.
-            //
-            // that guarantee is a STORE-LOAD ordering: our store to the page must be ordered
-            // before our load of the flag, as observed by every other thread. Acquire/Release
-            // never provide that - they order StoreStore and LoadLoad/LoadStore,
-            // but a CPU is still free to have our page write sitting in its store buffer
-            // while our flag load is satisfied from cache. SeqCst is the only ordering
-            // that forbids this: every SeqCst operation is additionally placed on one
-            // single global total order, so our SeqCst load of the flag cannot be
-            // reordered ahead of our own prior SeqCst-adjacent store to the page from
-            // any other thread's point of view, closing exactly the reordering window
-            // that let a flusher race ahead, invalidate, and clean the flag while our
-            // write was still invisible.
-            //
-            // this is necessary as `fetch_or` on every write operation would be too
-            // expensive especially under contention, so we still skip it when we can —
-            // we're just no longer trying to get that skip for free with a cheaper
-            // ordering, since Acquire/Release was paying for a guarantee it never gave us.
-            // do pay close attention that this uses
-            // **`SeqCst`** specifically, not **`Acquire`** nor **`Relaxed`**, on this load.
-            //
-            // the `fetch_or` below does NOT need that same upgrade. its job is narrower:
-            // publish the new flag *value* to whoever reads it next, so that a future
-            // acquire/SeqCst read of `01`/`11` synchronizes-with this store and correctly
-            // sees our page write as happens-before. that publish is the textbook
-            // Release pattern, and `Release` is sufficient for it - by the time we reach
-            // this `fetch_or`, the StoreLoad hazard is already closed, because it only
-            // runs after the SeqCst load above has completed, and that load is what forced
-            // our page write to be globally visible. `B_A` is also already sequenced-before
-            // this `fetch_or` by plain program order. there is no second StoreLoad gap left
-            // for this operation to plug, so bumping it to `SeqCst` would only buy us a
-            // place in the global total order we don't need, at a cost we'd rather not pay.
-            if (self.dirty_flags.load(Ordering::SeqCst) & Self::DIRTY_FLAG_IS_DIRTY) == 0 {
-                cold_path();
-                self.dirty_flags
-                    .fetch_or(Self::DIRTY_FLAG_IS_DIRTY, Ordering::SeqCst);
-            }
+            self.mutable_flags
+                .fetch_or(Self::IS_DIRTY_FLAG, Ordering::Release);
         }
     }
 }
@@ -345,6 +347,7 @@ impl Page<'_> {
 type IoMMUIdentPointee = MaybeUninit<u8>;
 type IoMMUIdentifierInner = Arc<IoMMUIdentPointee>;
 
+/// A unique, reference-counted token identifying an IOMMU address space.
 #[derive(Eq, PartialEq)]
 #[repr(transparent)]
 pub struct IoMMUIdentifier(NonNull<IoMMUIdentPointee>);
@@ -352,8 +355,9 @@ pub struct IoMMUIdentifier(NonNull<IoMMUIdentPointee>);
 unsafe impl ZeroableInOption for IoMMUIdentifier {}
 
 impl IoMMUIdentifier {
+    /// Creates a new, globally unique [`IoMMUIdentifier`].
     pub fn unique_token() -> Self {
-        // note we use a byte to make absoulely sure that we are getting a new
+        // note we use a byte to make sure that we are getting a new
         // `Arc` and that this isn't some cached ZST Arc
         let mut alloc: IoMMUIdentifierInner = Arc::<u8>::new_uninit();
         assert!(
@@ -364,6 +368,7 @@ impl IoMMUIdentifier {
         Self(unsafe { NonNull::new_unchecked(ptr.cast_mut()) })
     }
 
+    /// Borrows this identifier as a lightweight, `Copy`-able reference.
     pub fn get_ref(&self) -> IoMMUIdentifierRef<'_> {
         IoMMUIdentifierRef {
             ptr: self.0,
@@ -394,6 +399,7 @@ impl Drop for IoMMUIdentifier {
     }
 }
 
+/// A borrowed, `Copy`-able reference to an [`IoMMUIdentifier`].
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[repr(transparent)]
 pub struct IoMMUIdentifierRef<'a> {
@@ -402,6 +408,8 @@ pub struct IoMMUIdentifierRef<'a> {
 }
 
 impl IoMMUIdentifierRef<'_> {
+    /// Clones the referenced identifier, producing an owned, ref-counted
+    /// [`IoMMUIdentifier`].
     #[inline(always)]
     pub fn clone_identifier(self) -> IoMMUIdentifier {
         let ptr = ManuallyDrop::new(IoMMUIdentifier(self.ptr));
@@ -416,6 +424,7 @@ impl IoMMUIdentifierRef<'_> {
         IoMMUIdentifier(self.ptr)
     }
 
+    /// Returns the raw, type-erased pointer identifying this address space.
     #[inline(always)]
     pub fn ptr(self) -> NonNull<()> {
         self.ptr.cast()
@@ -425,32 +434,39 @@ impl IoMMUIdentifierRef<'_> {
 const _: () = {
     assert!(
         (MemFlags::ALL.bits() as u64 & !PAGE_OFFSET_MASK_U64) == 0,
-        "MemProt bits must fit in the low page-alignment bits"
+        "MemFlags bits must fit in the low page-alignment bits"
     );
 };
 
+/// A virtual page number: a virtual address with the in-page offset bits
+/// stripped off.
 #[derive(Debug, Zeroable, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct PageNumber(u64);
 
 impl PageNumber {
+    /// The largest representable page number.
     pub const MAX: Self = Self::from_vaddr(u64::MAX);
 
+    /// Splits a virtual address into its [`PageNumber`] and in-page offset.
     #[inline(always)]
     pub const fn from_vaddr_with_offset(vaddr: u64) -> (Self, usize) {
         let remainder = vaddr & PAGE_OFFSET_MASK_U64;
-        // Safety: PAGE_SIZE fits in usize, and we are taking the remainder by PAGE_SIZE
-        //         therefore the remainder **MUST** fit in a usize
+        // Safety: PAGE_SIZE fits in usize, and we are taking the remainder by PAGE_SIZE,
+        //         therefore, the remainder **MUST** fit in a usize
         let remainder = unsafe { u64_to_usize(remainder).unwrap_unchecked() };
 
         (Self::from_vaddr(vaddr), remainder)
     }
 
+    /// Computes the [`PageNumber`] containing the given virtual address.
     #[inline(always)]
     pub const fn from_vaddr(vaddr: u64) -> Self {
         Self(vaddr >> PAGE_SHIFT)
     }
 
+    /// Creates a [`PageNumber`] from a raw page-number value.
+    ///
     /// # Safety
     /// TODO
     #[inline(always)]
@@ -459,6 +475,8 @@ impl PageNumber {
         Self(page)
     }
 
+    /// Creates a [`PageNumber`] from a raw page-number value, returning
+    /// `None` if it exceeds [`Self::MAX`].
     #[inline]
     pub const fn from_page_number_checked(page: u64) -> Option<Self> {
         if page > Self::MAX.0 {
@@ -468,6 +486,11 @@ impl PageNumber {
         Some(unsafe { Self::from_page_number_unchecked(page) })
     }
 
+    /// Creates a [`PageNumber`] from a raw page-number value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `page` exceeds [`Self::MAX`].
     #[inline]
     pub const fn from_page_number(page: u64) -> Self {
         match Self::from_page_number_checked(page) {
@@ -476,15 +499,18 @@ impl PageNumber {
         }
     }
 
+    /// Returns the raw page-number value.
     #[inline(always)]
     pub const fn get(self) -> u64 {
         self.0
     }
 
+    /// Returns the virtual address of the first byte of this page.
     pub const fn vaddr_base(self) -> u64 {
         self.0 << PAGE_SHIFT
     }
 
+    /// Returns the next page number, or `None` if this is [`Self::MAX`].
     #[inline(always)]
     pub const fn inc(self) -> Option<Self> {
         const { assert!(Self::MAX.0 != u64::MAX) }
@@ -495,11 +521,15 @@ impl PageNumber {
 
 const _: () = assert!(PageNumber::MAX.inc().is_none());
 
+/// A [`PagePointer`] with its low, unused address bits repurposed to store
+/// [`MemFlags`].
 #[derive(Copy, Clone)]
 #[repr(transparent)]
 pub struct TaggedPagePtr(NonNull<AtomicU8>);
 
 impl TaggedPagePtr {
+    /// Creates a tagged pointer from a [`PagePointer`] and the [`MemFlags`]
+    /// to tag it with.
     pub fn new(ptr: PagePointer, prot: MemFlags) -> Self {
         let prot: u8 = prot.bits();
         const { assert!((u8::MAX as usize) < PAGE_SIZE) }
@@ -508,6 +538,7 @@ impl TaggedPagePtr {
         Self(ptr.map_addr(|addr| addr | tag_bits))
     }
 
+    /// Returns the untagged [`PagePointer`], with the flag bits masked off.
     pub fn page_ptr(self) -> PagePointer {
         let ptr = self.0.map_addr(|addr| {
             let mask = !usize::from(MemFlags::ALL.bits());
@@ -517,6 +548,7 @@ impl TaggedPagePtr {
         unsafe { PagePointer::new(ptr) }
     }
 
+    /// Returns the [`MemFlags`] tagged into this pointer's low bits.
     pub fn flags(self) -> MemFlags {
         let mask: u8 = MemFlags::ALL.bits();
         let prot_usize = self.0.addr().get() & usize::from(mask);
@@ -527,37 +559,52 @@ impl TaggedPagePtr {
 
 unsafe impl ZeroableInOption for TaggedPagePtr {}
 
+/// An [`IoMMUIdentifier`] slot that may or may not currently hold a valid
+/// identifier; a zeroed value represents "invalid".
 #[derive(Zeroable)]
 #[repr(transparent)]
 pub struct MaybeInvalidIdentifier(Option<IoMMUIdentifier>);
 
 impl MaybeInvalidIdentifier {
+    /// Returns an invalid (empty) identifier slot.
     pub const fn invalid() -> Self {
         bytemuck::zeroed()
     }
 
+    /// Wraps a valid [`IoMMUIdentifier`] into a slot.
     pub fn new(ident: IoMMUIdentifier) -> Self {
         Self(Some(ident))
     }
 
+    /// Returns a raw, type-erased pointer identifying the held identifier
+    /// (or a sentinel value if invalid).
     pub fn as_ptr(&self) -> *const () {
         unsafe { std::mem::transmute_copy::<Self, *const ()>(self) }
     }
 }
 
+/// A single TLB entry, mapping a virtual page number (within an IOMMU
+/// address space) to a resolved, tagged host page.
+///
 /// # Safety
 ///
-/// if `tagged_page_ptr` is `Some`
-/// then `insn_dirty_ptr` must also be `Some`
+/// - If `tagged_page_ptr` is `Some`, then `insn_dirty_ptr` must also be `Some`
+/// - If `io_mmu_ident` points to a live allocation, then `tagged_page_ptr` is `Some`
 #[derive(Zeroable)]
 pub struct TlbEntry {
+    /// Identifier of the IOMMU address space this entry was resolved in.
     pub io_mmu_ident: MaybeInvalidIdentifier,
+    /// The virtual page number this entry caches a translation for.
     pub virtual_page_number: PageNumber,
+    /// The resolved, tagged host page pointer, if this entry is valid.
     pub tagged_page_ptr: Option<TaggedPagePtr>,
-    pub insn_dirty_ptr: Option<NonNull<AtomicU8>>,
+    /// The dirty-flags pointer for the resolved page, if this entry is valid.
+    pub mut_page_flags: Option<NonNull<AtomicU8>>,
 }
 
 impl TlbEntry {
+    /// Overwrites this entry with a fresh translation for `new_page_number`
+    /// within the address space identified by `identifier`.
     pub fn update_entry(
         &mut self,
         identifier: IoMMUIdentifierRef,
@@ -568,34 +615,41 @@ impl TlbEntry {
             io_mmu_ident: tlb_identifier,
             virtual_page_number,
             tagged_page_ptr,
-            insn_dirty_ptr,
+            mut_page_flags,
         } = self;
 
         let tagged_ptr = page.ptr;
 
-        let new_insn_dirty_ptr = NonNull::<AtomicU8>::from_ref(page.dirty_flags);
+        let new_mut_flags = NonNull::<AtomicU8>::from_ref(page.mutable_flags);
 
         if !std::ptr::addr_eq(tlb_identifier.as_ptr(), identifier.ptr().as_ptr()) {
             *tlb_identifier = MaybeInvalidIdentifier::new(identifier.clone_identifier());
         }
 
         *tagged_page_ptr = Some(tagged_ptr);
-        *insn_dirty_ptr = Some(new_insn_dirty_ptr);
+        *mut_page_flags = Some(new_mut_flags);
         *virtual_page_number = new_page_number;
     }
 }
 
+/// Number of entries in a [`Tlb`], as a `u64`. Reduced under `cfg(test)` to
+/// make tests exercise TLB eviction more easily.
 pub const TLB_SIZE_U64: u64 = match cfg!(test) {
     true => 64,
     false => 1024,
 };
 
+/// Number of entries in a [`Tlb`], as a `usize`.
 pub const TLB_SIZE: usize = u64_to_usize(TLB_SIZE_U64).unwrap();
+/// Bitmask used to index into a [`Tlb`] from a [`PageNumber`].
 pub const TLB_MASK: u64 = compute_mask(TLB_SIZE_U64);
 
+/// A direct-mapped translation-lookaside buffer caching recent virtual
+/// page-number to host-page translations.
 #[derive(Zeroable)]
 #[repr(transparent)]
 pub struct Tlb {
+    /// The backing array of TLB entries.
     pub entries: [TlbEntry; TLB_SIZE],
 }
 
@@ -606,14 +660,18 @@ impl Default for Tlb {
 }
 
 impl Tlb {
+    /// Allocates a new, zeroed [`Tlb`] on the heap directly, without
+    /// constructing it on the stack first.
     pub fn new_boxed() -> Box<Self> {
         bytemuck::allocation::zeroed_box()
     }
 
+    /// Creates a new, empty [`Tlb`].
     pub const fn new() -> Self {
         bytemuck::zeroed()
     }
 
+    /// Returns the (direct-mapped) entry slot for the given page number.
     pub fn entry(&mut self, page_number: PageNumber) -> &mut TlbEntry {
         unsafe {
             let index = u64_to_usize(page_number.0 & TLB_MASK).unwrap_unchecked();
@@ -621,6 +679,10 @@ impl Tlb {
         }
     }
 
+    /// Looks up the translation for `page_num` in address space `ident`,
+    /// calling `fallback` to resolve it on a cache miss and populating the
+    /// entry with the result.
+    ///
     /// # Safety
     ///
     /// TODO
@@ -645,11 +707,13 @@ impl Tlb {
         Ok(unsafe {
             Page {
                 ptr: entry.tagged_page_ptr.unwrap_unchecked(),
-                dirty_flags: entry.insn_dirty_ptr.unwrap_unchecked().as_ref(),
+                mutable_flags: entry.mut_page_flags.unwrap_unchecked().as_ref(),
             }
         })
     }
 
+    /// Populates the entry for `page_number` in address space `identifier`
+    /// with `page`, unconditionally overwriting any existing entry.
     #[inline(always)]
     pub fn update_entry(
         &mut self,

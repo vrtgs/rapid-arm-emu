@@ -9,9 +9,12 @@ use std::ops::{Index, IndexMut};
 
 cfg_select! {
     target_pointer_width = "16" => {
-        type HandleInt = u32;
+        // we only need 16 bits for indices
+        type HandleInt = u16;
     }
     _ => {
+        const _: () = assert!(usize::BITS >= 32);
+
         type HandleInt = u32;
     }
 }
@@ -410,7 +413,8 @@ impl<K: Handle + Debug> Debug for ArenaSet<K> {
 }
 
 macro_rules! make_handle {
-    ($vis: vis $name: ident) => {
+    ($(#[$meta: meta])* $vis: vis $name: ident) => {
+        $(#[$meta])*
         #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
         #[repr(transparent)]
         $vis struct $name($crate::arena::RawHandle);
@@ -439,14 +443,14 @@ macro_rules! handle_impl_helper {
 
     (
         impl const for $name: path {
-            $($vis_const: vis const $const_name: ident;)*
+            $($(#[$meta: meta])* $vis_const: vis const $const_name: ident;)*
         }
     ) => {
         impl $name {
             $crate::arena::handle_impl_helper! {
                 @fold
                 current_stack: [],
-                munching: { $($vis_const const $const_name;)* }
+                munching: { $($(#[$meta])* $vis_const const $const_name;)* }
             }
         }
     };
@@ -455,10 +459,11 @@ macro_rules! handle_impl_helper {
         @fold
         current_stack: [$($tt:tt),*],
         munching: {
-            $vis_const: vis const $const_name: ident;
+            $(#[$meta: meta])* $vis_const: vis const $const_name: ident;
             $($rest:tt)*
         }
     ) => {
+        $(#[$meta])*
         $vis_const const $const_name: Self = {
             match $crate::arena::RawHandle::try_new(<[()]>::len(&[$($tt),*])) {
                 Some(x) => $crate::arena::from_raw(x),
@@ -482,18 +487,17 @@ macro_rules! handle_impl_helper {
 
 macro_rules! impl_storable {
     {
-        $ty: ty as $(impl $vis: vis $impl_name: ident)? $(($existing_handle: path))?;
+        $ty: ty as $(impl $(#[$handle_meta: meta])* $vis: vis $impl_name: ident)? $(($existing_handle: path))?;
         $(init: {
-            $($vis_const: vis const $const_name: ident = $init: expr;)*
+            $($(#[$const_meta: meta])* $vis_const: vis const $const_name: ident = $init: expr;)*
         })?
     } => {
-
-        $($crate::arena::make_handle!($vis $impl_name);)?
+        $($crate::arena::make_handle!($(#[$handle_meta])* $vis $impl_name);)?
 
 
         $($crate::arena::handle_impl_helper! {
             impl const for $impl_name {
-                $($vis_const const $const_name;)*
+                $($(#[$const_meta])* $vis_const const $const_name;)*
             }
         })?
 

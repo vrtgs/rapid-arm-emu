@@ -1,6 +1,7 @@
 use crate::armv9::{Armv9CpuCore, ExecState};
 use emu_abi::halt_reason::HaltReason;
 use emu_abi::memory::{HostPointer, PagePointer};
+use jit_compiler_core::chunk::CompiledExecChunk;
 use std::collections::HashMap;
 
 // this might seem weird, but when compiling a basic block,
@@ -21,7 +22,7 @@ use std::collections::HashMap;
 
 pub(crate) struct CodeBlock {
     _page: PagePointer,
-    _machine_code_handle: exec_ir::compiler::CompiledExecChunk,
+    _machine_code_handle: CompiledExecChunk,
 }
 
 impl CodeBlock {}
